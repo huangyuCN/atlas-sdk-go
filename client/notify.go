@@ -2,7 +2,6 @@ package client
 
 import (
 	"reflect"
-	"sync/atomic"
 
 	"github.com/huangyuCN/atlas-sdk-go/frame"
 )
@@ -61,6 +60,3 @@ func (c *Client) safeNotify(h NotifyHandler, op string, payload []byte) {
 	defer func() { _ = recover() }()
 	h(op, payload)
 }
-
-// notifyClosedStub 占位：防止 atomic 包未使用告警（epoch 计数在 client.go）。
-var _ = atomic.Pointer[func(error)]{}

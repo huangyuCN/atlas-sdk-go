@@ -121,6 +121,9 @@ func Dial(addr string, opts ...Option) (*Client, error) {
 	for _, opt := range opts {
 		opt(c)
 	}
+	// 连接世代：启动读循环前在本 goroutine 分配（禁止放进 readLoop goroutine，
+	// 否则 Dial 后立即 Invoke 可能读到旧 epoch、而响应按新 epoch 匹配 → 静默丢弃）。
+	c.epochNum.Add(1)
 	c.wg.Add(2)
 	go c.readLoop()
 	if c.heartbeatInterval > 0 {
