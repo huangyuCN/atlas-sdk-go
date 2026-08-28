@@ -1,0 +1,13 @@
+{
+  "dataHex": "7b2268696e74223a2278227d",
+  "error": "",
+  "hasStatus": true,
+  "status": {
+    "code": 404,
+    "message": "玩家不存在",
+    "metadata": {
+      "k": "v"
+    },
+    "reason": "PLAYER_NOT_FOUND"
+  }
+}

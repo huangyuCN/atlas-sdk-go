@@ -1,0 +1,135 @@
+{
+  "atlasCommit": "0ba52c039ae8264939bfb61c97743d8b634cdbea",
+  "atlasRef": "feat/actor",
+  "atlasRepo": "github.com/huangyuCN/atlas",
+  "cases": {
+    "frame-bad-magic": {
+      "sha256_input": "3889b4755d0a01ec81c5aca17481018a3b0b6e7af39125c189d5e6f4f6e532b7",
+      "sha256_expected": "b00088e10b9d3551f3de937be498d0df3be61a4a6e89895c8c17b3ac530af453",
+      "kind": "frame",
+      "max_body_size": 2097152
+    },
+    "frame-bad-seq-zero": {
+      "sha256_input": "5f546f50a0b4facc01c8cebae0705b87e0678ea7d59b927511be404e00597bb5",
+      "sha256_expected": "b00088e10b9d3551f3de937be498d0df3be61a4a6e89895c8c17b3ac530af453",
+      "kind": "frame",
+      "max_body_size": 2097152
+    },
+    "frame-bad-type": {
+      "sha256_input": "85e1c6550251d67e9b90346d298f176a1099ac6b0dc589817565056e9337e8e6",
+      "sha256_expected": "b00088e10b9d3551f3de937be498d0df3be61a4a6e89895c8c17b3ac530af453",
+      "kind": "frame",
+      "max_body_size": 2097152
+    },
+    "frame-bad-version": {
+      "sha256_input": "26548ccaf499c5caf0a543dc1f21913a56ebd14999967e18193765e1ec6a9b8f",
+      "sha256_expected": "b00088e10b9d3551f3de937be498d0df3be61a4a6e89895c8c17b3ac530af453",
+      "kind": "frame",
+      "max_body_size": 2097152
+    },
+    "frame-custom-limit": {
+      "sha256_input": "cb45bf0c7446aa95277c2f973243745f7bc5e3eca179916a3edda24bc2592bf1",
+      "sha256_expected": "b244e55b6ed5b1e803b6906310d4b6697ef9ff99f8e52675167db8c7c2dd72cf",
+      "kind": "frame",
+      "max_body_size": 64
+    },
+    "frame-notify": {
+      "sha256_input": "49a37a89e990d299798d2bfbfadae79196e268cc2d3b606801be791eb26bf2d7",
+      "sha256_expected": "8f7302b89de6c98fc7b3858bdc0dc29f3c2d1ad4cc347b74548a55bfdf996a18",
+      "kind": "frame",
+      "max_body_size": 2097152
+    },
+    "frame-oversize": {
+      "sha256_input": "27acc8c30389d84e641ac8cd9dfec5cebc1c38d766bb18942d44c54de30c532f",
+      "sha256_expected": "b00088e10b9d3551f3de937be498d0df3be61a4a6e89895c8c17b3ac530af453",
+      "kind": "frame",
+      "max_body_size": 2097152
+    },
+    "frame-payload-int64-string": {
+      "sha256_input": "1543513c3a56eec12878941f269faebd65ddce8140d37a8ae49215e8dbd7a413",
+      "sha256_expected": "ad143eb4c959bb6bf05fc5634293fd2f5746fbf929ed6a6715cb8af3fb546299",
+      "kind": "frame",
+      "max_body_size": 2097152
+    },
+    "frame-request-heartbeat": {
+      "sha256_input": "afeb8826d1553fddadb4debb358dde128d076e393fdd3862ffbe0fef8510ae46",
+      "sha256_expected": "ba67912cab005e91ee98c73b07136dbde831c80254a7de31e13ab56fe13a16bd",
+      "kind": "frame",
+      "max_body_size": 2097152
+    },
+    "frame-request-payload": {
+      "sha256_input": "66396e2450dd9a4d2fb3147d05e6090b70fbf35bf98b2f03987832c9d0ec9d17",
+      "sha256_expected": "d93d6759b7042a82afd117e47e491cb5317a9c16f5566e7b962e1b5bea8be01d",
+      "kind": "frame",
+      "max_body_size": 2097152
+    },
+    "frame-truncated-body": {
+      "sha256_input": "7ff458eb244e292c83607564e77e6eb82be54610a121dde30765ba31cfc26ba3",
+      "sha256_expected": "2873c9596138b92fa00864b6cd850b4bf1bbbce51466a556aaa51fc00995adb2",
+      "kind": "frame",
+      "max_body_size": 2097152
+    },
+    "frame-truncated-header": {
+      "sha256_input": "410cf71a64d850aa9afa26954b9e2728301afebbd1708a3027d931c663ba54a8",
+      "sha256_expected": "2873c9596138b92fa00864b6cd850b4bf1bbbce51466a556aaa51fc00995adb2",
+      "kind": "frame",
+      "max_body_size": 2097152
+    },
+    "reply-error-empty-status": {
+      "sha256_input": "a536aa3cede6ea3c1f3e0357c3c60e0f216a8c89b853df13b29daa8f85065dfb",
+      "sha256_expected": "2334b374498b8dfdbed1f0ee70c94dd16bae40707366b2d352479b83f9aa192b",
+      "kind": "reply",
+      "max_body_size": 2097152
+    },
+    "reply-error-status": {
+      "sha256_input": "178806d1a9bafd37c71f58b032bfd2b359553fe40ff75a1108945c82d7156a50",
+      "sha256_expected": "eb8438c61fad87a6f7adcb55301739877aa868e9279993d8e0559282c4dda195",
+      "kind": "reply",
+      "max_body_size": 2097152
+    },
+    "reply-error-with-data": {
+      "sha256_input": "4117e178775866b1249ebdef444f2ead85f01a634c70799633f7b5e39a6c7a51",
+      "sha256_expected": "60544c12251e6780d2cad15b12de6cb5624d39fb379ba905149b0f564111e2bd",
+      "kind": "reply",
+      "max_body_size": 2097152
+    },
+    "reply-success": {
+      "sha256_input": "c5fbafe79ddece807ed6f547d7e76c01a260158824f3b145d4be0cd7dc08ff46",
+      "sha256_expected": "011948c984d691045703961253955cba7158b9a17302b7e81b1df48228f02bac",
+      "kind": "reply",
+      "max_body_size": 2097152
+    },
+    "reply-trailing-bytes": {
+      "sha256_input": "1ebd42b290cc5e72a1b2776203427dcde1ed5b64c71360d00132665b367255fd",
+      "sha256_expected": "011948c984d691045703961253955cba7158b9a17302b7e81b1df48228f02bac",
+      "kind": "reply",
+      "max_body_size": 2097152
+    },
+    "status-full": {
+      "sha256_input": "898263a875fce5e57f21912ead42a6f3c953a81eea5e7e2df76fcec0cf51bbdc",
+      "sha256_expected": "b8439aaede023f38331c59949f05ff2d207d75f8eae0617d6b961d9fa13a380c",
+      "kind": "status",
+      "max_body_size": 2097152
+    },
+    "status-negative-code": {
+      "sha256_input": "201fc32536b24f753067b5d341133dac039430e95fa867118a9f76733a8512b8",
+      "sha256_expected": "52cc2ffcb8cda7fba7800d93024ca198cf5a726bc4162d1349f8ac698f5ec8e7",
+      "kind": "status",
+      "max_body_size": 2097152
+    },
+    "status-no-metadata": {
+      "sha256_input": "fd51e1ee52989b5d5a05fb6a4da04b50c8b5352722529ae954dc2c555ce382a2",
+      "sha256_expected": "38cd68cfd9e22f5c760b25303c823b0f735e4d034b6733eca67064bc11befa86",
+      "kind": "status",
+      "max_body_size": 2097152
+    },
+    "status-unknown-field": {
+      "sha256_input": "f5f6334a599aa7a59ca1a91871733816e330ba7ca9461f39a3a913f0a2d78abc",
+      "sha256_expected": "cd7e5cf70bcf1ad07125569c0e3921f360774e06a4cfbf7ae1ea53fb4c48de67",
+      "kind": "status",
+      "max_body_size": 2097152
+    }
+  },
+  "note": "atlas 帧协议 golden vectors；由 atlas-sdk-go/frame -update 生成，四语言 CI 共同消费（逐文件 sha256 校验）",
+  "protocolVersion": 1
+}
