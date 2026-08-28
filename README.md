@@ -21,6 +21,10 @@ Atlas 帧协议的 Go 客户端 SDK。用于游戏客户端、机器人与压测
   （如 `/gateway.v1.GatewayAuth/Heartbeat`）。
 - **结构化错误**：业务拒绝还原为带 `Code/Reason/Metadata` 的 `BusinessError`；
   网络故障、超时、协议错误各自成类，`errors.Is/As` 判定。
+- **断线自动重连**：指数退避（500ms 起 ×2 封顶 30s，带抖动）；重连期间请求排队
+  （默认 64 条，重连成功后按序重发，`WithFailFast` 可跳过）；协议级错误终止不重试。
+- **连接状态机**：`State()` 返回 `connected / reconnecting / disconnected`，
+  重连成功后触发会话重登钩子（`WithOnReconnected`）。
 - **协议一致性测试**：`testdata/golden/` 内置 21 个字节级 golden vectors
   （含截断、非法头、64 位整数字符串、负数编码等边界），CI 逐用例校验。
 
@@ -132,9 +136,10 @@ if errors.Is(err, client.ErrTimeout) {
 | 方法 | 说明 |
 |------|------|
 | `Dial(addr, opts...) (*Client, error)` | 建立 TCP 长连接，启动读循环与心跳 |
-| `Invoke(ctx, op, req, resp any) error` | 请求-响应；`req=nil` 时不带 payload；超时取 `ctx` deadline 与默认值中较小者 |
+| `Invoke(ctx, op, req, resp any, opts...InvokeOption) error` | 请求-响应；`req=nil` 时不带 payload；重连期间默认排队，`WithFailFast()` 立即失败 |
 | `On(op string, h NotifyHandler) (off func())` | 订阅推送；同一 handler 幂等去重；返回退订函数 |
-| `OnReadExit(fn func(error))` | 读循环退出回调（自定义重连的接入点） |
+| `OnReadExit(fn func(error))` | 每次连接断开触发（自动重连场景建议改用 `WithOnReconnected`） |
+| `State() State` | 当前状态：`StateConnected / StateReconnecting / StateDisconnected` |
 | `Close() error` | 优雅关闭：取消全部 in-flight（`NetworkError`）、停止心跳与读循环 |
 
 ### 配置项
@@ -145,6 +150,10 @@ if errors.Is(err, client.ErrTimeout) {
 | `WithInvokeTimeout(d)` | 10s | 请求默认超时 |
 | `WithMaxBodySize(n)` | 2MiB | 单帧 body 上限（只能调小，需与服务端对齐） |
 | `WithSerializer(s)` | JSON | 序列化插槽（可替换为二进制实现） |
+| `WithAutoReconnect(b)` | true | 断线自动重连开关 |
+| `WithBackoff(base, max)` | 500ms/30s | 重连退避参数（×2 封顶 + 抖动） |
+| `WithReconnectQueueSize(n)` | 64 | 重连期间请求排队上限（满后立即失败） |
+| `WithOnReconnected(fn)` | 无 | 重连成功后的会话重登钩子；返回错误则继续退避重试 |
 
 ### 并发与生命周期
 
@@ -188,8 +197,8 @@ golden vectors 位于 `testdata/golden/`：每个用例包含输入字节（`inp
 ## 路线图
 
 - [x] v0.1：TCP 通道、Invoke/Notify/心跳、golden vectors、错误四分类
-- [ ] v0.2：断线重连（指数退避 + 订阅重放 + 会话重登回调）、dual 形态双通道编排
-- [ ] v0.3：WebSocket 通道（浏览器 / 单通道形态）
+- [x] v0.2：断线自动重连（退避 + 排队 + 会话重登钩子 + 连接状态机）
+- [ ] v0.3：dual 形态双通道编排（业务 + 战斗通道）、WebSocket 通道（浏览器 / 单通道形态）
 - [ ] v0.4：KCP / UDP 通道
 - [ ] v0.5：`atlas sdk gen` DTO 生成器（从游戏项目 proto 生成 Go/TS/C# 客户端 DTO）
 
