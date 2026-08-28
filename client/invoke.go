@@ -4,8 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/huangyuCN/atlas-sdk-go/frame"
 	"time"
+
+	"github.com/huangyuCN/atlas-sdk-go/frame"
 )
 
 // invokeResult 是一次请求的回执（data 与 Status 二选一，或错误）。
@@ -37,44 +38,122 @@ func (c *Client) Invoke(ctx context.Context, op string, req, resp any, opts ...I
 	for _, opt := range opts {
 		opt(&o)
 	}
-	// 重连期间排队（failFast 除外）；排队项在重连成功后按序重发。
-	if c.state.Load() == int32(StateReconnecting) && !o.failFast {
-		return c.enqueueAndWait(ctx, op, req, resp)
+	// 排队判定与入队在 genMu 临界区内原子完成（评审 B4 修复）：
+	// supervisor 的 drain 也在同一临界区，二者串行化——
+	// 判定为 Reconnecting 后入队的请求，要么被本次 drain 消费，要么队列满立即失败，
+	// 不存在「drain 空队列后请求才入队」的永久遗留窗口。
+	if !o.failFast {
+		c.genMu.Lock()
+		reconnecting := c.state.Load() == int32(StateReconnecting)
+		if !reconnecting {
+			c.genMu.Unlock()
+			return c.invokeOnce(ctx, op, req, resp)
+		}
+		// 排队（临界区内：与 supervisor 的 state 置位/drain 互斥）。
+		q, err := c.enqueueLocked(ctx, op, req, resp)
+		c.genMu.Unlock()
+		if err != nil {
+			return err
+		}
+		return c.awaitQueued(ctx, q)
 	}
 	return c.invokeOnce(ctx, op, req, resp)
 }
 
-// enqueueAndWait 将请求排入重连队列并等待结果。
-func (c *Client) enqueueAndWait(ctx context.Context, op string, req, resp any) error {
+// enqueueLocked 将请求排入重连队列（调用方必须持有 genMu）。
+// 排队期限：单次超时（invokeTimeout）与 ctx deadline 取较早者——
+// 排队阶段计入超时（评审 Important 修复：不再无限等待重连）。
+func (c *Client) enqueueLocked(ctx context.Context, op string, req, resp any) (*queuedInvoke, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	q := &queuedInvoke{ctx: ctx, op: op, req: req, resp: resp, result: make(chan error, 1)}
+	queueDeadline := time.Now().Add(c.invokeTimeout)
+	if deadline, ok := ctx.Deadline(); ok && deadline.Before(queueDeadline) {
+		queueDeadline = deadline
+	}
+	q := &queuedInvoke{
+		ctx:      ctx,
+		op:       op,
+		req:      req,
+		resp:     resp,
+		result:   make(chan error, 1),
+		deadline: queueDeadline,
+		ctxDone:  ctx.Done(),
+		closeCh:  c.closeCh,
+	}
 	select {
 	case c.queue <- q:
-	case <-ctx.Done():
-		return NewNetworkError(ctx.Err())
-	case <-c.closeCh:
-		return NewNetworkError(errors.New("client: 连接已关闭"))
+		// 排队超时看护：到点未 drain 则认领并超时失败（恰好一次语义）。
+		go c.queueDeadlineWatch(q)
+		return q, nil
 	default:
-		return NewNetworkError(fmt.Errorf("client: 重连排队已满（%d）", c.queueSize))
+		return nil, NewNetworkError(fmt.Errorf("client: 重连排队已满（%d）", c.queueSize))
+	}
+}
+
+// queueDeadlineWatch 排队超时看护：到点后原子认领（LoadAndDelete 语义由
+// queuedInvoke.claimed CAS 保证）并发送超时结果。
+func (c *Client) queueDeadlineWatch(q *queuedInvoke) {
+	d := time.Until(q.deadline)
+	if d > 0 {
+		t := time.NewTimer(d)
+		defer t.Stop()
+		select {
+		case <-t.C:
+		case <-q.ctxDone:
+			// ctx 先取消：仍等到 drain/关闭路径认领，此处仅标记加速失败。
+		case <-q.closeCh:
+			return
+		}
+	}
+	// 认领失败 = 已被 drain 消费（drain 会忽略过期请求）或已失败。
+	if !q.claimed.CompareAndSwap(false, true) {
+		return
+	}
+	q.result <- NewTimeoutError(fmt.Errorf("client: %s 排队超时", q.op))
+}
+
+// awaitQueued 等待排队请求的结果（drain 重发 / 排队超时 / ctx 取消 / 关闭）。
+func (c *Client) awaitQueued(ctx context.Context, q *queuedInvoke) error {
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	select {
 	case err := <-q.result:
 		return err
 	case <-ctx.Done():
-		return NewNetworkError(ctx.Err())
+		// ctx 取消：原子认领后失败（若已被 drain 认领则等它的结果）。
+		if q.claimed.CompareAndSwap(false, true) {
+			return NewNetworkError(ctx.Err())
+		}
+		select {
+		case err := <-q.result:
+			return err
+		case <-time.After(time.Second):
+			return NewNetworkError(ctx.Err())
+		}
 	case <-c.closeCh:
-		return NewNetworkError(errors.New("client: 连接已关闭"))
+		// 关闭路径 failAllQueued 已认领并发送结果。
+		select {
+		case err := <-q.result:
+			return err
+		default:
+			return NewNetworkError(errors.New("client: 连接已关闭"))
+		}
 	}
 }
 
-// invokeOnce 执行一次「写帧 + 等待响应」。
+// invokeOnce 执行一次「快照取代 → 写帧 → 等待响应」。
 func (c *Client) invokeOnce(ctx context.Context, op string, req, resp any) error {
-	// Reconnecting 期间（failFast 或重连前的旧调用）不写帧：
-	// 死连接的写可能进内核缓冲后无响应，导致等待完整超时而非立即失败。
+	// Reconnecting 期间不写帧：死连接的写可能进内核缓冲后无响应，等待完整超时。
+	// （failFast 路径与 drain 前的旧调用在此被拦截，立即失败。）
 	if s := State(c.state.Load()); s == StateReconnecting {
 		return NewNetworkError(fmt.Errorf("client: 正在重连（%s）", s))
+	}
+	// 单次原子读取得 (epoch, conn, done)（评审 B3 修复：不再撕裂读）。
+	g := c.gen()
+	if g == nil || c.closed.Load() {
+		return NewNetworkError(errors.New("client: 连接已关闭"))
 	}
 	var payload []byte
 	if req != nil {
@@ -88,13 +167,13 @@ func (c *Client) invokeOnce(ctx context.Context, op string, req, resp any) error
 		return NewProtocolError(err)
 	}
 
-	key := inflightKey{epoch: c.epochNum.Load(), seq: c.nextSeq()}
+	key := inflightKey{epoch: g.epoch, seq: c.nextSeq()}
 	ch := make(chan invokeResult, 1)
 	c.inflight.Store(key, ch)
 	defer c.inflight.Delete(key)
 
 	c.writeMu.Lock()
-	writeErr := frame.Write(c.currentConn(), frame.Header{Type: frame.MsgTypeRequest, Seq: key.seq}, body, c.maxBodySize)
+	writeErr := frame.Write(g.conn, frame.Header{Type: frame.MsgTypeRequest, Seq: key.seq}, body, c.maxBodySize)
 	c.writeMu.Unlock()
 	if writeErr != nil {
 		return NewNetworkError(fmt.Errorf("client: 写帧失败: %w", writeErr))
@@ -162,21 +241,23 @@ func (c *Client) resultToError(op string, r invokeResult, resp any) error {
 }
 
 // dispatchResponse 按 (epoch, seq) 匹配响应；迟到响应（已超时移除）静默丢弃。
-func (c *Client) dispatchResponse(hdr frame.Header, body []byte) {
+// 包络非法为协议级致命错误（规范 §7：不可重试、连接已断）——上抛 readLoop 终止
+// Client（评审 B5 修复：不再只回当前请求后继续用失步连接）。
+func (c *Client) dispatchResponse(hdr frame.Header, body []byte) (fatalErr error) {
 	data, st, err := frame.DecodeReply(body)
+	if err != nil {
+		return NewProtocolError(err)
+	}
 	var r invokeResult
-	switch {
-	case err != nil:
-		r = invokeResult{err: NewProtocolError(err)}
-	case st != nil:
+	if st != nil {
 		r = invokeResult{st: st}
-	default:
+	} else {
 		r = invokeResult{data: data}
 	}
-	key := inflightKey{epoch: c.epochNum.Load(), seq: hdr.Seq}
-	if ch, ok := c.inflight.LoadAndDelete(key); ok {
+	if ch, ok := c.inflight.LoadAndDelete(inflightKey{epoch: c.gen().epoch, seq: hdr.Seq}); ok {
 		ch.(chan invokeResult) <- r
 	}
+	return nil
 }
 
 // failAllInflight 连接断开或客户端关闭时取消全部 in-flight。
@@ -200,7 +281,9 @@ func (c *Client) failAllQueued() {
 	for {
 		select {
 		case q := <-c.queue:
-			q.result <- NewNetworkError(errors.New("client: 连接已关闭"))
+			if q.claimed.CompareAndSwap(false, true) {
+				q.result <- NewNetworkError(errors.New("client: 连接已关闭"))
+			}
 		default:
 			return
 		}
@@ -208,10 +291,25 @@ func (c *Client) failAllQueued() {
 }
 
 // drainQueue 重连成功后按序重发排队请求。
+// 调用方持有 genMu（与 Invoke 的排队判定同临界区，评审 B4 修复）。
+// 过期请求（排队超时已被看护认领 / ctx 已取消）跳过重发，避免执行
+// 调用方已放弃的有副作用请求（评审 Important 修复）。
 func (c *Client) drainQueue() {
 	for {
 		select {
 		case q := <-c.queue:
+			// 过期判定：ctx 已取消，或排队超时看护已认领 → 跳过。
+			if q.ctx != nil && q.ctx.Err() != nil {
+				if q.claimed.CompareAndSwap(false, true) {
+					q.result <- NewNetworkError(q.ctx.Err())
+				}
+				continue
+			}
+			if !q.claimed.CompareAndSwap(false, true) {
+				// 已被看护认领（排队超时）：跳过，结果已由看护投递。
+				continue
+			}
+			// 认领成功：重发并投递结果。
 			q.result <- c.invokeOnce(q.ctx, q.op, q.req, q.resp)
 		default:
 			return

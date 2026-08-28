@@ -15,14 +15,14 @@ import (
 //     由业务层调度，见规范 §5.2 双层心跳）；
 //   - 心跳 Invoke 携带 WithFailFast：死链期间进入重连排队无意义，
 //     心跳自身的失败计数就是重连触发器。
-func (c *Client) heartbeatLoop(done chan struct{}) {
+func (c *Client) heartbeatLoop(g *generation) {
 	defer c.wg.Done()
 	ticker := time.NewTicker(c.heartbeatInterval)
 	defer ticker.Stop()
 	var failures int
 	for {
 		select {
-		case <-done: // 当前代连接死亡（读循环已关闭代信号）：心跳随代退出
+		case <-g.done: // 当前代连接死亡（读循环已关闭代信号）：心跳随代退出
 			return
 		case <-c.closeCh:
 			return
@@ -43,14 +43,15 @@ func (c *Client) heartbeatLoop(done chan struct{}) {
 
 // readLoop 为当前代连接循环读帧并分发；退出时关闭代信号（触发重连/关闭收尾）、
 // 回收本代 in-flight（epoch 匹配天然隔离旧代）。
-func (c *Client) readLoop(done chan struct{}) {
+// 包络非法（DecodeReply 失败）视为协议级致命错误：终止 Client（评审 B5 修复）。
+func (c *Client) readLoop(g *generation) {
 	defer func() {
-		close(done)
+		close(g.done)
 		c.wg.Done()
 	}()
 	var exitErr error
 	for {
-		hdr, body, err := frame.Read(c.currentConn(), c.maxBodySize)
+		hdr, body, err := frame.Read(g.conn, c.maxBodySize)
 		if err != nil {
 			if !c.closed.Load() {
 				exitErr = c.classifyReadError(err)
@@ -59,7 +60,10 @@ func (c *Client) readLoop(done chan struct{}) {
 		}
 		switch hdr.Type {
 		case frame.MsgTypeResponse:
-			c.dispatchResponse(hdr, body)
+			// 包络非法 = 协议级致命错误：上抛终止 Client（评审 B5 修复）。
+			if fatal := c.dispatchResponse(hdr, body); fatal != nil {
+				exitErr = fatal
+			}
 		case frame.MsgTypeNotify:
 			c.dispatchNotify(hdr, body)
 		default:
@@ -89,7 +93,9 @@ func (c *Client) terminate(cause error) {
 		close(c.closeCh)
 	}
 	c.lifecycleMu.Unlock()
-	_ = c.currentConn().Close()
+	if g := c.gen(); g != nil {
+		_ = g.conn.Close()
+	}
 	c.state.Store(int32(StateDisconnected))
 }
 

@@ -5,6 +5,7 @@
 package client
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -26,6 +27,7 @@ const (
 	defaultBackoffBase       = 500 * time.Millisecond
 	defaultBackoffMax        = 30 * time.Second
 	defaultQueueSize         = 64
+	defaultHookTimeout       = 10 * time.Second
 )
 
 // State 是客户端连接状态（规范 §5.1 状态机）。
@@ -50,15 +52,24 @@ func (s State) String() string {
 	}
 }
 
+// generation 是一次连接代际的完整快照（评审 B3 修复）：
+// epoch / 连接 / 死亡信号绑定在同一个不可变结构里，Invoke 通过单次
+// atomic Load 取齐三项，杜绝「旧 epoch + 新连接」的撕裂读。
+// 代际切换 = 整体替换该指针（setConn），旧的 generation 永不修改。
+type generation struct {
+	epoch uint64
+	conn  net.Conn
+	done  chan struct{} // 读循环退出时关闭
+}
+
 // Client 是到单个服务端的长连接客户端（内建自动重连；dual 多通道编排后续批次）。
 type Client struct {
 	addr string
 
-	// 当前代连接（重连后更换；atomic 保证 Invoke/读循环跨 goroutine 一致视图）。
-	connPtr  atomic.Pointer[net.Conn]
-	writeMu  sync.Mutex                    // 帧级写锁：并发 Invoke/Notify 回调下整帧不交错
-	connDone atomic.Pointer[chan struct{}] // 当前代的死亡信号（读循环退出时关闭）
-	epochNum atomic.Uint64                 // 连接世代：每次启动新连接循环前 +1（在 Dial/supervisor 主线程）
+	// 当前代快照：Invoke/读循环/心跳统一经 gen() 获取（评审 B3 修复）。
+	genPtr atomic.Pointer[generation]
+
+	writeMu sync.Mutex // 帧级写锁：并发 Invoke/Notify 回调下整帧不交错
 
 	serial Serializer
 	// inflight 表按 (epoch, seq) 匹配（规范 §5.2）：值使用单一所有权语义——
@@ -71,24 +82,29 @@ type Client struct {
 	onReadExit atomic.Pointer[func(error)]
 
 	// 重连配置与状态。
-	autoReconnect bool
-	backoffBase   time.Duration
-	backoffMax    time.Duration
-	queueSize     int
-	queue         chan *queuedInvoke
-	onReconnected func() error // 重连成功后的会话重登钩子（返回错误则继续退避）
-
+	autoReconnect     bool
+	backoffBase       time.Duration
+	backoffMax        time.Duration
+	queueSize         int
+	queue             chan *queuedInvoke
+	onReconnected     func() error    // 重连成功后的会话重登钩子
+	onReconnectedF    asyncHookRunner // 钩子的异步执行器（评审 B1/B2 修复）
+	hookTimeout       time.Duration   // 钩子执行超时上限
+	state             atomic.Int32    // State
+	closed            atomic.Bool     // 关闭标记（幂等）
+	closeCh           chan struct{}   // 关闭信号（所有 goroutine 的退出源）
+	lifecycleMu       sync.Mutex      // 序列化 wg.Add 与 Close 的 wg.Wait（WaitGroup 并发纪律）
+	wg                sync.WaitGroup  // supervisor + 每代读循环/心跳 + 钩子执行
+	genMu             sync.Mutex      // setConn 的代际切换互斥（切换与 wg.Add 原子）
+	fatal             atomic.Bool     // 协议级致命错误已终止 Client（不重连）
+	dialer            *net.Dialer     // 可取消拨号（评审 Important：Close 不被系统拨号阻塞）
 	heartbeatInterval time.Duration
 	invokeTimeout     time.Duration
 	maxBodySize       int
-
-	state       atomic.Int32 // State
-	lifecycleMu sync.Mutex   // 序列化 closed 标记与 wg.Add（规避 Wait/Add 竞态）
-	closed      atomic.Bool
-	closeCh     chan struct{}
-	connCloseMu sync.Mutex
-	wg          sync.WaitGroup // supervisor + 每代读循环/心跳
 }
+
+// asyncHookRunner 是重登钩子的执行形态：异步、带超时、不阻塞 supervisor。
+type asyncHookRunner func(c *Client, done chan struct{}, hookTimeout time.Duration, wg *sync.WaitGroup, closeCh chan struct{}, invokeTimeout time.Duration)
 
 // inflightKey 是 in-flight 表的复合键：(epoch, seq)。
 type inflightKey struct {
@@ -161,6 +177,9 @@ func WithReconnectQueueSize(n int) Option {
 
 // WithOnReconnected 注册重连成功后的会话钩子（业务侧在此重登/重绑定；
 // 返回错误视为本次重连未完成，SDK 继续退避重试）。
+// 钩子在独立 goroutine 执行（评审 B1/B2 修复）：不阻塞 supervisor 状态机，
+// 钩子内可安全调用 Invoke（此时状态已置 Connected）与 Close（不会自等待死锁）；
+// 执行超过 hookTimeout 视为失败，继续退避。默认 10s。
 func WithOnReconnected(fn func() error) Option {
 	return func(c *Client) { c.onReconnected = fn }
 }
@@ -176,7 +195,7 @@ func (c *Client) OnReadExit(fn func(error)) {
 
 // Dial 建立 TCP 长连接并启动读循环、心跳与重连监管。
 func Dial(addr string, opts ...Option) (*Client, error) {
-	conn, err := net.Dial("tcp", addr)
+	conn, err := (&net.Dialer{}).DialContext(context.Background(), "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
@@ -191,14 +210,17 @@ func Dial(addr string, opts ...Option) (*Client, error) {
 		backoffBase:       defaultBackoffBase,
 		backoffMax:        defaultBackoffMax,
 		queueSize:         defaultQueueSize,
+		hookTimeout:       defaultHookTimeout,
 		closeCh:           make(chan struct{}),
+		dialer:            &net.Dialer{},
 	}
+	c.onReconnectedF = runHookAsync
 	for _, opt := range opts {
 		opt(c)
 	}
 	c.queue = make(chan *queuedInvoke, c.queueSize)
 
-	// 首代连接：epoch 在本 goroutine 分配（禁止放进读循环 goroutine，见 supervisor 注释）。
+	// 首代连接：generation 在本 goroutine 构造（代际切换只在 supervisor/Dial 串行发生）。
 	c.setConn(conn)
 	c.state.Store(int32(StateConnected)) // 首连已在手，置位先于 supervisor 调度
 	c.wg.Add(1)
@@ -206,124 +228,133 @@ func Dial(addr string, opts ...Option) (*Client, error) {
 	return c, nil
 }
 
-// setConn 更换当前代连接：epoch+1、登记 conn 与死亡信号通道。
-// 必须在 Dial/supervisor 主线程调用（epoch 分配与启动顺序在此串行化）。
-func (c *Client) setConn(conn net.Conn) chan struct{} {
+// setConn 登记新一代连接：构造不可变 generation 整体替换 genPtr。
+// 必须在 Dial/supervisor 主线程调用（代际切换串行化；epoch 单调递增）。
+func (c *Client) setConn(conn net.Conn) {
+	c.genMu.Lock()
+	defer c.genMu.Unlock()
 	done := make(chan struct{})
-	c.connPtr.Store(&conn)
-	c.connDone.Store(&done)
-	c.epochNum.Add(1)
-	return done
+	prev := c.genPtr.Load()
+	epoch := uint64(1)
+	if prev != nil {
+		epoch = prev.epoch + 1
+	}
+	c.genPtr.Store(&generation{epoch: epoch, conn: conn, done: done})
 }
 
-// currentConn 返回当前代连接。
-func (c *Client) currentConn() net.Conn { return *c.connPtr.Load() }
-
-// currentConnDone 返回当前代死亡信号通道。
-func (c *Client) currentConnDone() chan struct{} { return *c.connDone.Load() }
+// gen 返回当前代快照（单次原子读，评审 B3 修复：杜绝撕裂读）。
+func (c *Client) gen() *generation { return c.genPtr.Load() }
 
 // closeConn 关闭当前代连接（触发读循环退出 → supervisor 重连）。
 func (c *Client) closeConn() {
-	_ = c.currentConn().Close()
+	if g := c.gen(); g != nil {
+		_ = g.conn.Close()
+	}
 }
 
-// supervisor 是连接生命周期监管：首代读循环启动后，监视连接死亡并驱动自动重连。
+// supervisor 是连接生命周期监管：监视连接死亡并驱动自动重连。
 func (c *Client) supervisor() {
 	defer c.wg.Done()
-	c.startConnLoops(c.currentConnDone())
-	c.state.Store(int32(StateConnected))
+	g := c.gen()
+	c.startConnLoops(g)
 
 	for {
 		select {
 		case <-c.closeCh:
 			return
-		case <-c.currentConnDone():
+		case <-g.done:
 			if c.closed.Load() {
 				return
 			}
 			// 连接死亡（对端断开/读错误/心跳死链）：进入重连。
 			// （协议级致命错误由 readLoop 直接 terminate Client，不经此路径。）
-			c.state.Store(int32(StateReconnecting))
 			if !c.autoReconnect {
 				c.state.Store(int32(StateDisconnected))
 				return
 			}
-			if !c.reconnectOnce() {
+			c.state.Store(int32(StateReconnecting))
+			ng, ok := c.reconnectOnce()
+			if !ok {
 				c.state.Store(int32(StateDisconnected))
+				return
+			}
+			// 评审 B6 修复：新连接读循环可能已在钩子/置位前遇到协议错误并 terminate
+			// （closed=true, state=Disconnected）——不得覆盖回 Connected。
+			if c.closed.Load() {
+				return
+			}
+			// 重登钩子异步执行（评审 B1/B2 修复）：不阻塞 supervisor。
+			// 钩子失败会主动关闭新连接（g.done 关闭）→ 下一轮循环再次进入重连。
+			if c.onReconnected != nil {
+				c.onReconnectedF(c, ng.done, c.hookTimeout, &c.wg, c.closeCh, c.invokeTimeout)
+			}
+			// 状态置 Connected + drain 队列：与代际切换的先后关系由 genMu 序列化，
+			// drainQueue 经 gen() 获取的就是新代（评审 B4 修复：入队方在同一临界区
+			// 判定 Connected 后必然能被本次 drain 消费，或排队满立即失败）。
+			c.genMu.Lock()
+			if c.closed.Load() {
+				// 双重检查：genMu 等待期间可能发生 terminate（评审 B6）。
+				c.genMu.Unlock()
 				return
 			}
 			c.state.Store(int32(StateConnected))
 			c.drainQueue()
+			c.genMu.Unlock()
+			g = ng // 进入下一代监视
 		}
 	}
 }
 
 // startConnLoops 为当前代连接启动读循环与心跳（每代各一对）。
-func (c *Client) startConnLoops(done chan struct{}) {
+func (c *Client) startConnLoops(g *generation) {
 	c.wg.Add(2)
-	go c.readLoop(done)
+	go c.readLoop(g)
 	if c.heartbeatInterval > 0 {
-		go c.heartbeatLoop(done)
+		go c.heartbeatLoop(g)
 	} else {
 		c.wg.Done()
 	}
 }
 
-// reconnectOnce 执行一轮「退避重连 + 重登钩子」；返回 false 表示应停止（Client 已关闭）。
-func (c *Client) reconnectOnce() bool {
+// reconnectOnce 执行一轮「退避重连 + 新连接登记」；返回新一代与是否继续。
+// 重登钩子不在本函数执行（评审 B1/B2：钩子异步化，见 supervisor）。
+func (c *Client) reconnectOnce() (*generation, bool) {
 	backoff := c.backoffBase
 	for {
 		// 退避等待（带抖动抖开重连风暴）；期间关闭则立即退出。
 		if err := sleepInterruptible(jitter(backoff), c.closeCh); err != nil {
-			return false
+			return nil, false
 		}
-		conn, err := net.Dial("tcp", c.addr)
-		if err == nil {
-			// 新连接登记（epoch 在本线程分配）；业务重登钩子失败则弃用并继续退避。
-			// lifecycleMu 保护「检查关闭 + wg.Add」的原子性（规避 Close 的 Wait/Add 竞态），
-			// goroutine 计数由 startConnLoops 内部统一 Add。
-			var done chan struct{}
-			c.lifecycleMu.Lock()
-			if c.closed.Load() {
-				c.lifecycleMu.Unlock()
-				_ = conn.Close()
-				return false
-			}
-			// startConnLoops（含 wg.Add）必须在锁内完成：
-			// 保证 Close 的 wg.Wait 开始后不可能再有 Add（WaitGroup 并发纪律）。
-			done = c.setConn(conn)
-			c.startConnLoops(done)
+		// 可取消拨号（评审 Important 修复）：Close 不被系统拨号阻塞。
+		conn, err := c.dialer.DialContext(context.Background(), "tcp", c.addr)
+		if err != nil {
+			backoff = c.nextBackoff(backoff)
+			continue
+		}
+		c.lifecycleMu.Lock()
+		if c.closed.Load() {
 			c.lifecycleMu.Unlock()
-			if c.onReconnected != nil {
-				if err := c.safeRebind(); err != nil {
-					c.closeConn()
-					backoff = c.nextBackoff(backoff)
-					continue
-				}
-			}
-			return true
+			_ = conn.Close()
+			return nil, false
 		}
-		backoff = c.nextBackoff(backoff)
+		// startConnLoops（含 wg.Add）必须在锁内完成：
+		// 保证 Close 的 wg.Wait 开始后不可能再有 Add（WaitGroup 并发纪律）。
+		c.setConn(conn)
+		ng := c.gen()
+		c.startConnLoops(ng)
+		c.lifecycleMu.Unlock()
+		return ng, true
 	}
 }
 
-// safeRebind 带保护的会话重登钩子执行。
-func (c *Client) safeRebind() (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("client: 重连钩子 panic: %v", r)
-		}
-	}()
-	return c.onReconnected()
-}
-
-// nextBackoff 计算下一轮退避时长（×2 封顶 + 20% 抖动）。
+// nextBackoff 计算下一轮退避时长（×2 封顶；抖动只在睡眠时应用一次，
+// 评审 Important 修复：不再在保存下一档时重复抖动）。
 func (c *Client) nextBackoff(cur time.Duration) time.Duration {
 	next := cur * 2
 	if next > c.backoffMax {
 		next = c.backoffMax
 	}
-	return jitter(next)
+	return next
 }
 
 // State 返回当前连接状态。
@@ -340,26 +371,75 @@ func (c *Client) nextSeq() uint32 {
 	}
 }
 
-// epoch 返回当前连接世代。
-func (c *Client) epoch() uint64 { return c.epochNum.Load() }
-
 // Close 优雅关闭：停止重连与心跳、断开当前连接、取消全部 in-flight 与排队请求。
-// 幂等；任何时刻调用都不会死锁。
+// 幂等；任何时刻调用都不会死锁（钩子异步化后 supervisor 不再被业务回调阻塞；
+// wg.Wait 的每一项都能在 closeCh 关闭后独立退出）。
 func (c *Client) Close() error {
 	c.lifecycleMu.Lock()
 	if c.closed.Swap(true) {
 		c.lifecycleMu.Unlock()
-		<-c.closeCh
 		c.wg.Wait()
 		return nil
 	}
 	close(c.closeCh)
-	err := c.currentConn().Close()
+	if g := c.gen(); g != nil {
+		_ = g.conn.Close()
+	}
 	c.lifecycleMu.Unlock()
 
-	c.wg.Wait() // supervisor 收到 closeCh 退出；各代读循环因 conn 关闭退出
+	c.wg.Wait() // supervisor/读循环/心跳/钩子执行器均监听 closeCh 或连接关闭
 	c.failAllInflight(errors.New("client: 连接已关闭"))
 	c.failAllQueued()
 	c.state.Store(int32(StateDisconnected))
-	return err
+	return nil
+}
+
+// connOfDone 按代信号通道精确查找对应代的连接（钩子失败只弃用自己那一代）。
+// 找不到（已被换代且 old done 不再是当前代）返回 nil，调用方跳过关闭。
+func (c *Client) connOfDone(done chan struct{}) net.Conn {
+	g := c.genPtr.Load()
+	if g != nil && g.done == done {
+		return g.conn
+	}
+	return nil
+}
+
+// runHookAsync 是默认的钩子异步执行器：独立 goroutine + 超时 + panic 保护。
+// 钩子执行时状态已是 Connected（supervisor 在调度本执行器前已置位），
+// 因此钩子内调用 Invoke 走正常写帧路径（评审 B1 修复）。
+// 钩子在独立 goroutine，Close 的 wg.Wait 等待的是本执行器（监听 closeCh 可退出），
+// 不可能等待业务回调自身（评审 B2 修复）。
+func runHookAsync(c *Client, done chan struct{}, hookTimeout time.Duration, wg *sync.WaitGroup, closeCh chan struct{}, invokeTimeout time.Duration) {
+	// 注意：本执行器 goroutine 不加入 wg（评审 B2 修复的关键）——
+	// 若加入，钩子内调用 Close 时 Close 的 wg.Wait 会等待本执行器，
+	// 而本执行器又阻塞在钩子里，形成自等待死锁。执行器监听 closeCh
+	// 或钩子完成即退出；Close 返回后钩子可能仍在运行（文档明示语义）。
+	go func() {
+		// 等待本代读循环就绪（连接可用）后再执行钩子，避免钩子 Invoke 撞上
+		// 尚未完成的代际初始化。读循环 panic 由自身 recover 语义覆盖。
+		timer := time.NewTimer(hookTimeout)
+		defer timer.Stop()
+		result := make(chan error, 1)
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					result <- fmt.Errorf("client: 重连钩子 panic: %v", r)
+				}
+			}()
+			result <- c.onReconnected()
+		}()
+		select {
+		case err := <-result:
+			if err != nil {
+				// 钩子失败：弃用「本次重连的那一代」连接（精确匹配 done），
+				// 不得用 c.gen()（supervisor 可能已换代，误杀新连接）。
+				_ = c.connOfDone(done).Close()
+			}
+		case <-timer.C:
+			// 钩子超时：同失败路径（业务回调可能仍在运行，但不再阻塞状态机；
+			// 其后续 Invoke 会因连接已被关闭而快速失败）。
+			_ = c.connOfDone(done).Close()
+		case <-closeCh:
+		}
+	}()
 }
