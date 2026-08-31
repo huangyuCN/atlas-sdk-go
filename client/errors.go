@@ -71,6 +71,3 @@ func IsBusinessError(err error, reason string) bool {
 	}
 	return be.Reason == reason
 }
-
-// errorsIs 是 errors.Is 的局部别名（供 client.go 使用，避免额外 import 扩散）。
-func errorsIs(err, target error) bool { return errors.Is(err, target) }

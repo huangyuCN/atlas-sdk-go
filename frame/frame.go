@@ -97,11 +97,7 @@ func Write(w io.Writer, h Header, body []byte, maxBodySize int) error {
 	h.Length = uint32(len(body))
 
 	var buf [HeaderSize]byte
-	binary.BigEndian.PutUint32(buf[0:4], h.Magic)
-	buf[4] = h.Version
-	buf[5] = byte(h.Type)
-	binary.BigEndian.PutUint32(buf[8:12], h.Seq)
-	binary.BigEndian.PutUint32(buf[12:16], h.Length)
+	encodeHeaderInto(buf[:], h)
 
 	if len(body) > 0 {
 		if bufs, ok := writevBuffers(w, buf[:], body); ok {

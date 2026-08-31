@@ -100,7 +100,7 @@ func TestRebindHookInvoke(t *testing.T) {
 
 	c, err := Dial(s.ln.Addr().String(),
 		WithHeartbeatInterval(0),
-		WithInvokeTimeout(500*time.Millisecond),
+		WithInvokeTimeout(3*time.Second), // 排队期限覆盖重连+钩子链
 		WithBackoff(50*time.Millisecond, 200*time.Millisecond),
 		WithOnReconnected(func() error {
 			relogged.Store(true)
@@ -256,7 +256,7 @@ func TestRebindHookFailureRetries(t *testing.T) {
 
 	c, err := Dial(s.ln.Addr().String(),
 		WithHeartbeatInterval(0),
-		WithInvokeTimeout(500*time.Millisecond),
+		WithInvokeTimeout(3*time.Second),
 		WithBackoff(50*time.Millisecond, 200*time.Millisecond),
 		WithOnReconnected(func() error {
 			// 前两次失败，第三次成功

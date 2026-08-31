@@ -7,16 +7,62 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/huangyuCN/atlas-sdk-go/frame"
 )
 
-// fakeServer 是最小服务端替身：按 operation 回响应，可主动推 Notify。
-type fakeServer struct {
-	ln       net.Listener
+// echoService 是 TCP/WS 测试服务端共用的请求处理逻辑（operation 语义两侧行一致）：
+// Heartbeat 记录并回空包；boom 回业务错误 Status；notify-op 先推一条 Notify 再回空包；
+// kick 回空包后断开（模拟服务端踢线）；hold 等待放行信号后回显（in-flight 隔离测试用）；
+// 其余 operation 回显 payload。
+type echoService struct {
 	pingSeen chan struct{} // 收到心跳时写入（容量 1）
+	reqN     atomic.Int32  // 已处理请求数
+	holdSeen chan struct{} // hold 请求到达信号（容量 1；nil = 未启用）
+	release  chan struct{} // hold 放行信号（nil = 未启用）
+}
+
+// handleRequest 处理一帧请求：返回回包 body、需先推的 Notify body（可空）、是否随后断连。
+func (e *echoService) handleRequest(op string, payload []byte) (resp, notifyBody []byte, closeConn bool) {
+	e.reqN.Add(1)
+	switch op {
+	case HeartbeatOperation:
+		select {
+		case e.pingSeen <- struct{}{}:
+		default:
+		}
+		return replyBytes(nil, nil), nil, false
+	case "boom":
+		return replyBytes(testStatus(400, "NOT_ENOUGH_GOLD", "金币不足"), nil), nil, false
+	case "notify-op":
+		nb, _ := frame.BuildRequestBody("/push.test", []byte(`{"k":"v"}`))
+		return replyBytes(nil, nil), nb, false
+	case "kick":
+		return replyBytes(nil, nil), nil, true
+	case "hold":
+		if e.holdSeen != nil {
+			e.holdSeen <- struct{}{}
+		}
+		if e.release != nil {
+			<-e.release
+		}
+		return replyBytes(nil, payload), nil, false
+	default: // echo
+		return replyBytes(nil, payload), nil, false
+	}
+}
+
+// requestCount 返回已处理请求数（断言「请求只到达指定通道」用）。
+func (e *echoService) requestCount() int32 { return e.reqN.Load() }
+
+// fakeServer 是最小 TCP 服务端替身：按 operation 回响应，可主动推 Notify。
+type fakeServer struct {
+	ln net.Listener
+	echoService
+	connClosed atomic.Int32 // 服务端侧连接被对端关闭的次数（回滚测试用）
 }
 
 func startFakeServer(t *testing.T) *fakeServer {
@@ -25,7 +71,11 @@ func startFakeServer(t *testing.T) *fakeServer {
 	if err != nil {
 		t.Fatalf("监听失败: %v", err)
 	}
-	s := &fakeServer{ln: ln, pingSeen: make(chan struct{}, 1)}
+	s := &fakeServer{ln: ln, echoService: echoService{
+		pingSeen: make(chan struct{}, 1),
+		holdSeen: make(chan struct{}, 1),
+		release:  make(chan struct{}),
+	}}
 	go s.serve()
 	t.Cleanup(func() { _ = ln.Close() })
 	return s
@@ -43,10 +93,11 @@ func (s *fakeServer) serve() {
 	}
 }
 
-// handle 单连接循环：echo 回显 payload；Heartbeat 记录并回空包；
-// boom 回业务错误 Status；notify-op 先推一条 Notify 再回空包；silent 只收不回。
 func (s *fakeServer) handle(conn net.Conn) {
-	defer func() { _ = conn.Close() }()
+	defer func() {
+		_ = conn.Close()
+		s.connClosed.Add(1)
+	}()
 	for {
 		hdr, body, err := frame.Read(conn, frame.MaxBodySize)
 		if err != nil {
@@ -59,34 +110,26 @@ func (s *fakeServer) handle(conn net.Conn) {
 		if err != nil {
 			return
 		}
-		switch op {
-		case HeartbeatOperation:
-			select {
-			case s.pingSeen <- struct{}{}:
-			default:
-			}
-			s.reply(conn, hdr.Seq, replyBytes(nil, nil))
-		case "boom":
-			s.reply(conn, hdr.Seq, replyBytes(testStatus(400, "NOT_ENOUGH_GOLD", "金币不足"), nil))
-		case "notify-op":
-			_ = s.push(conn, "/push.test", []byte(`{"k":"v"}`))
-			s.reply(conn, hdr.Seq, replyBytes(nil, nil))
-		default: // echo
-			s.reply(conn, hdr.Seq, replyBytes(nil, payload))
+		resp, notifyBody, closeConn := s.handleRequest(op, payload)
+		if notifyBody != nil {
+			_ = s.push(conn, notifyBody)
+		}
+		s.reply(conn, hdr.Seq, resp)
+		if closeConn {
+			return
 		}
 	}
 }
+
+// closedCount 返回服务端侧观测到的连接关闭次数。
+func (s *fakeServer) closedCount() int32 { return s.connClosed.Load() }
 
 func (s *fakeServer) reply(conn net.Conn, seq uint32, body []byte) {
 	_ = frame.Write(conn, frame.Header{Type: frame.MsgTypeResponse, Seq: seq}, body, frame.MaxBodySize)
 }
 
-// push 主动向客户端推送一条 Notify 帧。
-func (s *fakeServer) push(conn net.Conn, op string, payload []byte) error {
-	body, err := frame.BuildRequestBody(op, payload)
-	if err != nil {
-		return err
-	}
+// push 主动向客户端推送一条 Notify 帧（body 为完整帧 body）。
+func (s *fakeServer) push(conn net.Conn, body []byte) error {
 	return frame.Write(conn, frame.Header{Type: frame.MsgTypeNotify, Seq: 999}, body, frame.MaxBodySize)
 }
 
@@ -190,23 +233,9 @@ func TestInvokeBusinessError(t *testing.T) {
 
 // TestInvokeTimeout 验证无响应请求按超时失败（TimeoutError）。
 func TestInvokeTimeout(t *testing.T) {
-	// 只收不回的静默服务端。
-	silent, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("监听失败: %v", err)
-	}
-	defer func() { _ = silent.Close() }()
-	go func() {
-		for {
-			c2, e := silent.Accept()
-			if e != nil {
-				return
-			}
-			_ = c2
-		}
-	}()
+	ln := startSilentServer(t)
 
-	c, err := Dial(silent.Addr().String(), WithInvokeTimeout(100*time.Millisecond))
+	c, err := Dial(ln.Addr().String(), WithInvokeTimeout(100*time.Millisecond))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -269,22 +298,9 @@ func TestHeartbeatKeepAlive(t *testing.T) {
 
 // TestCloseCancelsInflight 验证 Close 后 in-flight 请求收到 NetworkError。
 func TestCloseCancelsInflight(t *testing.T) {
-	silent, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("监听失败: %v", err)
-	}
-	defer func() { _ = silent.Close() }()
-	go func() {
-		for {
-			c2, e := silent.Accept()
-			if e != nil {
-				return
-			}
-			_ = c2
-		}
-	}()
+	ln := startSilentServer(t)
 
-	c, err := Dial(silent.Addr().String(), WithInvokeTimeout(time.Second))
+	c, err := Dial(ln.Addr().String(), WithInvokeTimeout(time.Second))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -371,12 +387,12 @@ func TestProtocolErrorOnBadFrame(t *testing.T) {
 		t.Fatal("非法帧后 Invoke 应失败")
 	}
 	// 连接应标记为已关闭（读循环终止后 shutdown）
-	if !c.closed.Load() {
+	if !c.business.closed.Load() {
 		t.Error("协议错误后连接应已关闭")
 	}
 	// 读循环对协议错误的分类：classifyReadError 直接验证（invoke 侧可能被
 	// closeCh 分支抢先返回 NetworkError，属正常竞态——两者都是合法结果）
-	classified := c.classifyReadError(fmt.Errorf("frame: invalid version: %w", frame.ErrProtocol))
+	classified := c.business.classifyReadError(fmt.Errorf("frame: invalid version: %w", frame.ErrProtocol))
 	var pe *ProtocolError
 	if !errors.As(classified, &pe) {
 		t.Fatalf("classifyReadError 对 ErrProtocol 应返回 ProtocolError, 实际 %T: %v", classified, classified)
@@ -393,8 +409,8 @@ func TestSeqZeroSkipped(t *testing.T) {
 	defer func() { _ = c.Close() }()
 
 	// 直接把 seq 推到回绕边界，验证下一个 seq 不为 0
-	c.seq.Store(0xFFFFFFFF)
-	seq := c.nextSeq()
+	c.business.seq.Store(0xFFFFFFFF)
+	seq := c.business.nextSeq()
 	if seq == 0 {
 		t.Fatal("回绕守卫失效: nextSeq 返回 0")
 	}

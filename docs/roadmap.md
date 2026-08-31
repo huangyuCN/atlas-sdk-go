@@ -5,22 +5,33 @@
 > README 不依赖它）。服务端对接基准：atlas `feat/actor` 分支（golden manifest
 > `atlasCommit` 字段锁定，当前 `0ba52c0`）。
 
-## 当前状态（2026-08-31）
+## 当前状态（2026-08-31，v0.3 完成）
 
-- v0.1/v0.2 已完成并推送：帧编解码、golden vectors（21 用例）、TCP 通道、
-  Invoke 匹配、双层心跳语义、断线自动重连（supervisor 多代连接 + 状态机 +
-  请求排队 + 会话重登钩子）、错误四分类。
-- 真连接冒烟已通过：`examples/smoke` 对集成服务器（10.10.9.36）模板四服务
-  跑通 注册→登录→双层心跳→kill/重启 gateway 重连演练 全链路。
-- 目录速览：`frame/`（协议层，零依赖）、`client/`（内核：client/invoke/notify/
-  heartbeat/reconnect/queue/errors/serializer）、`examples/smoke/`、
-  `testdata/golden/`。
+- v0.1/v0.2/v0.3 已完成：帧编解码、golden vectors（21 用例）、TCP 通道、Invoke 匹配、
+  传输心跳 + **SDK 内置会话心跳调度（v0.3 评审修复）**、断线自动重连（supervisor 多代连接 +
+  状态机 + 请求排队 + 会话重登钩子）、错误四分类、**dual 双通道编排（v0.3）**、
+  **WebSocket 通道（v0.3）**、**业务重登成功后自动触发战斗重绑（v0.3 评审修复）**。
+- v0.3 交付内容：
+  - Channel 抽象拆分：`Client` 为编排器（门面），`channel`（内部）为连接本体；
+    `Dial/DialWS/DialDual` 构造，`Channel(kind)` 视图（独立 Invoke/On/State），
+    `Client.State()` 聚合向下降级；每通道独立心跳/重连/排队/会话钩子
+    （`ChannelConfig.Opts` 按通道覆盖，业务重登 + 战斗 Join 重绑定）。
+  - WebSocket 通道：`transport_ws.go`（gorilla/websocket，一条消息 = 一个完整帧，
+    `frame.Encode/Decode` 消息边界编解码），`DialWS(addr, path)` 默认路径 `/ws`。
+  - 验收全绿：golden vectors 全绿；`-race` 全绿；真服务（10.10.9.36）TCP/WS/dual
+    三形态冒烟通过；dual 重连演练（重启 gateway）双通道独立恢复（业务重登 + 战斗重绑定）。
+- 目录速览：`frame/`（协议层，零依赖）、`client/`（client 编排器 / channel 连接本体 /
+  options / transport（TCP+WS）/ invoke / notify / heartbeat / reconnect / queue / errors /
+  serializer）、`examples/smoke/`（`-transport tcp|ws` / `-dual` 三形态）、`testdata/golden/`。
+- 实测经验（对接真实网关时注意）：**战斗通道不要做业务 Login**——网关会话为
+  每玩家单会话，二次登录会顶掉业务通道会话（规范 §5.2 会话绑定业务通道）；
+  战斗通道连通性验证用传输心跳 `client.HeartbeatOperation` 往返即可。
 
-## v0.3：dual 双通道编排 + WebSocket 通道
+## v0.3：dual 双通道编排 + WebSocket 通道（已完成）
 
 ### Channel 抽象拆分（先做，重构性质）
 
-现状：`client.Client` 既是「连接本体」又是「门面」。v0.3 需拆为：
+现状：~~`client.Client` 既是「连接本体」又是「门面」~~ → 已拆为：
 
 ```
 Client（编排器，对外 API 不变）
@@ -46,8 +57,8 @@ Channel（连接本体，内部）
   （`ReadMessage` → 帧解析；写侧整帧单次 `WriteMessage` + 写锁）。
 - 浏览器/单通道形态对齐模板约定：服务端 `/ws` 路径包装（模板 e2e 的 WSURL
   形如 `ws://host:port/ws`）；SDK 侧 `DialWS(addr, path)`。
-- Node 下 WS 客户端同实现；`nhooyr.io/websocket` 或 gorilla 二选一
-  （gorilla 已回归维护，推荐）。
+- WS 库选型已定：**gorilla/websocket**（已回归维护；`transport_ws.go`，
+  读侧 `SetReadLimit` 对齐 bodyLen 上限、超限归类协议错误）。
 - 验收：对模板 gateway WS 通道（9002）跑通注册/登录/心跳，`examples/smoke`
   加 `-transport ws` 形态。
 

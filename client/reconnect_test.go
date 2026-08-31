@@ -70,6 +70,13 @@ func (s *reconnServer) handle(conn net.Conn) {
 			_ = frame.Write(conn, frame.Header{Type: frame.MsgTypeResponse, Seq: hdr.Seq},
 				replyBytes(nil, nil), frame.MaxBodySize)
 			return // defer 关闭连接 → 客户端侧读循环退出
+		case "notify-op":
+			// 先推一条 Notify 再回响应（与 client_test 的 fakeServer 同款语义），
+			// 支撑「订阅重放」真实验证（评审 B5）。
+			nb, _ := frame.BuildRequestBody("/push.test", []byte(`{"k":"v"}`))
+			_ = frame.Write(conn, frame.Header{Type: frame.MsgTypeNotify, Seq: 999}, nb, frame.MaxBodySize)
+			_ = frame.Write(conn, frame.Header{Type: frame.MsgTypeResponse, Seq: hdr.Seq},
+				replyBytes(nil, nil), frame.MaxBodySize)
 		default:
 			_ = frame.Write(conn, frame.Header{Type: frame.MsgTypeResponse, Seq: hdr.Seq},
 				replyBytes(nil, payload), frame.MaxBodySize)
@@ -134,13 +141,20 @@ func TestAutoReconnect(t *testing.T) {
 		t.Fatalf("回显不一致: %+v", resp)
 	}
 
-	// 订阅重放：触发服务端在新连接上推送（echo op 与订阅 op 不同则用 push 模拟：
-	// 向自己 On 的 op 发 Invoke 会被 echo 回响应而非 Notify——此处直接断言订阅仍注册）。
-	if len(s.conns) == 0 {
-		t.Fatal("服务端未记录到重连后的新连接")
+	// 订阅重放（评审 B5 修复：真实验证而非空引用）：
+	// notify-op 会先推一条 Notify 再回响应——重连后发送它，
+	// 断言订阅表（Client 级保留、跨连接重放）把 Notify 送达了 handler。
+	if err := c.Invoke(context.Background(), "notify-op", nil, nil); err != nil {
+		t.Fatalf("重连后 notify-op: %v", err)
 	}
-	_ = notified
-	_ = off
+	select {
+	case got := <-notified:
+		if got == "" {
+			t.Fatal("重连后 Notify 送达但 payload 为空")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("订阅重放失效：重连后 2s 内未收到 Notify（评审 B5）")
+	}
 }
 
 // waitReconnecting 等待客户端进入 Reconnecting（断连已被感知）。
