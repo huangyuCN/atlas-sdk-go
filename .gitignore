@@ -43,3 +43,5 @@ bin/
 *.test
 *.out
 .zcode/
+smoke
+examples/smoke/smoke
