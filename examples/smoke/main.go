@@ -97,7 +97,8 @@ func main() {
 }
 
 // runSingle 单通道冒烟：注册 → 登录 → 业务心跳 →（可选）重连演练 → 传输心跳确认。
-// 会话重登钩子：服务端重启后会话丢失，重登由业务层负责（规范 §5.2 双层心跳）。
+// 会话重登钩子：服务端重启后会话丢失，重登由业务层负责（规范 §5.2 双层心跳）；
+// SDK 内置会话心跳调度（WithSessionHeartbeat）按周期续租会话。
 func runSingle(dial dialFn, account string, reconnectAfter time.Duration) {
 	var (
 		c           *client.Client
@@ -107,9 +108,12 @@ func runSingle(dial dialFn, account string, reconnectAfter time.Duration) {
 		reloggedIn  = make(chan struct{})
 	)
 	var err error
-	c, err = dial(append(smokeDialOpts(), client.WithOnReconnected(func() error {
-		return relogin(c, account, &player, &token, reloggedIn, &rebindCalls)
-	}))...)
+	c, err = dial(append(smokeDialOpts(),
+		client.WithOnReconnected(func() error {
+			return relogin(c, account, &player, &token, reloggedIn, &rebindCalls)
+		}),
+		sessionHeartbeatOpt(&player, &token),
+	)...)
 	if err != nil {
 		fail("连接失败: %v", err)
 	}
@@ -146,9 +150,12 @@ func runDual(tcpAddr, wsAddr, wsPath, account string, reconnectAfter time.Durati
 	c, err = client.DialDual(
 		client.ChannelConfig{
 			Addr: tcpAddr,
-			Opts: []client.Option{client.WithOnReconnected(func() error {
-				return relogin(c, account, &player, &token, reloggedIn, &rebindCalls)
-			})},
+			Opts: []client.Option{
+				client.WithOnReconnected(func() error {
+					return relogin(c, account, &player, &token, reloggedIn, &rebindCalls)
+				}),
+				sessionHeartbeatOpt(&player, &token), // 会话心跳仅业务通道生效
+			},
 		},
 		client.ChannelConfig{
 			Transport: client.TransportWS,
@@ -226,6 +233,19 @@ func relogin(c *client.Client, account string, player, token *string, done chan 
 // battlePing 战斗通道连通性验证：传输心跳往返（服务端引擎内置 handler，不触碰业务会话）。
 func battlePing(c *client.Client) error {
 	return c.Channel(client.KindBattle).Invoke(context.Background(), client.HeartbeatOperation, nil, nil)
+}
+
+// sessionHeartbeatOpt 会话心跳配置（规范 §5.2 业务层；闭包携带最新 token/player，
+// 未登录时跳过本轮）。网关会话租期 30s，周期取 2s（远小于 租期/2）。
+func sessionHeartbeatOpt(player, token *string) client.Option {
+	return client.WithSessionHeartbeat(2*time.Second, func() (string, any) {
+		if *token == "" {
+			return "", nil // 未登录：跳过
+		}
+		return opHeartbeat, heartbeatReq{
+			Token: *token, PlayerId: *player, Ts: fmt.Sprintf("%d", time.Now().UnixMilli()),
+		}
+	})
 }
 
 // signalOnce 非阻塞通知（容量 1）：钩子多次成功触发（网关反复抖动）时只保留首个信号。

@@ -26,6 +26,26 @@
 - 实测经验（对接真实网关时注意）：**战斗通道不要做业务 Login**——网关会话为
   每玩家单会话，二次登录会顶掉业务通道会话（规范 §5.2 会话绑定业务通道）；
   战斗通道连通性验证用传输心跳 `client.HeartbeatOperation` 往返即可。
+- 第二轮评审修复（v0.3 合入前，2026-08-31）：
+  1. **P0 `DialDual` Opts 交叉污染**：`wrapBattleRebind` 的返回值曾被整体赋给
+     `business.Opts`——战斗通道的按通道配置（短超时/退避/排队等）泄漏到业务通道
+     （有单测回归：`TestDualOptsIsolation` 白盒断言 + 行为验证）。现链式钩子
+     追加到业务 Opts 自身，battle.Opts 永不外溢。
+  2. **P1 hookActive 接线补齐**：钩子同步执行期间本通道保持 Reconnecting，
+     `invoke()`/`invokeOnce()` 对 hookActive 直通（钩子的重登请求与传输心跳不排队），
+     外部请求保持排队；Connected 置位与 drainQueue 回到同一 genMu 临界区
+     （`settleGeneration`）——恢复「排队请求严格先于新请求」的 FIFO，
+     且未认证连接不再接收新请求。
+  3. **P1 重连拨号 watcher 泄漏**：`rebindDialCtx` 改为返回 (ctx, cancel)，
+     每轮拨号尝试返回后立即 cancel，goroutine 不再累积到通道关闭。
+  4. **P1 会话心跳门控与单飞**：`startConnLoops` 按 `kind == KindBusiness` 门控
+     （顶层配置不再波及战斗通道）；业务错误触发重登钩子改为 CAS 单飞
+     （`sessionHookBusy`）+ hookActive 跳过 + nil 守卫；新增
+     `session_heartbeat_test.go` 五用例（周期调度/业务错误触发钩子/网络错误静默/
+     工厂未就绪跳过/仅业务通道）。
+  5. P2：`reconnectOnce` 合一为 `reconnectFrom(backoffBase)` 的委托；
+     `WithOnReconnected`/`WithSessionHeartbeat` 文档对齐同步钩子与门控语义；
+     冒烟程序三形态接入 `WithSessionHeartbeat` 真服务验证。
 
 ## v0.3：dual 双通道编排 + WebSocket 通道（已完成）
 

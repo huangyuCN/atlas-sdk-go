@@ -252,26 +252,29 @@ func DialDual(business, battle ChannelConfig, opts ...Option) (*Client, error) {
 	// 评审 v0.3-B2 修复：业务重登成功后自动触发战斗通道重绑（Join），
 	// 规范 §5.2「业务通道重连成功后由 SDK 自动对战斗通道执行重新绑定」。
 	// 实现为链式包装（追加到业务通道）：业务钩子 = 业务重登 → 成功后调用战斗钩子。
-	business.Opts = wrapBattleRebind(&business.Opts, &battle.Opts)
+	// 注意：链式编排要求两个钩子都配置在 ChannelConfig.Opts——
+	// 顶层 Option 配置的钩子按「全部通道默认值」生效，不参与链式编排。
+	business.Opts = wrapBattleRebind(business.Opts, battle.Opts)
 	return dialChannels([]ChannelConfig{business, battle}, opts)
 }
 
 // wrapBattleRebind 从两个通道的 Opts 中提取各自的 WithOnReconnected 钩子，
-// 将战斗通道钩子包装为「业务重登成功后自动执行」的链式形态并追加到战斗 Opts 末尾
-// （后应用的 Option 覆盖先前的同名钩子）。返回修改后的战斗通道 Opts。
-// 任一侧无钩子则无从编排：保持原样（每通道独立钩子语义）。
-func wrapBattleRebind(bizOpts, batOpts *[]Option) []Option {
+// 将「业务钩子 → 战斗钩子」的链式形态追加到业务 Opts 末尾并返回
+// （后应用的 Option 覆盖先前的同名钩子，业务通道最终生效链式钩子）。
+// 战斗通道 Opts 原样返回、不做任何拼接——战斗通道的重绑钩子由其自身重连独立触发。
+// 任一侧无钩子则无从编排：业务 Opts 原样返回（每通道独立钩子语义）。
+func wrapBattleRebind(bizOpts, batOpts []Option) []Option {
 	bizProbe := defaultSettings()
-	for _, o := range *bizOpts {
+	for _, o := range bizOpts {
 		o(&bizProbe)
 	}
 	batProbe := defaultSettings()
-	for _, o := range *batOpts {
+	for _, o := range batOpts {
 		o(&batProbe)
 	}
 	bizHook, batHook := bizProbe.onReconnected, batProbe.onReconnected
 	if bizHook == nil || batHook == nil {
-		return *batOpts
+		return bizOpts
 	}
 	chained := func() error {
 		if err := bizHook(); err != nil {
@@ -279,7 +282,9 @@ func wrapBattleRebind(bizOpts, batOpts *[]Option) []Option {
 		}
 		return batHook()
 	}
-	return append(*batOpts, WithOnReconnected(chained))
+	out := make([]Option, 0, len(bizOpts)+1)
+	out = append(out, bizOpts...)
+	return append(out, WithOnReconnected(chained))
 }
 
 // dialChannels 是全部构造器的公共路径：逐通道构建连接本体并启动监管；

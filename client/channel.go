@@ -43,7 +43,8 @@ type channel struct {
 	onReconnected     func() error   // 重连成功后的会话钩子（业务重登 / Join 重绑定）
 	hookTimeout       time.Duration  // 钩子执行超时上限
 	state             atomic.Int32   // State
-	hookActive        atomic.Bool    // 会话钩子正在同步执行（钩子内 Invoke 放行直通，评审 v0.3-B1 配套）
+	hookActive        atomic.Bool    // 会话钩子同步执行中（runHookSync）：钩子内 Invoke 与传输心跳直通，外部请求排队
+	sessionHookBusy   atomic.Bool    // 会话心跳路径的钩子单飞标记（避免并发重登）
 	closed            atomic.Bool    // 关闭标记（幂等）
 	closeCh           chan struct{}  // 关闭信号（本通道所有 goroutine 的退出源）
 	lifecycleMu       sync.Mutex     // 序列化 wg.Add 与 Close 的 wg.Wait（WaitGroup 并发纪律）
@@ -180,43 +181,51 @@ func (ch *channel) supervisor() {
 			if ch.closed.Load() {
 				return
 			}
-			// 评审 v0.3-B1 修复：钩子成功前不 drain（排队请求等待「重连+重登成功」后重发）。
-			// 每轮循环：置 Connected（连接可用，钩子内 Invoke 可直写）→ 同步钩子 →
-			// 失败则置 Reconnecting、弃用本代、退避重连后重试（排队请求保留）。
-			// 钩子失败无限重试（规范「返回错误视为本次重连未完成，SDK 继续退避重试」），
-			// 退避间隔天然限流；Close 可随时打断。
-			for {
-				ch.genMu.Lock()
-				if ch.closed.Load() {
-					// 双重检查：genMu 等待期间可能发生 terminate（评审 B6）。
-					ch.genMu.Unlock()
-					return
-				}
-				ch.state.Store(int32(StateConnected))
-				ch.genMu.Unlock()
-				if ch.onReconnected == nil {
-					break
-				}
-				if err := ch.runHookSync(ng); err == nil {
-					break // 钩子成功
-				}
-				// 钩子失败：排队请求保留（未重发、无副作用）；弃用本代、退避、重连后重试。
-				ch.state.Store(int32(StateReconnecting))
+			// 会话钩子与队列 drain（评审 v0.3-B1）：见 settleGeneration。
+			ng, ok = ch.settleGeneration(ng)
+			if !ok {
+				ch.state.Store(int32(StateDisconnected))
+				return
+			}
+			g = ng // 进入下一代监视
+		}
+	}
+}
+
+// settleGeneration 在重连成功后的代际上执行会话钩子与队列 drain：
+//   - 无钩子：置 Connected + drain（同一 genMu 临界区，排队请求严格先于新请求）；
+//   - 有钩子：钩子同步执行期间保持 Reconnecting（外部请求继续排队、不外发未认证
+//     请求；钩子内 Invoke 经 hookActive 直通）；成功后才置 Connected + drain。
+//
+// 钩子失败无限重试（规范「返回错误视为本次重连未完成，SDK 继续退避重试」）：
+// 保留排队请求（未重发、无副作用）、弃用本代连接、退避重连后再试；Close 可随时打断。
+// 返回最终代与是否继续（false = 已关闭，调用方直接退出）。
+func (ch *channel) settleGeneration(ng *generation) (*generation, bool) {
+	for {
+		if ch.onReconnected != nil {
+			if err := ch.runHookSync(ng); err != nil {
 				ch.closeGeneration(ng.done)
-				ng2, ok2 := ch.reconnectFrom(ch.backoffBase)
-				if !ok2 {
-					ch.state.Store(int32(StateDisconnected))
-					return
+				ng2, ok := ch.reconnectFrom(ch.backoffBase)
+				if !ok {
+					return nil, false
 				}
 				ng = ng2
 				if ch.closed.Load() {
-					return
+					return nil, false
 				}
+				continue
 			}
-			// 钩子成功（或无钩子）：此时才 drain——排队请求按「重连+重登成功」语义重发。
-			ch.drainQueue()
-			g = ng // 进入下一代监视
 		}
+		ch.genMu.Lock()
+		if ch.closed.Load() {
+			// 双重检查：genMu 等待期间可能发生 terminate（评审 B6）。
+			ch.genMu.Unlock()
+			return nil, false
+		}
+		ch.state.Store(int32(StateConnected))
+		ch.drainQueue()
+		ch.genMu.Unlock()
+		return ng, true
 	}
 }
 
@@ -226,7 +235,11 @@ func (ch *channel) reconnectFrom(backoff time.Duration) (*generation, bool) {
 		if err := sleepInterruptible(jitter(backoff), ch.closeCh); err != nil {
 			return nil, false
 		}
-		tr, err := ch.dialFn(ch.rebindDialCtx())
+		// 可取消拨号（评审 v0.3-B4 修复）：Close 不被系统拨号阻塞；
+		// 拨号返回（成败皆然）后立即 cancel，释放 watcher goroutine。
+		ctx, cancel := ch.rebindDialCtx()
+		tr, err := ch.dialFn(ctx)
+		cancel()
 		if err != nil {
 			backoff = ch.nextBackoff(backoff)
 			continue
@@ -246,9 +259,11 @@ func (ch *channel) reconnectFrom(backoff time.Duration) (*generation, bool) {
 }
 
 // startConnLoops 为当前代连接启动读循环、传输心跳与会话心跳（每代）。
+// 会话心跳仅业务通道启动（规范 §5.2：会话绑定业务通道，战斗通道不续租）。
 func (ch *channel) startConnLoops(g *generation) {
+	sessionHB := ch.kind == KindBusiness && ch.sessionHBInterval > 0 && ch.sessionHBOp != nil
 	n := 2
-	if ch.sessionHBInterval > 0 && ch.sessionHBOp != nil {
+	if sessionHB {
 		n = 3
 	}
 	ch.wg.Add(n)
@@ -258,15 +273,15 @@ func (ch *channel) startConnLoops(g *generation) {
 	} else {
 		ch.wg.Done()
 	}
-	if ch.sessionHBInterval > 0 && ch.sessionHBOp != nil {
+	if sessionHB {
 		go ch.sessionHeartbeatLoop(g)
 	}
 }
 
-// sessionHeartbeatLoop 会话心跳调度（规范 §5.2 双层心跳的业务层）：
+// sessionHeartbeatLoop 会话心跳调度（规范 §5.2 双层心跳的业务层；仅业务通道启动）：
 // 周期 Invoke 业务 Heartbeat（op/req 由 opFactory 提供，业务侧闭包携带最新 token）；
-// 业务错误（*BusinessError，如会话过期）触发重登钩子（会话失效语义）；
-// 网络错误静默（连接死亡由重连机制接管）。仅业务通道配置时启动。
+// 业务错误（*BusinessError，如会话过期）单飞触发重登钩子（会话失效语义）；
+// 网络错误静默（连接死亡由重连机制接管）。
 func (ch *channel) sessionHeartbeatLoop(g *generation) {
 	defer ch.wg.Done()
 	ticker := time.NewTicker(ch.sessionHBInterval)
@@ -282,49 +297,41 @@ func (ch *channel) sessionHeartbeatLoop(g *generation) {
 			if op == "" {
 				continue // 工厂未就绪（如尚未登录无 token）：跳过本轮
 			}
-			err := ch.invokeOnce(context.Background(), op, req, nil)
-			if be, ok := err.(*BusinessError); ok {
-				// 会话失效：触发重登钩子（与重连钩子同一入口，业务侧刷新 token）。
-				// 异步执行避免阻塞心跳 ticker；失败静默（下一轮心跳再触发）。
-				go func(be *BusinessError) {
-					defer func() { _ = recover() }()
-					_ = ch.onReconnected()
-				}(be)
+			if err := ch.invokeOnce(context.Background(), op, req, nil); err != nil {
+				if _, ok := err.(*BusinessError); ok {
+					ch.triggerReloginHook()
+				}
+				// NetworkError/TimeoutError 静默：重连机制处理
 			}
-			// NetworkError/TimeoutError 静默：重连机制处理
 		}
 	}
 }
 
-// reconnectOnce 执行一轮「退避重连 + 新连接登记」；返回新一代与是否继续。
-// 会话钩子不在本函数执行（评审 B1/B2：钩子异步化，见 supervisor）。
-func (ch *channel) reconnectOnce() (*generation, bool) {
-	backoff := ch.backoffBase
-	for {
-		// 退避等待（带抖动抖开重连风暴）；期间关闭则立即退出。
-		if err := sleepInterruptible(jitter(backoff), ch.closeCh); err != nil {
-			return nil, false
-		}
-		// 可取消拨号（评审 v0.3-B4 修复）：Close 不被系统拨号阻塞。
-		tr, err := ch.dialFn(ch.rebindDialCtx())
-		if err != nil {
-			backoff = ch.nextBackoff(backoff)
-			continue
-		}
-		ch.lifecycleMu.Lock()
-		if ch.closed.Load() {
-			ch.lifecycleMu.Unlock()
-			_ = tr.Close()
-			return nil, false
-		}
-		// startConnLoops（含 wg.Add）必须在锁内完成：
-		// 保证 Close 的 wg.Wait 开始后不可能再有 Add（WaitGroup 并发纪律）。
-		ch.setConn(tr)
-		ng := ch.gen()
-		ch.startConnLoops(ng)
-		ch.lifecycleMu.Unlock()
-		return ng, true
+// triggerReloginHook 单飞触发会话重登钩子（会话心跳业务错误路径）：
+// 重连钩子同步执行期间（hookActive）或上一轮触发未完成时跳过，
+// 避免并发重登造成 Login 竞态与 token 抖动；失败静默，下一轮会话心跳再触发。
+func (ch *channel) triggerReloginHook() {
+	if ch.hookActive.Load() {
+		return // 重连钩子执行中：本轮跳过
 	}
+	if !ch.sessionHookBusy.CompareAndSwap(false, true) {
+		return // 上一轮触发的钩子未返回
+	}
+	go func() {
+		defer func() {
+			ch.sessionHookBusy.Store(false)
+			_ = recover()
+		}()
+		if ch.onReconnected != nil {
+			_ = ch.onReconnected()
+		}
+	}()
+}
+
+// reconnectOnce 执行一轮「退避重连 + 新连接登记」（自 base 退避起步）。
+// 会话钩子不在本函数执行（钩子由 settleGeneration 同步驱动）。
+func (ch *channel) reconnectOnce() (*generation, bool) {
+	return ch.reconnectFrom(ch.backoffBase)
 }
 
 // nextBackoff 计算下一轮退避时长（×2 封顶；抖动只在睡眠时应用一次，
@@ -391,10 +398,11 @@ func (ch *channel) closeGeneration(done chan struct{}) {
 	}
 }
 
-// runHookSync 同步执行会话钩子（重登/Join）：带超时 + panic 保护。
-// 同步语义是评审 v0.3-B1 修复的核心：钩子成功返回后才置 Connected 并 drain，
-// 保证排队请求在「重连+重登成功」后才重发。钩子在 supervisor goroutine 内执行，
-// 超时由 hookTimeout 强制收敛（超时视为失败，弃用本代连接）。
+// runHookSync 在 supervisor goroutine 内同步执行会话钩子（重登/Join）：带超时 + panic 保护。
+// 评审 v0.3-B1 修复的核心：执行期间本通道状态保持 Reconnecting（外部请求排队、
+// 不外发未认证请求），hookActive 置位使钩子内 Invoke 与传输心跳直通当前代连接；
+// 钩子成功返回后由 settleGeneration 置 Connected 并 drain。超时视为失败，
+// 由调用方弃用本代连接；Close 可打断（closeCh 分支）。
 func (ch *channel) runHookSync(g *generation) (err error) {
 	defer func() {
 		ch.hookActive.Store(false)
@@ -419,9 +427,10 @@ func (ch *channel) runHookSync(g *generation) (err error) {
 	}
 }
 
-// rebindDialCtx 返回可取消的重连拨号上下文（评审 v0.3-B4 修复）：
-// 绑定通道关闭信号，Close 后进行中的拨号被取消，不被系统 TCP/WS 握手阻塞。
-func (ch *channel) rebindDialCtx() context.Context {
+// rebindDialCtx 返回可取消的重连拨号上下文与释放函数（评审 v0.3-B4 修复）：
+// 绑定通道关闭信号，Close 后进行中的拨号被取消。调用方在拨号返回后必须
+// cancel()（成功/失败皆然）——否则 watcher goroutine 会挂到通道关闭才退出。
+func (ch *channel) rebindDialCtx() (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		select {
@@ -430,5 +439,5 @@ func (ch *channel) rebindDialCtx() context.Context {
 		case <-ctx.Done():
 		}
 	}()
-	return ctx
+	return ctx, cancel
 }

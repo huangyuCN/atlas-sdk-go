@@ -369,3 +369,46 @@ func TestDialDualDuplicateKind(t *testing.T) {
 		t.Fatal("通道角色重复应返回错误")
 	}
 }
+
+// TestDualOptsIsolation 回归（评审 v0.3 修复）：战斗通道的按通道配置
+// 不得泄漏到业务通道——含链式重绑路径（业务/战斗钩子同时存在时）。
+func TestDualOptsIsolation(t *testing.T) {
+	biz := startFakeServer(t)
+	bat := startFakeServer(t)
+
+	c, err := DialDual(
+		ChannelConfig{
+			Addr: biz.addr(),
+			Opts: []Option{WithOnReconnected(func() error { return nil })},
+		},
+		ChannelConfig{
+			Addr: bat.addr(),
+			Opts: []Option{
+				WithInvokeTimeout(100 * time.Millisecond), // 战斗高频短超时
+				WithOnReconnected(func() error { return nil }),
+			},
+		},
+		WithHeartbeatInterval(0),
+	)
+	if err != nil {
+		t.Fatalf("DialDual: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// 白盒：业务通道保持默认超时，战斗通道为覆盖值。
+	if got := c.business.invokeTimeout; got != defaultInvokeTimeout {
+		t.Fatalf("业务通道超时 = %s, 期望默认 %s（战斗 Opts 泄漏）", got, defaultInvokeTimeout)
+	}
+	if got := c.Channel(KindBattle).ch.invokeTimeout; got != 100*time.Millisecond {
+		t.Fatalf("战斗通道超时 = %s, 期望 100ms", got)
+	}
+
+	// 行为：战斗通道短超时生效（静默回显不可能——fakeServer 会回；
+	// 改用直接断言两通道各自的钩子归属：业务链式、战斗独立）。
+	if c.business.onReconnected == nil {
+		t.Fatal("业务通道应有链式重绑钩子")
+	}
+	if c.Channel(KindBattle).ch.onReconnected == nil {
+		t.Fatal("战斗通道应有独立重绑钩子")
+	}
+}

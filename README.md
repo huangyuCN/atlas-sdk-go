@@ -21,17 +21,17 @@ Atlas 帧协议的 Go 客户端 SDK。用于游戏客户端、机器人与压测
   迟到响应静默丢弃、断连统一失败——全部路径恰好一次投递。
 - **服务端推送（Notify）**：按 operation 分发到订阅者，handler 独立 goroutine 执行、
   panic 隔离，支持幂等注册与退订。
-- **双层心跳**：传输保活（周期 Ping，默认 30s，连续 3 次失败判定死链）+
-  **会话心跳（`WithSessionHeartbeat`）**：SDK 在业务通道按周期 Invoke 业务 Heartbeat
-  （op/req 由业务闭包提供，携带最新 token），业务错误自动触发重登钩子（规范 §5.2）。
-  注意它只保活连接，**不续租业务会话**——会话续租请周期调用业务协议的 Heartbeat
-  （如 `/gateway.v1.GatewayAuth/Heartbeat`）。
+- **双层心跳**：传输保活（周期 Ping，默认 30s，连续 3 次失败判定死链，只保活连接、
+  **不续租业务会话**）+ **会话心跳（`WithSessionHeartbeat`，仅业务通道）**：
+  SDK 按周期 Invoke 业务协议的 Heartbeat（op/req 由业务闭包提供，携带最新 token），
+  业务错误（如会话过期）自动单飞触发重登钩子（规范 §5.2）。
 - **结构化错误**：业务拒绝还原为带 `Code/Reason/Metadata` 的 `BusinessError`；
   网络故障、超时、协议错误各自成类，`errors.Is/As` 判定。
 - **断线自动重连**：指数退避（500ms 起 ×2 封顶 30s，带抖动）；重连期间请求排队
   （默认 64 条，重连成功后按序重发，`WithFailFast` 可跳过）；协议级错误终止不重试。
 - **连接状态机**：`State()` 返回 `connected / reconnecting / disconnected`，
-  重连成功后触发会话重登钩子（`WithOnReconnected`）。
+  重连成功后执行会话重登钩子（`WithOnReconnected`）：钩子成功前状态保持
+  `reconnecting`（外部请求继续排队），成功后才置 `connected` 并按序重发排队请求。
 - **协议一致性测试**：`testdata/golden/` 内置 21 个字节级 golden vectors
   （含截断、非法头、64 位整数字符串、负数编码等边界），CI 逐用例校验。
 
@@ -121,6 +121,8 @@ func main() {
 
 对应模板 dual 形态：业务通道承载登录/会话，战斗通道承载高频帧输入。
 两通道独立心跳与重连；业务通道钩子做重登，战斗通道钩子做 Join 重绑定（规范 §5.2）。
+`DialDual` 会自动链式编排：**业务重登成功后 SDK 自动触发战斗重绑**
+（要求两个钩子都配置在 `ChannelConfig.Opts`）；战斗通道自身断线重连时仅重绑。
 
 ```go
 c, err := client.DialDual(
@@ -215,7 +217,8 @@ if errors.Is(err, client.ErrTimeout) {
 | `WithAutoReconnect(b)` | true | 断线自动重连开关（每通道独立） |
 | `WithBackoff(base, max)` | 500ms/30s | 重连退避参数（×2 封顶 + 抖动） |
 | `WithReconnectQueueSize(n)` | 64 | 重连期间请求排队上限（满后立即失败，每通道独立） |
-| `WithOnReconnected(fn)` | 无 | 本通道重连成功后的会话钩子（dual 下业务通道配重登、战斗通道配 Join 重绑定）；返回错误则继续退避重试 |
+| `WithOnReconnected(fn)` | 无 | 本通道重连成功后的会话钩子；supervisor 内同步执行（超时 10s 视为失败：弃用本代连接、请求保留排队，退避重连后重试）；dual 下经 `DialDual` 自动链式编排（业务重登 → 战斗重绑） |
+| `WithSessionHeartbeat(interval, opFactory)` | 无 | SDK 内置会话心跳（仅业务通道）：周期 Invoke 业务 Heartbeat，业务错误单飞触发重登钩子，网络错误静默；interval 需小于会话租期 |
 
 ### 并发与生命周期
 

@@ -108,8 +108,10 @@ func WithReconnectQueueSize(n int) Option {
 // WithSessionHeartbeat 注册 SDK 内置的会话心跳调度（规范 §5.2 双层心跳）：
 // opFactory 每轮被调用返回 (operation, req)——业务侧从闭包捕获最新 token/player_id，
 // req 为 nil 时不携带 payload；SDK 在业务通道 Connected 期间按 interval 周期 Invoke，
-// 业务错误（*BusinessError）触发 onReconnected 重登回调，网络错误静默（由重连机制处理）。
-// interval 必须小于服务端会话租期（建议 租期/2）；仅对业务通道生效。
+// 业务错误（*BusinessError）单飞触发 onReconnected 重登回调（并发去重），
+// 网络错误静默（由重连机制处理）。
+// 仅对业务通道生效（实现按通道角色强制；规范 §5.2：会话绑定业务通道，
+// 战斗通道不续租）；interval 必须小于服务端会话租期（建议 租期/2）。
 func WithSessionHeartbeat(interval time.Duration, opFactory func() (string, any)) Option {
 	return func(s *channelSettings) {
 		if interval > 0 && opFactory != nil {
@@ -122,9 +124,12 @@ func WithSessionHeartbeat(interval time.Duration, opFactory func() (string, any)
 // WithOnReconnected 注册本通道重连成功后的会话钩子（业务侧在此重登/重绑定；
 // 返回错误视为本次重连未完成，SDK 继续退避重试）。
 // dual 形态下每通道独立：业务通道配置重登、战斗通道配置 Join 重绑定（规范 §5.2）。
-// 钩子在独立 goroutine 执行（评审 B1/B2 修复）：不阻塞重连状态机，
-// 钩子内可安全调用 Invoke（此时状态已置 Connected）与 Close（不会自等待死锁）；
-// 执行超过 hookTimeout 视为失败，继续退避。默认 10s。
+// 钩子在 supervisor 内同步执行（评审 v0.3-B1）：执行期间本通道状态保持
+// Reconnecting（外部请求继续排队），钩子内 Invoke 经内部直通路径送达当前代连接
+// ——可安全调用 Invoke（含本通道重登）与 Close（不会自等待死锁）；
+// 执行超过 hookTimeout 视为失败：连接被弃用、请求保留排队，SDK 退避重连后重试。
+// 默认 10s。dual 形态下经 DialDual 配置的业务+战斗钩子自动链式编排
+// （业务重登成功 → 战斗重绑），要求两个钩子都配置在 ChannelConfig.Opts。
 func WithOnReconnected(fn func() error) Option {
 	return func(s *channelSettings) { s.onReconnected = fn }
 }
