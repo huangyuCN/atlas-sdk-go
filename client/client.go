@@ -314,13 +314,6 @@ func DialDual(business, battle ChannelConfig, opts ...Option) (*Client, error) {
 	return c, err
 }
 
-// wrapBattleRebind 保留通道钩子原样（链式「业务重登 → 战斗重绑」编排已由
-// DialDual 的 clientSlot 方案实现：业务钩子执行后按战斗通道实时状态决定是否
-// 立即触发战斗重绑；战斗通道未就绪时跳过，由其自身重连钩子兜底）。
-func wrapBattleRebind(bizOpts, _ []Option) []Option {
-	return bizOpts
-}
-
 // dialChannels 是全部构造器的公共路径：逐通道构建连接本体并启动监管；
 // 任一通道失败即回滚关闭已建通道。所有构造器保证业务通道存在
 // （Dial/DialWS 显式指定；DialDual 校验角色互异）。

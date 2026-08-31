@@ -75,7 +75,7 @@ func dialKCP(ctx context.Context, addr string) (channelTransport, error) {
 	return &kcpTransport{sess: sess}, nil
 }
 
-// kcpTransport 基于 kcp-go UDPSession 的流式传输。
+// kcpTransport 基于 kcp-go UDPSession 的传输（消息模式，互通细节见 dialKCP 文档）。
 type kcpTransport struct {
 	sess    *kcpgo.UDPSession
 	writeMu sync.Mutex // kcp 写侧整帧单次写（与内核通道写锁双保险）

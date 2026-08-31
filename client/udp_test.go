@@ -315,9 +315,12 @@ func TestUDPGarbageThenAlive(t *testing.T) {
 	}
 }
 
-// TestUDPEpochIsolation 验证评审缺口：UDP 重拨后 (epoch, seq) 隔离——
-// 静默期（服务端无响应）耗尽旧代 in-flight 后重拨，新代请求正常匹配，无旧代串扰。
-func TestUDPEpochIsolation(t *testing.T) {
+// TestUDPSilentWindowTimeoutCleanup 验证静默窗口内的超时请求不污染后续匹配：
+// 服务端无响应期间请求依次超时（in-flight 表随超时清理，迟到响应即使到达也会
+// 因条目已删除被静默丢弃），静默结束后同一代连接上的新请求正常往返。
+// 注意：本用例关闭心跳、全程未发生重拨/换代（UDP 无连接）——(epoch, seq) 的
+// 跨代隔离由键结构天然保证，无需单测覆盖。
+func TestUDPSilentWindowTimeoutCleanup(t *testing.T) {
 	srv := startUDPServer(t)
 	c, err := DialUDP(srv.addr(),
 		WithHeartbeatInterval(0),
