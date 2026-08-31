@@ -2,7 +2,7 @@
 // 连接真实 gateway 服务端，执行 注册 → 登录 → 业务心跳 → 传输心跳保活，
 // 并演练断线自动重连（-reconnect-after 触发等待，由外层脚本重启服务端）。
 //
-// 三种形态：
+// 形态（TCP / WS / KCP / UDP 单通道 + dual 组合）：
 //
 //	go run ./examples/smoke -addr 127.0.0.1:9001                    # TCP 单通道
 //	go run ./examples/smoke -transport ws -ws-addr 127.0.0.1:9002   # WebSocket 单通道
@@ -13,6 +13,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -74,21 +75,33 @@ type smokeOpts struct {
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:9001", "gateway TCP 地址")
-	transport := flag.String("transport", "tcp", "单通道形态 tcp|ws")
+	transport := flag.String("transport", "tcp", "单通道形态 tcp|ws|kcp|udp")
 	wsAddr := flag.String("ws-addr", "127.0.0.1:9002", "gateway WS 地址（-transport ws / -dual 时使用）")
+	kcpAddr := flag.String("kcp-addr", "127.0.0.1:9003", "gateway KCP 地址（-transport kcp / -dual -battle-transport kcp 时使用）")
+	udpAddr := flag.String("udp-addr", "127.0.0.1:9004", "gateway UDP 地址（-transport udp 时使用）")
 	wsPath := flag.String("ws-path", "/ws", "gateway WS 路径")
-	dual := flag.Bool("dual", false, "dual 双通道编排：业务 TCP + 战斗 WS（忽略 -transport）")
+	battleTransport := flag.String("battle-transport", "ws", "dual 形态战斗通道传输 ws|kcp（-dual 时生效）")
+	dual := flag.Bool("dual", false, "dual 双通道编排：业务 TCP + 战斗通道（-battle-transport 指定，默认 WS；忽略 -transport）")
 	reconnectAfter := flag.Duration("reconnect-after", 0, "该时长后进入重连演练等待（0 = 不演练）")
 	flag.Parse()
 
 	account := fmt.Sprintf("smoke-%d", rand.Int63())
 	switch {
 	case *dual:
-		runDual(*addr, *wsAddr, *wsPath, account, *reconnectAfter)
+		runDual(*addr, *wsAddr, *kcpAddr, *wsPath, *battleTransport, account, *reconnectAfter)
 	case *transport == "ws":
 		runSingle(func(opts ...client.Option) (*client.Client, error) {
 			return client.DialWS(*wsAddr, *wsPath, opts...)
 		}, account, *reconnectAfter)
+	case *transport == "kcp":
+		// KCP/UDP 仅注册战斗协议（模板 D6），走通道验证形态而非认证闭环。
+		runBattleChannelSmoke(func(opts ...client.Option) (*client.Client, error) {
+			return client.DialKCP(*kcpAddr, opts...)
+		}, "KCP", *reconnectAfter)
+	case *transport == "udp":
+		runBattleChannelSmoke(func(opts ...client.Option) (*client.Client, error) {
+			return client.DialUDP(*udpAddr, opts...)
+		}, "UDP", *reconnectAfter)
 	default:
 		runSingle(func(opts ...client.Option) (*client.Client, error) {
 			return client.Dial(*addr, opts...)
@@ -134,9 +147,63 @@ func runSingle(dial dialFn, account string, reconnectAfter time.Duration) {
 	fmt.Println("冒烟通过（真连接闭环：注册/登录/业务心跳/传输心跳/自动重连+重登）")
 }
 
-// runDual dual 双通道冒烟（v0.3 验收①编排形态）：业务 TCP + 战斗 WS。
+// runBattleChannelSmoke 战斗协议通道（KCP/UDP）单通道冒烟：
+// 网关按用途绑定（模板 D6）——KCP/UDP 仅注册战斗协议、无认证业务 op，
+// 本形态只验证通道本身：拨号 → 传输心跳往返 →（可选）重启演练（死链重拨）。
+func runBattleChannelSmoke(dial dialFn, form string, reconnectAfter time.Duration) {
+	c, err := dial(smokeDialOpts()...)
+	if err != nil {
+		fail("连接失败: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// 往返探针：Ping（StreamEngine 通道内置）或业务拒绝（如网关 UDP 通道的
+	// DatagramEngine 未注册 Ping）均证明往返完成、链路存活；网络类错误才算失败。
+	if !probeAlive(c) {
+		fail("%s 通道往返探针失败", form)
+	}
+	fmt.Printf("[冒烟] %s 通道往返探针 OK\n", form)
+
+	// 重连演练：重启 gateway 后死链由传输心跳发现，自动重拨恢复。
+	if reconnectAfter > 0 {
+		fmt.Printf("[冒烟] %s 后请重启 gateway（等待死链重拨）\n", reconnectAfter)
+		time.Sleep(reconnectAfter)
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			if probeAlive(c) {
+				break
+			}
+			if time.Now().After(deadline) {
+				fail("等待重拨恢复超时（当前状态 %s）", c.State())
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		fmt.Println("[冒烟] 重拨后往返探针 OK")
+	}
+
+	assertConnected(c, form)
+	fmt.Printf("冒烟通过（%s 战斗协议通道：拨号/传输心跳保活/自动重拨）\n", form)
+}
+
+// probeAlive 通道存活探针：传输心跳 Invoke 完成「往返」即存活——
+// 返回 nil（内置 Ping 成功）或业务拒绝（如网关 UDP 通道未注册 Ping）都算往返完成；
+// 网络类错误（超时/断连）视为链路未恢复。
+func probeAlive(c *client.Client) bool {
+	err := c.Invoke(context.Background(), client.HeartbeatOperation, nil, nil)
+	if err == nil {
+		return true
+	}
+	var be *client.BusinessError
+	return errors.As(err, &be)
+}
+
+// runDual dual 双通道冒烟（模板 dual 形态）：业务 TCP + 战斗通道（WS 或 KCP）。
 // 业务通道重登钩子 + 战斗通道 Join 重绑定钩子各自独立触发与演练。
-func runDual(tcpAddr, wsAddr, wsPath, account string, reconnectAfter time.Duration) {
+func runDual(tcpAddr, wsAddr, kcpAddr, wsPath, battleTransport, account string, reconnectAfter time.Duration) {
+	battleKind, battleAddr := client.TransportWS, wsAddr
+	if battleTransport == "kcp" {
+		battleKind, battleAddr = client.TransportKCP, kcpAddr
+	}
 	var (
 		c           *client.Client
 		player      string
@@ -158,8 +225,8 @@ func runDual(tcpAddr, wsAddr, wsPath, account string, reconnectAfter time.Durati
 			},
 		},
 		client.ChannelConfig{
-			Transport: client.TransportWS,
-			Addr:      wsAddr,
+			Transport: battleKind,
+			Addr:      battleAddr,
 			Path:      wsPath,
 			Opts: []client.Option{client.WithOnReconnected(func() error {
 				// 战斗通道重绑定（模板 JoinBattle 语义的冒烟替身）：
@@ -186,7 +253,7 @@ func runDual(tcpAddr, wsAddr, wsPath, account string, reconnectAfter time.Durati
 	player, token = registerAndLogin(c, account)
 	fmt.Printf("[冒烟] 业务通道登录成功 playerId=%s token 已存\n", player)
 	battlePing(c)
-	fmt.Println("[冒烟] 战斗通道（WS）传输心跳往返 OK")
+	fmt.Printf("[冒烟] 战斗通道（%s）传输心跳往返 OK\n", battleKind)
 
 	businessHeartbeats(c, player, token, 3)
 	fmt.Println("[冒烟] 业务心跳 3 次往返 OK")
@@ -202,7 +269,7 @@ func runDual(tcpAddr, wsAddr, wsPath, account string, reconnectAfter time.Durati
 	}
 
 	assertConnected(c, "dual")
-	fmt.Println("冒烟通过（dual 双通道闭环：业务TCP/战斗WS 独立重连+重登+重绑定）")
+	fmt.Printf("冒烟通过（dual 双通道闭环：业务TCP/战斗%s 独立重连+重登+重绑定）\n", battleKind)
 }
 
 // smokeDialOpts 公共拨号参数（冒烟内加速心跳与重连节奏）；会话钩子由各通道单独配置。

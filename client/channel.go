@@ -43,7 +43,7 @@ type channel struct {
 	onReconnected     func() error   // 重连成功后的会话钩子（业务重登 / Join 重绑定）
 	hookTimeout       time.Duration  // 钩子执行超时上限
 	state             atomic.Int32   // State
-	hookActive        atomic.Bool    // 会话钩子同步执行中（runHookSync）：钩子内 Invoke 与传输心跳直通，外部请求排队
+	hookBypass        atomic.Bool    // 会话钩子同步执行中（runHookSync）：Invoke 直通当前代连接（含外部并发 Invoke，见 invoke.go 文档）
 	sessionHookBusy   atomic.Bool    // 会话心跳路径的钩子单飞标记（避免并发重登）
 	closed            atomic.Bool    // 关闭标记（幂等）
 	closeCh           chan struct{}  // 关闭信号（本通道所有 goroutine 的退出源）
@@ -195,7 +195,7 @@ func (ch *channel) supervisor() {
 // settleGeneration 在重连成功后的代际上执行会话钩子与队列 drain：
 //   - 无钩子：置 Connected + drain（同一 genMu 临界区，排队请求严格先于新请求）；
 //   - 有钩子：钩子同步执行期间保持 Reconnecting（外部请求继续排队、不外发未认证
-//     请求；钩子内 Invoke 经 hookActive 直通）；成功后才置 Connected + drain。
+//     请求；钩子执行期间 Invoke 直通当前代连接，见 invoke.go hookBypass 文档）；成功后才 drain。
 //
 // 钩子失败无限重试（规范「返回错误视为本次重连未完成，SDK 继续退避重试」）：
 // 保留排队请求（未重发、无副作用）、弃用本代连接、退避重连后再试；Close 可随时打断。
@@ -308,10 +308,10 @@ func (ch *channel) sessionHeartbeatLoop(g *generation) {
 }
 
 // triggerReloginHook 单飞触发会话重登钩子（会话心跳业务错误路径）：
-// 重连钩子同步执行期间（hookActive）或上一轮触发未完成时跳过，
+// 重连钩子同步执行期间（hookBypass）或上一轮触发未完成时跳过，
 // 避免并发重登造成 Login 竞态与 token 抖动；失败静默，下一轮会话心跳再触发。
 func (ch *channel) triggerReloginHook() {
-	if ch.hookActive.Load() {
+	if ch.hookBypass.Load() {
 		return // 重连钩子执行中：本轮跳过
 	}
 	if !ch.sessionHookBusy.CompareAndSwap(false, true) {
@@ -400,17 +400,17 @@ func (ch *channel) closeGeneration(done chan struct{}) {
 
 // runHookSync 在 supervisor goroutine 内同步执行会话钩子（重登/Join）：带超时 + panic 保护。
 // 评审 v0.3-B1 修复的核心：执行期间本通道状态保持 Reconnecting（外部请求排队、
-// 不外发未认证请求），hookActive 置位使钩子内 Invoke 与传输心跳直通当前代连接；
+// 不外发未认证请求），hookBypass 置位使钩子执行期间 Invoke 直通当前代连接；
 // 钩子成功返回后由 settleGeneration 置 Connected 并 drain。超时视为失败，
 // 由调用方弃用本代连接；Close 可打断（closeCh 分支）。
 func (ch *channel) runHookSync(g *generation) (err error) {
 	defer func() {
-		ch.hookActive.Store(false)
+		ch.hookBypass.Store(false)
 		if r := recover(); r != nil {
 			err = fmt.Errorf("client: 重连钩子 panic: %v", r)
 		}
 	}()
-	ch.hookActive.Store(true)
+	ch.hookBypass.Store(true)
 	done := make(chan error, 1)
 	go func() {
 		done <- ch.onReconnected()

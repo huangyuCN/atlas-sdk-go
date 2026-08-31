@@ -28,10 +28,20 @@ func (ch *channel) heartbeatLoop(g *generation) {
 			return
 		case <-ticker.C:
 			if err := ch.invoke(nil, HeartbeatOperation, nil, nil, WithFailFast()); err != nil {
+				// 业务拒绝（往返完成）：链路存活，不计入死链——服务端拒绝属配置/语义问题
+				//（如网关 UDP 通道的 DatagramEngine 未注册内置 Ping），重连无意义。
+				var be *BusinessError
+				if errors.As(err, &be) {
+					failures = 0
+					continue
+				}
+				// 网络类失败（超时/写失败）：无往返，计死链。
 				failures++
 				if failures >= defaultHeartbeatFailures {
-					// 死链：只关当前代连接（触发 supervisor 重连），不关通道。
-					ch.closeConn()
+					// 死链：只关闭「本心跳绑定的那一代」连接（按代精确匹配，评审修复：
+					// 旧代心跳失败时 gen 可能已换代，ch.gen() 会误杀新代连接），
+					// 触发 supervisor 重连，不关通道。
+					_ = g.tr.Close()
 					return
 				}
 				continue

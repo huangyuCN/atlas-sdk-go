@@ -3,10 +3,10 @@
 [![CI](https://github.com/huangyuCN/atlas-sdk-go/actions/workflows/ci.yml/badge.svg)](https://github.com/huangyuCN/atlas-sdk-go/actions/workflows/ci.yml)
 
 Atlas 帧协议的 Go 客户端 SDK。用于游戏客户端、机器人与压测脚本连接
-[Atlas](https://github.com/huangyuCN/atlas) 游戏服务端（TCP / WebSocket 长连接），提供
+[Atlas](https://github.com/huangyuCN/atlas) 游戏服务端（TCP / WebSocket / KCP / UDP 四通道），提供
 **双通道编排、请求-响应匹配、服务端推送订阅、心跳保活、断线自动重连**等开箱即用的长连接能力。
 
-> v0.3：dual 双通道编排（业务 + 战斗）与 WebSocket 通道。KCP / UDP 通道与 DTO 生成器在路线图（见下文）。
+> v0.4：KCP / UDP 通道补齐四通道矩阵。DTO 生成器在路线图（见下文）。
 
 ## 特性
 
@@ -15,8 +15,11 @@ Atlas 帧协议的 Go 客户端 SDK。用于游戏客户端、机器人与压测
 - **双通道编排（dual 形态）**：业务 + 战斗通道各自独立连接、心跳、重连与请求排队
   （规范 §5.2）；`Invoke/On` 默认走业务通道，`Channel(kind)` 提供通道视图；
   `Client.State()` 聚合向下降级，细粒度走 `Channel(kind).State()`。
-- **多传输通道**：TCP（流式分帧）与 WebSocket（一条消息 = 一个完整帧，浏览器形态同协议）；
-  拨号入口 `Dial` / `DialWS` / `DialDual`。
+- **四通道矩阵**：TCP（流式分帧）、WebSocket（一条消息 = 一个完整帧，浏览器形态）、
+  KCP（kcp-go 可靠 UDP，流式分帧与 TCP 同构，会话参数与 atlas 服务端基线对齐）、
+  UDP（一报一帧，单数据报上限 64KiB 含帧头，坏数据报静默丢弃）。
+  拨号入口 `Dial` / `DialWS` / `DialKCP` / `DialUDP` / `DialDual`。
+  注意：KCP/UDP 无连接关闭通知，**死链只能由传输心跳发现**（勿设 `WithHeartbeatInterval(0)`）。
 - **请求-响应匹配**：`seq` 单调递增 + in-flight 表按 `(epoch, seq)` 匹配，超时取消、
   迟到响应静默丢弃、断连统一失败——全部路径恰好一次投递。
 - **服务端推送（Notify）**：按 operation 分发到订阅者，handler 独立 goroutine 执行、
@@ -60,7 +63,8 @@ Atlas 帧协议的 Go 客户端 SDK。用于游戏客户端、机器人与压测
 go get github.com/huangyuCN/atlas-sdk-go
 ```
 
-要求 Go 1.26+；唯一第三方依赖为 [gorilla/websocket](https://github.com/gorilla/websocket)（WebSocket 通道）。
+要求 Go 1.26+；第三方依赖为 [gorilla/websocket](https://github.com/gorilla/websocket)（WS 通道）
+与 [kcp-go v5](https://github.com/xtaci/kcp-go)（KCP 通道），均只被对应传输文件引用。
 
 ## 快速开始
 
@@ -157,7 +161,9 @@ if err := c.Channel(client.KindBattle).Invoke(ctx, "/battle.v1.Battle/Join", req
 }
 ```
 
-单通道 WebSocket（浏览器形态同协议）：`client.DialWS("127.0.0.1:9002", "/ws", opts...)`。
+单通道 WebSocket（浏览器形态同协议）：`client.DialWS("127.0.0.1:9002", "/ws", opts...)`；
+KCP / UDP（模板战斗协议通道，端口 9003/9004）：`client.DialKCP("127.0.0.1:9003")` /
+`client.DialUDP("127.0.0.1:9004")`。
 
 ## 错误处理
 
@@ -188,6 +194,8 @@ if errors.Is(err, client.ErrTimeout) {
 |------|------|
 | `Dial(addr, opts...) (*Client, error)` | 建立 TCP 长连接（单通道 = 业务通道），启动读循环与心跳 |
 | `DialWS(addr, path, opts...) (*Client, error)` | 建立 WebSocket 长连接；`path` 空则 `/ws`；addr 亦可为完整 `ws://` URL |
+| `DialKCP(addr, opts...) (*Client, error)` | 建立 KCP 长连接（kcp-go；明文、无 FEC，参数对齐服务端基线） |
+| `DialUDP(addr, opts...) (*Client, error)` | 建立 UDP 长连接（面向连接 socket；一报一帧；死链由心跳发现后重拨） |
 | `DialDual(business, battle ChannelConfig, opts...) (*Client, error)` | dual 双通道编排：业务 + 战斗通道独立心跳/重连/排队 |
 | `Invoke(ctx, op, req, resp any, opts...InvokeOption) error` | 请求-响应（默认业务通道）；`req=nil` 时不带 payload；重连期间默认排队，`WithFailFast()` 立即失败 |
 | `On(op string, h NotifyHandler) (off func())` | 订阅推送（默认业务通道）；同一 handler 幂等去重；返回退订函数 |
@@ -201,7 +209,7 @@ if errors.Is(err, client.ErrTimeout) {
 | 字段 | 说明 |
 |------|------|
 | `Kind` | 通道角色：`KindBusiness`（默认）/ `KindBattle`；DialDual 战斗参数零值按位置推断 |
-| `Transport` | 传输类型：`TransportTCP`（默认）/ `TransportWS` |
+| `Transport` | 传输类型：`TransportTCP`（默认）/ `TransportWS` / `TransportKCP` / `TransportUDP` |
 | `Addr` | 服务端地址 `host:port`；WS 亦接受完整 `ws://`/`wss://` URL（此时 Path 忽略） |
 | `Path` | WS 服务端包装路径（空则 `/ws`，对齐模板网关） |
 | `Opts` | 本通道覆盖项：在顶层 Option 之后应用（战斗短超时、每通道钩子等） |
@@ -255,7 +263,7 @@ golden vectors 位于 `testdata/golden/`：每个用例包含输入字节（`inp
 
 | atlas-sdk-go | 服务端基线 |
 |--------------|-----------|
-| v0.1–v0.3 | atlas `feat/actor` 分支（golden manifest 锁定 commit `0ba52c0`） |
+| v0.1–v0.4 | atlas `feat/actor` 分支（golden manifest 锁定 commit `0ba52c0`） |
 
 `feat/actor` 合入 main 后，基线将改为 main 的对应 commit。
 
@@ -264,7 +272,7 @@ golden vectors 位于 `testdata/golden/`：每个用例包含输入字节（`inp
 - [x] v0.1：TCP 通道、Invoke/Notify/心跳、golden vectors、错误四分类
 - [x] v0.2：断线自动重连（退避 + 排队 + 会话重登钩子 + 连接状态机）
 - [x] v0.3：dual 形态双通道编排（业务 + 战斗通道）、WebSocket 通道（浏览器 / 单通道形态）
-- [ ] v0.4：KCP / UDP 通道
+- [x] v0.4：KCP / UDP 通道（四通道矩阵补齐）
 - [ ] v0.5：`atlas sdk gen` DTO 生成器（从游戏项目 proto 生成 Go/TS/C# 客户端 DTO）
 
 ## License

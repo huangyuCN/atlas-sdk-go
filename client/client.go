@@ -1,14 +1,15 @@
 // Package client 是 Atlas 帧协议的客户端运行时内核：
-// 多通道编排（dual 形态：业务 + 战斗）、通道传输（TCP / WebSocket）、
+// 多通道编排（dual 形态：业务 + 战斗）、通道传输（TCP / WebSocket / KCP / UDP）、
 // Invoke 请求-响应匹配、双层心跳语义、Notify 订阅分发、断线自动重连。
 // 规范见 atlas 仓库 docs/superpowers/specs/2026-08-28-client-sdk-multilang-design.md；
-// KCP·UDP 通道 / DTO 生成器按规范路线后续批次交付。
+// DTO 生成器按规范路线后续批次交付。
 package client
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 )
 
@@ -79,6 +80,12 @@ const (
 	TransportTCP Transport = iota
 	// TransportWS 是 WebSocket 消息边界传输（一条消息 = 一个完整帧）。
 	TransportWS
+	// TransportKCP 是 KCP 可靠 UDP 传输（kcp-go；流式分帧与 TCP 同构，
+	// 会话参数与 atlas 服务端基线对齐：明文、无 FEC）。
+	TransportKCP
+	// TransportUDP 是 UDP 数据报传输（一报一帧；单数据报上限 64KiB 含帧头；
+	// 坏数据报静默丢弃；死链由传输心跳发现后自动重拨）。
+	TransportUDP
 )
 
 // String 实现字符串化。
@@ -86,8 +93,12 @@ func (t Transport) String() string {
 	switch t {
 	case TransportWS:
 		return "ws"
+	case TransportKCP:
+		return "kcp"
+	case TransportUDP:
+		return "udp"
 	default:
-		return "tcp"
+		return fmt.Sprintf("transport(%d)", int(t))
 	}
 }
 
@@ -234,6 +245,19 @@ func DialWS(addr, path string, opts ...Option) (*Client, error) {
 	return dialChannels([]ChannelConfig{{Kind: KindBusiness, Transport: TransportWS, Addr: addr, Path: path}}, opts)
 }
 
+// DialKCP 建立 KCP 长连接（单通道 = 业务通道；kcp-go 消息模式与服务端一致，
+// 会话参数与 atlas 服务端基线对齐：明文、无 FEC、NoDelay(0,40,0,0)、窗口 128、MTU 1400；
+// 帧写带写超时兜底，死链窗口满时不再永久阻塞）。
+func DialKCP(addr string, opts ...Option) (*Client, error) {
+	return dialChannels([]ChannelConfig{{Kind: KindBusiness, Transport: TransportKCP, Addr: addr}}, opts)
+}
+
+// DialUDP 建立 UDP 长连接（单通道 = 业务通道；一报一帧，单数据报上限 64KiB 含帧头，
+// 坏数据报静默丢弃；UDP 无连接——死链由传输心跳连续失败判定后自动重拨）。
+func DialUDP(addr string, opts ...Option) (*Client, error) {
+	return dialChannels([]ChannelConfig{{Kind: KindBusiness, Transport: TransportUDP, Addr: addr}}, opts)
+}
+
 // DialDual 建立 dual 双通道客户端（规范 §5.2 dual 双通道独立重连）：业务 + 战斗通道
 // 各自独立连接、心跳、重连与请求排队；断线重连按通道独立成立，每通道独立会话钩子
 // （业务通道重登 / 战斗通道 Join 重绑定，经 ChannelConfig.Opts 配置）。
@@ -254,37 +278,47 @@ func DialDual(business, battle ChannelConfig, opts ...Option) (*Client, error) {
 	// 实现为链式包装（追加到业务通道）：业务钩子 = 业务重登 → 成功后调用战斗钩子。
 	// 注意：链式编排要求两个钩子都配置在 ChannelConfig.Opts——
 	// 顶层 Option 配置的钩子按「全部通道默认值」生效，不参与链式编排。
-	business.Opts = wrapBattleRebind(business.Opts, battle.Opts)
-	return dialChannels([]ChannelConfig{business, battle}, opts)
-}
-
-// wrapBattleRebind 从两个通道的 Opts 中提取各自的 WithOnReconnected 钩子，
-// 将「业务钩子 → 战斗钩子」的链式形态追加到业务 Opts 末尾并返回
-// （后应用的 Option 覆盖先前的同名钩子，业务通道最终生效链式钩子）。
-// 战斗通道 Opts 原样返回、不做任何拼接——战斗通道的重绑钩子由其自身重连独立触发。
-// 任一侧无钩子则无从编排：业务 Opts 原样返回（每通道独立钩子语义）。
-func wrapBattleRebind(bizOpts, batOpts []Option) []Option {
-	bizProbe := defaultSettings()
-	for _, o := range bizOpts {
-		o(&bizProbe)
-	}
+	var clientSlot atomic.Pointer[Client]
+	// 战斗钩子提取（链式调用的第二环）。
 	batProbe := defaultSettings()
-	for _, o := range batOpts {
+	for _, o := range battle.Opts {
 		o(&batProbe)
 	}
-	bizHook, batHook := bizProbe.onReconnected, batProbe.onReconnected
-	if bizHook == nil || batHook == nil {
-		return bizOpts
-	}
-	chained := func() error {
-		if err := bizHook(); err != nil {
-			return err // 业务重登失败：战斗重绑不执行（由战斗通道自身重连重试）
+	batHook := batProbe.onReconnected
+	business.Opts = append(business.Opts, func(s *channelSettings) {
+		prev := s.onReconnected
+		s.onReconnected = func() error {
+			if prev != nil {
+				if err := prev(); err != nil {
+					return err
+				}
+			}
+			if batHook == nil {
+				return nil
+			}
+			// 评审 v0.4 修复：战斗通道可能还在自身重连中（两通道同时断线、战斗
+			// 恢复较慢）。此时跳过本次重绑——战斗通道自身重连成功后会执行自己的
+			// Join 钩子，避免业务钩子因「战斗未就绪」失败而拖累业务通道反复重连。
+			if cc := clientSlot.Load(); cc != nil {
+				if bat := cc.Channel(KindBattle); bat != nil && bat.State() != StateConnected {
+					return nil
+				}
+			}
+			return batHook()
 		}
-		return batHook()
+	})
+	c, err := dialChannels([]ChannelConfig{business, battle}, opts)
+	if err == nil {
+		clientSlot.Store(c)
 	}
-	out := make([]Option, 0, len(bizOpts)+1)
-	out = append(out, bizOpts...)
-	return append(out, WithOnReconnected(chained))
+	return c, err
+}
+
+// wrapBattleRebind 保留通道钩子原样（链式「业务重登 → 战斗重绑」编排已由
+// DialDual 的 clientSlot 方案实现：业务钩子执行后按战斗通道实时状态决定是否
+// 立即触发战斗重绑；战斗通道未就绪时跳过，由其自身重连钩子兜底）。
+func wrapBattleRebind(bizOpts, _ []Option) []Option {
+	return bizOpts
 }
 
 // dialChannels 是全部构造器的公共路径：逐通道构建连接本体并启动监管；

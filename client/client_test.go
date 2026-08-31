@@ -23,6 +23,8 @@ type echoService struct {
 	reqN     atomic.Int32  // 已处理请求数
 	holdSeen chan struct{} // hold 请求到达信号（容量 1；nil = 未启用）
 	release  chan struct{} // hold 放行信号（nil = 未启用）
+
+	hbBusinessErr atomic.Bool // 心跳回业务拒绝（验证「业务拒绝不计死链」用）
 }
 
 // handleRequest 处理一帧请求：返回回包 body、需先推的 Notify body（可空）、是否随后断连。
@@ -33,6 +35,10 @@ func (e *echoService) handleRequest(op string, payload []byte) (resp, notifyBody
 		select {
 		case e.pingSeen <- struct{}{}:
 		default:
+		}
+		if e.hbBusinessErr.Load() {
+			// 模拟网关 UDP 通道未注册内置 Ping：往返完成但业务拒绝。
+			return replyBytes(testStatus(500, "", "engine: not registered"), nil), nil, false
 		}
 		return replyBytes(nil, nil), nil, false
 	case "boom":
@@ -63,6 +69,7 @@ type fakeServer struct {
 	ln net.Listener
 	echoService
 	connClosed atomic.Int32 // 服务端侧连接被对端关闭的次数（回滚测试用）
+	connN      atomic.Int32 // 接受的连接总数（重连观测用）
 }
 
 func startFakeServer(t *testing.T) *fakeServer {
@@ -94,6 +101,7 @@ func (s *fakeServer) serve() {
 }
 
 func (s *fakeServer) handle(conn net.Conn) {
+	s.connN.Add(1)
 	defer func() {
 		_ = conn.Close()
 		s.connClosed.Add(1)
@@ -416,5 +424,32 @@ func TestSeqZeroSkipped(t *testing.T) {
 	}
 	if seq != 1 {
 		t.Fatalf("回绕后 seq = %d, 期望 1", seq)
+	}
+}
+
+// TestHeartbeatBusinessErrorNotDeadLink 验证心跳业务拒绝（往返完成）不计入死链：
+// 服务端持续对 Ping 回业务拒绝，通道不触发重连、连接保持复用（规范 §5.2 语义修正）。
+func TestHeartbeatBusinessErrorNotDeadLink(t *testing.T) {
+	s := startFakeServer(t)
+	s.hbBusinessErr.Store(true) // 心跳一律业务拒绝（模拟网关 UDP 通道未注册 Ping）
+
+	c, err := Dial(s.addr(),
+		WithHeartbeatInterval(20*time.Millisecond),
+		WithInvokeTimeout(100*time.Millisecond),
+		WithBackoff(20*time.Millisecond, 100*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// 远超 3 次心跳失败窗口：若业务拒绝被误计死链，此处已发生重连（新客户端端口）。
+	time.Sleep(500 * time.Millisecond)
+
+	if got := c.State(); got != StateConnected {
+		t.Fatalf("状态 = %s, 期望 connected（业务拒绝不应触发重连）", got)
+	}
+	if got := s.connN.Load(); got != 1 {
+		t.Fatalf("服务端观测连接数 = %d, 期望 1（不应重拨）", got)
 	}
 }

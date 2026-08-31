@@ -5,7 +5,31 @@
 > README 不依赖它）。服务端对接基准：atlas `feat/actor` 分支（golden manifest
 > `atlasCommit` 字段锁定，当前 `0ba52c0`）。
 
-## 当前状态（2026-08-31，v0.3 完成）
+## 当前状态（2026-08-31，v0.4 完成）
+
+- **v0.4 交付**：KCP / UDP 通道（四通道矩阵补齐）。
+  - KCP：`transport_kcp.go`（kcp-go v5.6.72 与服务端同源；明文、无 FEC，
+    会话参数对齐服务端 session_config 默认档；`frame.Read/Write` 流式分帧与 TCP 同构；
+    拨号后台化支持 ctx 取消）；`DialKCP` / `TransportKCP`；读循环串行保序对齐服务端默认。
+  - UDP：`transport_udp.go`（面向连接 `DialUDP`；一报一帧；读缓冲 64KiB 含帧头；
+    坏数据报静默丢弃对齐服务端 `ErrBadFrame` 软跳过；写侧拦截超 64KiB 帧；
+    body 拷贝出让所有权——Notify payload 会逃逸到 handler goroutine）；
+    `DialUDP` / `TransportUDP`。
+  - **心跳语义修正**：心跳收到业务拒绝（往返完成）不计入死链——服务端拒绝属
+    配置/语义问题而非链路故障（回归测试 `TestHeartbeatBusinessErrorNotDeadLink`）。
+  - **发现服务端偏差（待 atlas 侧修复）**：`NewDatagramEngine`（UDP）未像
+    `NewStreamEngine` 一样自动注册内置 Ping handler——网关 UDP 通道对
+    `/atlas.internal.Heartbeat/Ping` 回业务错误「not registered」。SDK 侧已用
+    「业务拒绝不计死链」+ 冒烟往返探针兼容；建议在 atlas feat/actor 的
+    `NewDatagramEngine` 补同款自动注册（规范 §2 声明心跳为四通道内置）。
+  - KCP/UDP 无连接关闭通知：死链只能由传输心跳发现（KCP 服务端 Close 不通知对端、
+    回包可能未冲刷即丢；UDP 无连接）——测试与文档均已明确。
+  - 验收全绿：golden vectors 全绿；`-race` 全绿；真服务 KCP（9003）/UDP（9004）
+    冒烟通过（往返探针 + 重启演练重拨恢复）；dual 战斗通道 KCP 真服务验证通过。
+  - 冒烟：`-transport kcp|udp` 走战斗协议通道验证形态（模板 D6：KCP/UDP 仅注册
+    战斗协议，无认证业务 op）；`-dual -battle-transport kcp` 支持模板主 dual 形态。
+
+## 前序状态（2026-08-31，v0.3 完成）
 
 - v0.1/v0.2/v0.3 已完成：帧编解码、golden vectors（21 用例）、TCP 通道、Invoke 匹配、
   传输心跳 + **SDK 内置会话心跳调度（v0.3 评审修复）**、断线自动重连（supervisor 多代连接 +
@@ -89,13 +113,15 @@ Channel（连接本体，内部）
 2. 断线重连演练对**每条通道**独立成立（kick 通道 A 不影响通道 B 的 in-flight）。
 3. golden vectors 全绿；`-race` 全绿；冒烟双形态通过。
 
-## v0.4：KCP / UDP 通道
+## v0.4：KCP / UDP 通道（已完成）
 
-- KCP：kcp-go，流式语义与 TCP 同构（`frame.ReadInto` 直接可用）；
+- KCP：kcp-go v5.6.72（与服务端 go.mod 同源），流式语义与 TCP 同构；
   默认串行处理保序（对齐服务端 KCP 引擎默认）。
 - UDP：数据报一报一帧（`DatagramEngine` 对称）；**单帧实际上限 64KiB**
   （读缓冲默认，含 16B 头）；解码失败静默丢包语义对齐。
 - 服务端 KCP/UDP 端口见模板 `services/gateway/configs/config.yaml`（9003/9004）。
+- 交接备注：atlas 服务端 `NewDatagramEngine` 缺内置 Ping 自动注册（见上方「服务端
+  偏差」），SDK 已兼容；v0.5 起若服务端补齐则 UDP 通道心跳将自动恢复语义一致。
 
 ## v0.5：atlas sdk gen DTO 生成器
 

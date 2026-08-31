@@ -43,10 +43,13 @@ func (ch *channel) invoke(ctx context.Context, op string, req, resp any, opts ..
 	// 判定为 Reconnecting 后入队的请求，要么被本次 drain 消费，要么队列满立即失败，
 	// 不存在「drain 空队列后请求才入队」的永久遗留窗口。
 	//
-	// 会话钩子同步执行期间（hookActive，评审 v0.3-B1）直通当前代连接：
-	// 钩子的重登/重绑请求不排队（队列要等钩子成功后才 drain），
-	// 传输心跳亦经此路径在钩子期间保活；外部请求因 state=Reconnecting 正常排队。
-	if ch.hookActive.Load() {
+	// 会话钩子同步执行期间（hookBypass，评审 v0.3-B1）直通当前代连接：
+	// 钩子的重登/重绑请求不排队（队列要等钩子成功后才 drain），传输心跳亦经此
+	// 路径保活。已文档化的语义：该窗口内外部并发 Invoke 同样直写新代连接（连接
+	// 可用但可能尚未完成重登，调用方需自行容忍；窗口上限 = hookTimeout）。
+	// 无法按 goroutine 区分钩子内外调用（Go 无 goroutine-local），此为公开 API
+	// 约束下的既定取舍。
+	if ch.hookBypass.Load() {
 		return ch.invokeOnce(ctx, op, req, resp)
 	}
 	if !o.failFast {
@@ -154,9 +157,9 @@ func (ch *channel) awaitQueued(ctx context.Context, q *queuedInvoke) error {
 func (ch *channel) invokeOnce(ctx context.Context, op string, req, resp any) error {
 	// Reconnecting 期间不写帧：死连接的写可能进内核缓冲后无响应，等待完整超时。
 	// （failFast 路径与 drain 前的旧调用在此被拦截，立即失败。）
-	// 例外：会话钩子执行期间（hookActive，评审 v0.3-B1）放行——
+	// 例外：会话钩子执行期间（hookBypass，评审 v0.3-B1）放行——
 	// 钩子的重登请求正是为建立会话，必须直通当前代连接。
-	if s := State(ch.state.Load()); s == StateReconnecting && !ch.hookActive.Load() {
+	if s := State(ch.state.Load()); s == StateReconnecting && !ch.hookBypass.Load() {
 		return NewNetworkError(fmt.Errorf("client: 正在重连（%s）", s))
 	}
 	// 单次原子读取得 (epoch, conn, done)（评审 B3 修复：不再撕裂读）。

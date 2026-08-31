@@ -24,6 +24,10 @@ func dialTransport(ctx context.Context, tr Transport, addr, path string, maxBody
 		return dialTCP(ctx, addr)
 	case TransportWS:
 		return dialWS(ctx, addr, path, maxBodySize)
+	case TransportKCP:
+		return dialKCP(ctx, addr)
+	case TransportUDP:
+		return dialUDP(ctx, addr)
 	default:
 		return nil, fmt.Errorf("client: 不支持的传输类型 %d", int(tr))
 	}
