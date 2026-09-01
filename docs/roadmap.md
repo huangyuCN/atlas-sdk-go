@@ -17,11 +17,12 @@
     `DialUDP` / `TransportUDP`。
   - **心跳语义修正**：心跳收到业务拒绝（往返完成）不计入死链——服务端拒绝属
     配置/语义问题而非链路故障（回归测试 `TestHeartbeatBusinessErrorNotDeadLink`）。
-  - **发现服务端偏差（待 atlas 侧修复）**：`NewDatagramEngine`（UDP）未像
-    `NewStreamEngine` 一样自动注册内置 Ping handler——网关 UDP 通道对
-    `/atlas.internal.Heartbeat/Ping` 回业务错误「not registered」。SDK 侧已用
-    「业务拒绝不计死链」+ 冒烟往返探针兼容；建议在 atlas feat/actor 的
-    `NewDatagramEngine` 补同款自动注册（规范 §2 声明心跳为四通道内置）。
+  - **服务端偏差已修复**：`NewDatagramEngine`（UDP）曾未像 `NewStreamEngine`
+    一样自动注册内置 Ping handler——网关 UDP 通道对 `/atlas.internal.Heartbeat/Ping`
+    回业务错误「not registered」。SDK 侧曾以「业务拒绝不计死链」+ 冒烟往返探针
+    兼容；atlas feat/actor 已补同款自动注册（`TestDatagramEngineHeartbeatHandlerAutoRegistered`），
+    真服务复验 UDP/KCP Ping 均返回 nil（SDK 的兼容语义保留：业务拒绝不计死链对
+    任何服务端形态都成立）。
   - KCP/UDP 无连接关闭通知：死链只能由传输心跳发现（KCP 服务端 Close 不通知对端、
     回包可能未冲刷即丢；UDP 无连接）——测试与文档均已明确。
   - 验收全绿：golden vectors 全绿；`-race` 全绿；真服务 KCP（9003）/UDP（9004）
