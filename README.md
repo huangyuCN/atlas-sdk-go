@@ -1,61 +1,43 @@
 # atlas-sdk-go
 
 [![CI](https://github.com/huangyuCN/atlas-sdk-go/actions/workflows/ci.yml/badge.svg)](https://github.com/huangyuCN/atlas-sdk-go/actions/workflows/ci.yml)
+[![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 Atlas 帧协议的 Go 客户端 SDK。用于游戏客户端、机器人与压测脚本连接
-[Atlas](https://github.com/huangyuCN/atlas) 游戏服务端（TCP / WebSocket / KCP / UDP 四通道），提供
-**双通道编排、请求-响应匹配、服务端推送订阅、心跳保活、断线自动重连**等开箱即用的长连接能力。
+[Atlas](https://github.com/huangyuCN/atlas) 游戏服务端，提供开箱即用的长连接能力：
+**请求-响应匹配、服务端推送订阅、心跳保活、断线自动重连、双通道编排**。
 
-> v0.4：KCP / UDP 通道补齐四通道矩阵。DTO 生成器在路线图（见下文）。
+支持四种传输通道，与 Atlas 网关的通道形态一一对应：
+
+| 通道 | 典型用途 | 拨号函数 |
+|------|---------|---------|
+| TCP | 业务通道（登录 / 会话 / 匹配） | `Dial` |
+| WebSocket | 浏览器形态的单通道业务+战斗 | `DialWS` |
+| KCP | 战斗通道（可靠 UDP，低延迟） | `DialKCP` |
+| UDP | 战斗通道（低延迟，尽力而为） | `DialUDP` |
+| TCP/WS + KCP/UDP 组合 | dual 形态：业务 + 战斗双通道 | `DialDual` |
 
 ## 特性
 
-- **帧协议编解码**：与服务端 `transport/frame` 同一套线格式（16B 头 + 变长 body），
-  粘包/半包由帧头 `bodyLen` 精确切分，校验先于内存分配。
-- **双通道编排（dual 形态）**：业务 + 战斗通道各自独立连接、心跳、重连与请求排队
-  （规范 §5.2）；`Invoke/On` 默认走业务通道，`Channel(kind)` 提供通道视图；
-  `Client.State()` 聚合向下降级，细粒度走 `Channel(kind).State()`。
-- **四通道矩阵**：TCP（流式分帧）、WebSocket（一条消息 = 一个完整帧，浏览器形态）、
-  KCP（kcp-go 可靠 UDP，流式分帧与 TCP 同构，会话参数与 atlas 服务端基线对齐）、
-  UDP（一报一帧，单数据报上限 64KiB 含帧头，坏数据报静默丢弃）。
-  拨号入口 `Dial` / `DialWS` / `DialKCP` / `DialUDP` / `DialDual`。
-  注意：KCP/UDP 无连接关闭通知，**死链只能由传输心跳发现**（勿设 `WithHeartbeatInterval(0)`）。
-- **请求-响应匹配**：`seq` 单调递增 + in-flight 表按 `(epoch, seq)` 匹配，超时取消、
-  迟到响应静默丢弃、断连统一失败——全部路径恰好一次投递。
-- **服务端推送（Notify）**：按 operation 分发到订阅者，handler 独立 goroutine 执行、
-  panic 隔离，支持幂等注册与退订。
-- **双层心跳**：传输保活（周期 Ping，默认 30s，连续 3 次失败判定死链，只保活连接、
-  **不续租业务会话**）+ **会话心跳（`WithSessionHeartbeat`，仅业务通道）**：
-  SDK 按周期 Invoke 业务协议的 Heartbeat（op/req 由业务闭包提供，携带最新 token），
-  业务错误（如会话过期）自动单飞触发重登钩子（规范 §5.2）。
+- **四通道矩阵**：TCP（流式分帧）、WebSocket（一条消息 = 一个完整帧）、KCP（kcp-go
+  可靠 UDP，会话参数与服务端基线对齐）、UDP（一报一帧，单数据报上限 64KiB 含帧头，
+  坏数据报静默丢弃）。KCP/UDP 无连接关闭通知，死链由传输心跳发现。
+- **双通道编排（dual 形态）**：业务 + 战斗通道各自独立连接、心跳、重连与请求排队；
+  业务重登成功后自动触发战斗通道重新绑定（Join 语义）。
+- **请求-响应匹配**：`seq` 单调递增 + 按连接代次隔离匹配，超时取消、迟到响应静默
+  丢弃、断连统一失败——全部路径恰好一次投递。
+- **服务端推送（Notify）**：按 operation 分发到订阅者，handler 在独立 goroutine
+  执行、panic 隔离，支持幂等注册与退订。
+- **双层心跳**：传输保活（周期 Ping，只保活连接、不续租业务会话）+ 可选的
+  **会话心跳**（`WithSessionHeartbeat`，仅业务通道）：按业务协议周期续租会话，
+  会话过期自动触发重登钩子。
+- **断线自动重连**：指数退避（500ms 起 ×2 封顶 30s，带抖动）；重连期间请求排队
+  （默认 64 条，重连成功后按序重发）；重连成功后执行会话重登钩子。
 - **结构化错误**：业务拒绝还原为带 `Code/Reason/Metadata` 的 `BusinessError`；
   网络故障、超时、协议错误各自成类，`errors.Is/As` 判定。
-- **断线自动重连**：指数退避（500ms 起 ×2 封顶 30s，带抖动）；重连期间请求排队
-  （默认 64 条，重连成功后按序重发，`WithFailFast` 可跳过）；协议级错误终止不重试。
-- **连接状态机**：`State()` 返回 `connected / reconnecting / disconnected`，
-  重连成功后执行会话重登钩子（`WithOnReconnected`）：钩子成功前状态保持
-  `reconnecting`（外部请求继续排队），成功后才置 `connected` 并按序重发排队请求。
-- **协议一致性测试**：`testdata/golden/` 内置 21 个字节级 golden vectors
-  （含截断、非法头、64 位整数字符串、负数编码等边界），CI 逐用例校验。
-
-## 协议概览
-
-每个应用层消息封装为一个「帧」。TCP 字节流上按帧头声明的长度切分，天然解决粘包/半包：
-
-```
-帧头（16 字节，大端）                              帧 body
-┌────────┬──────┬──────┬────────┬───────┬───────────┐   ┌────────────┬──────────────────┐
-│ magic 4│ ver 1│ type1│ rsv  2 │ seq 4 │ bodyLen 4 │ + │ opLen 2    │ operation │ payload │
-└────────┴──────┴──────┴────────┴───────┴───────────┘   └────────────┴──────────────────┘
-  "ATLS"   =1    1=请求            单调递增   ≤2MiB       长度前缀      如 "/gateway.v1.GatewayAuth/Login"
-                       2=响应
-                       3=推送(Notify)
-```
-
-- **请求-响应**：客户端发出 `type=1`（seq 自行分配），服务端回 `type=2`（同 seq），SDK 按 seq 匹配。
-- **服务端推送**：`type=3`，seq 由服务端独立分配，不参与请求匹配，按 operation 分发到订阅者。
-- **载荷编码**：payload 为 JSON（protojson 规则，字段 camelCase），详见下文「载荷编码约定」。
-- **上限**：单帧 body ≤ 2MiB；两端 `MaxBodySize` 配置需对齐，单端调大有断连风险。
+- **协议一致性**：内置 21 个字节级 golden vectors（含截断、非法头、64 位整数等
+  边界），CI 逐用例校验；各语言 SDK 共用同一份向量，行为跨语言一致。
 
 ## 安装
 
@@ -63,12 +45,13 @@ Atlas 帧协议的 Go 客户端 SDK。用于游戏客户端、机器人与压测
 go get github.com/huangyuCN/atlas-sdk-go
 ```
 
-要求 Go 1.26+；第三方依赖为 [gorilla/websocket](https://github.com/gorilla/websocket)（WS 通道）
-与 [kcp-go v5](https://github.com/xtaci/kcp-go)（KCP 通道），均只被对应传输文件引用。
+要求 Go 1.26+。第三方依赖只有 WebSocket 与 KCP 通道的两个库
+（[gorilla/websocket](https://github.com/gorilla/websocket)、
+[kcp-go v5](https://github.com/xtaci/kcp-go)），其余零依赖。
 
 ## 快速开始
 
-### 单通道（TCP）
+### 连接、请求与推送（TCP）
 
 ```go
 package main
@@ -98,7 +81,7 @@ func main() {
 	})
 	defer off()
 
-	// 请求-响应（payload 为 JSON，DTO 字段名 camelCase）。
+	// 请求-响应（payload 为 JSON，字段名 camelCase）。
 	var resp struct {
 		PlayerId string `json:"playerId"`
 		Nickname string `json:"nickname"`
@@ -121,12 +104,11 @@ func main() {
 }
 ```
 
-### dual 双通道（业务 TCP + 战斗 WebSocket）
+### dual 双通道（业务 TCP + 战斗通道）
 
-对应模板 dual 形态：业务通道承载登录/会话，战斗通道承载高频帧输入。
-两通道独立心跳与重连；业务通道钩子做重登，战斗通道钩子做 Join 重绑定（规范 §5.2）。
-`DialDual` 会自动链式编排：**业务重登成功后 SDK 自动触发战斗重绑**
-（要求两个钩子都配置在 `ChannelConfig.Opts`）；战斗通道自身断线重连时仅重绑。
+业务通道承载登录/会话，战斗通道承载高频帧输入，两通道独立心跳与重连。
+`DialDual` 自动链式编排：**业务重登成功后自动触发战斗重绑**；战斗通道自身断线
+重连时仅重绑。
 
 ```go
 c, err := client.DialDual(
@@ -134,7 +116,7 @@ c, err := client.DialDual(
 	client.ChannelConfig{
 		Addr: "127.0.0.1:9001",
 		Opts: []client.Option{client.WithOnReconnected(func() error {
-			return relogin() // 会话失效，业务层重登
+			return relogin()
 		})},
 	},
 	// 战斗通道（WebSocket）：重连成功后重新绑定战斗（JoinBattle 语义）。
@@ -145,7 +127,7 @@ c, err := client.DialDual(
 		Opts: []client.Option{
 			client.WithInvokeTimeout(time.Second), // 战斗高频短超时
 			client.WithOnReconnected(func() error {
-				return joinBattle() // 战斗重绑定
+				return joinBattle()
 			}),
 		},
 	},
@@ -161,9 +143,9 @@ if err := c.Channel(client.KindBattle).Invoke(ctx, "/battle.v1.Battle/Join", req
 }
 ```
 
-单通道 WebSocket（浏览器形态同协议）：`client.DialWS("127.0.0.1:9002", "/ws", opts...)`；
-KCP / UDP（模板战斗协议通道，端口 9003/9004）：`client.DialKCP("127.0.0.1:9003")` /
-`client.DialUDP("127.0.0.1:9004")`。
+单通道 WebSocket：`client.DialWS("127.0.0.1:9002", "/ws")`；
+KCP / UDP：`client.DialKCP("127.0.0.1:9003")` / `client.DialUDP("127.0.0.1:9004")`。
+完整的可运行示例见 [examples/smoke](examples/smoke/)。
 
 ## 错误处理
 
@@ -181,100 +163,102 @@ var be *client.BusinessError
 if errors.As(err, &be) {
 	// 业务分支：be.Reason / be.Code / be.Metadata
 }
-if errors.Is(err, client.ErrTimeout) {
-	// 超时分支
-}
 ```
 
-## API
-
-### Client 方法
-
-| 方法 | 说明 |
-|------|------|
-| `Dial(addr, opts...) (*Client, error)` | 建立 TCP 长连接（单通道 = 业务通道），启动读循环与心跳 |
-| `DialWS(addr, path, opts...) (*Client, error)` | 建立 WebSocket 长连接；`path` 空则 `/ws`；addr 亦可为完整 `ws://` URL |
-| `DialKCP(addr, opts...) (*Client, error)` | 建立 KCP 长连接（kcp-go；明文、无 FEC，参数对齐服务端基线） |
-| `DialUDP(addr, opts...) (*Client, error)` | 建立 UDP 长连接（面向连接 socket；一报一帧；死链由心跳发现后重拨） |
-| `DialDual(business, battle ChannelConfig, opts...) (*Client, error)` | dual 双通道编排：业务 + 战斗通道独立心跳/重连/排队 |
-| `Invoke(ctx, op, req, resp any, opts...InvokeOption) error` | 请求-响应（默认业务通道）；`req=nil` 时不带 payload；重连期间默认排队，`WithFailFast()` 立即失败 |
-| `On(op string, h NotifyHandler) (off func())` | 订阅推送（默认业务通道）；同一 handler 幂等去重；返回退订函数 |
-| `Channel(kind Kind) *ChannelView` | 通道视图：独立 `Invoke/On/State/OnReadExit`；未知 kind 返回 nil；生命周期归 Client（视图不单独 Close） |
-| `State() State` | 聚合状态：任一通道非 Connected 即向下降级；细粒度走 `Channel(kind).State()` |
-| `OnReadExit(fn func(error))` | 业务通道读循环退出回调（每通道版本见 ChannelView） |
-| `Close() error` | 优雅关闭全部通道：取消全部 in-flight（`NetworkError`）、停止心跳与读循环 |
-
-### ChannelConfig 字段
-
-| 字段 | 说明 |
-|------|------|
-| `Kind` | 通道角色：`KindBusiness`（默认）/ `KindBattle`；DialDual 战斗参数零值按位置推断 |
-| `Transport` | 传输类型：`TransportTCP`（默认）/ `TransportWS` / `TransportKCP` / `TransportUDP` |
-| `Addr` | 服务端地址 `host:port`；WS 亦接受完整 `ws://`/`wss://` URL（此时 Path 忽略） |
-| `Path` | WS 服务端包装路径（空则 `/ws`，对齐模板网关） |
-| `Opts` | 本通道覆盖项：在顶层 Option 之后应用（战斗短超时、每通道钩子等） |
-
-### 配置项
+## 配置项
 
 | Option | 默认 | 说明 |
 |--------|------|------|
-| `WithHeartbeatInterval(d)` | 30s | 心跳周期；连续 3 次失败判定死链；`≤0` 关闭（每通道独立） |
-| `WithInvokeTimeout(d)` | 10s | 请求默认超时 |
-| `WithMaxBodySize(n)` | 2MiB | 单帧 body 上限（只能调小，需与服务端对齐） |
+| `WithHeartbeatInterval(d)` | 30s | 传输心跳周期；连续 3 次失败判定死链；`≤0` 关闭（每通道独立） |
+| `WithInvokeTimeout(d)` | 10s | 请求默认超时（可 per-call 覆盖） |
+| `WithMaxBodySize(n)` | 2MiB | 单帧 body 上限（需与服务端对齐，单端调大有断连风险） |
 | `WithSerializer(s)` | JSON | 序列化插槽（可替换为二进制实现） |
 | `WithAutoReconnect(b)` | true | 断线自动重连开关（每通道独立） |
 | `WithBackoff(base, max)` | 500ms/30s | 重连退避参数（×2 封顶 + 抖动） |
-| `WithReconnectQueueSize(n)` | 64 | 重连期间请求排队上限（满后立即失败，每通道独立） |
-| `WithOnReconnected(fn)` | 无 | 本通道重连成功后的会话钩子；supervisor 内同步执行（超时 10s 视为失败：弃用本代连接、请求保留排队，退避重连后重试）；dual 下经 `DialDual` 自动链式编排（业务重登 → 战斗重绑） |
-| `WithSessionHeartbeat(interval, opFactory)` | 无 | SDK 内置会话心跳（仅业务通道）：周期 Invoke 业务 Heartbeat，业务错误单飞触发重登钩子，网络错误静默；interval 需小于会话租期 |
+| `WithReconnectQueueSize(n)` | 64 | 重连期间请求排队上限（满后立即失败） |
+| `WithFailFast()` | — | per-call：重连期间不排队、立即失败 |
+| `WithOnReconnected(fn)` | 无 | 本通道重连成功后的会话钩子（重登/重绑；超时 10s 视为失败）；dual 下自动链式编排 |
+| `WithSessionHeartbeat(interval, opFactory)` | 无 | SDK 内置会话心跳（仅业务通道）：周期调用业务 Heartbeat 续租会话，会话过期自动触发重登钩子；interval 需小于会话租期 |
 
-### 并发与生命周期
+## API 一览
 
-- `Invoke` / `On` 并发安全；回调在独立 goroutine 执行（panic 隔离），不阻塞读循环。
-- `Close` 幂等且会等待内部 goroutine 退出；任何时刻调用都不会死锁。
-- 关闭时全部 in-flight 请求立即收到 `NetworkError`。
+| 方法 | 说明 |
+|------|------|
+| `Dial(addr, opts...) (*Client, error)` | 建立 TCP 长连接，启动读循环与心跳 |
+| `DialWS(addr, path, opts...) (*Client, error)` | WebSocket 长连接；`path` 空则 `/ws`；addr 亦可为完整 `ws://` URL |
+| `DialKCP(addr, opts...) (*Client, error)` | KCP 长连接（明文、无 FEC，参数对齐服务端基线） |
+| `DialUDP(addr, opts...) (*Client, error)` | UDP 长连接（面向连接 socket；一报一帧） |
+| `DialDual(business, battle ChannelConfig, opts...) (*Client, error)` | dual 双通道编排 |
+| `Invoke(ctx, op, req, resp any, opts...) error` | 请求-响应（默认业务通道）；`req=nil` 时不带 payload |
+| `On(op, handler) (off func())` | 订阅推送；同一 handler 幂等去重；返回退订函数 |
+| `Channel(kind) *ChannelView` | 通道视图：独立 `Invoke/On/State`；生命周期归 Client |
+| `State() State` | 聚合状态 `connected/reconnecting/disconnected`：任一通道非 connected 即向下降级 |
+| `Close() error` | 优雅关闭全部通道：取消全部 in-flight（`NetworkError`）、停止心跳与读循环 |
 
-## 载荷编码约定（编写 DTO 时）
+`ChannelConfig` 字段：`Kind`（`KindBusiness`/`KindBattle`）、`Transport`
+（`TransportTCP`/`TransportWS`/`TransportKCP`/`TransportUDP`）、`Addr`（`host:port`）、
+`Path`（WS 路径，空则 `/ws`）、`Opts`（本通道覆盖项，如战斗通道短超时、每通道钩子）。
 
-payload 采用 protojson 风格 JSON。手写或生成 DTO 时注意：
+并发与生命周期：`Invoke`/`On` 并发安全；回调在独立 goroutine 执行（panic 隔离）；
+`Close` 幂等且等待内部 goroutine 退出。
+
+## 协议概览
+
+每个应用层消息封装为一个「帧」。TCP/KCP 字节流上按帧头声明的长度切分，
+天然解决粘包/半包：
+
+```
+帧头（16 字节，大端）                              帧 body
+┌────────┬──────┬──────┬────────┬───────┬───────────┐   ┌──────────┬───────────┬─────────┐
+│ magic 4│ ver 1│ type 1│ rsv  2 │ seq 4 │ bodyLen 4 │ + │ opLen 2  │ operation │ payload │
+└────────┴──────┴──────┴────────┴───────┴───────────┘   └──────────┴───────────┴─────────┘
+  "ATLS"   =1    1=请求            单调递增   ≤2MiB      长度前缀   如 "/gateway.v1.GatewayAuth/Login"
+                       2=响应
+                       3=推送(Notify)
+```
+
+- **请求-响应**：客户端发出请求（seq 自行分配），服务端回同 seq 的响应，SDK 按 seq 匹配。
+- **服务端推送**：seq 由服务端独立分配，不参与请求匹配，按 operation 分发到订阅者。
+- **载荷编码**：payload 为 JSON（protojson 风格），编写 DTO 时注意：
 
 | 规则 | 说明 |
 |------|------|
 | 字段名 camelCase | `player_id` → `json:"playerId"` |
-| **64 位整数为字符串** | proto 里的 `uint64/int64` 线上是 `"123"` 而非 `123`——DTO 字段用 `string`，避免精度丢失 |
-| 零值字段会下发 | 服务端以 `EmitUnpopulated` 编码请求/响应，DTO 判空不能依赖「字段缺失」 |
-| 未知字段被忽略 | 服务端 `DiscardUnknown`：旧 SDK 对新服务端字段向后兼容 |
+| **64 位整数为字符串** | 线上是 `"123"` 而非 `123`——DTO 字段用 `string`，避免精度丢失 |
+| 零值字段会下发 | 服务端编码请求/响应时零值字段也下发，判空不能依赖「字段缺失」 |
+| 未知字段被忽略 | 旧 SDK 对新服务端字段向后兼容 |
 | 枚举是字符串名 | 未知枚举值可能以数字出现，DTO 判别不要穷举失败 |
 | message 字段未设置为 `null` | 仅标量字段保证零值下发 |
 
-## 测试
-
-```bash
-make test     # 全量单测（-race）
-make update   # 协议用例变更后重新生成 golden vectors
-make lint     # gofmt + go vet
-```
-
-golden vectors 位于 `testdata/golden/`：每个用例包含输入字节（`input.bin`）、
-语言无关的期望结果（`expected.json`）与 manifest 校验（双 sha256 + atlas 基线 commit）。
-其他语言实现（TypeScript / C#）应以同一份 vectors 校验解码行为。
+> 游戏项目的 DTO 无需手写：`atlas sdk gen --lang go` 可从 proto 定义直接生成。
 
 ## 兼容性
 
-| atlas-sdk-go | 服务端基线 |
-|--------------|-----------|
-| v0.1–v0.4 | atlas `feat/actor` 分支（golden manifest 锁定 commit `0ba52c0`） |
+atlas-sdk-go v0.1–v0.5 与 atlas 服务端 `feat/actor` 分支（commit `40d8e74`）的
+帧协议对齐，由 `testdata/golden/` 中的 21 个字节级用例锁定。服务端协议变更时
+向量随之更新，保证跨版本行为可查。
 
-`feat/actor` 合入 main 后，基线将改为 main 的对应 commit。
+## 开发
+
+```bash
+make build    # 构建
+make test     # 全量单测（-race，含 golden vectors）
+make lint     # gofmt + go vet
+make update   # 协议用例变更后重新生成 golden vectors
+```
+
+可运行冒烟示例：`examples/smoke`（支持 `-transport tcp|ws|kcp|udp` 与 `-dual` 形态，
+可对接真实网关验证注册/登录/心跳/重连流程）。
 
 ## 路线图
 
 - [x] v0.1：TCP 通道、Invoke/Notify/心跳、golden vectors、错误四分类
 - [x] v0.2：断线自动重连（退避 + 排队 + 会话重登钩子 + 连接状态机）
-- [x] v0.3：dual 形态双通道编排（业务 + 战斗通道）、WebSocket 通道（浏览器 / 单通道形态）
+- [x] v0.3：dual 双通道编排、WebSocket 通道
 - [x] v0.4：KCP / UDP 通道（四通道矩阵补齐）
-- [ ] v0.5：`atlas sdk gen` DTO 生成器（从游戏项目 proto 生成 Go/TS/C# 客户端 DTO）
+- [x] v0.5：`atlas sdk gen` DTO 生成器（Go/TS，随 [atlas CLI](https://github.com/huangyuCN/atlas) 交付）
+- [ ] 后续：C# 仓（Unity/WebGL）、跨仓 CI 机器人
 
 ## License
 
-MIT
+[Apache License 2.0](LICENSE)
