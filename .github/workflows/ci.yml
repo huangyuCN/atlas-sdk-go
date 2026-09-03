@@ -10,12 +10,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # golden vectors 源在 atlas 主仓（协议单点：规范与向量同仓，transport/frame -update 生成）
+      # golden vectors 源在 atlas 主仓（协议单点：规范与向量同仓，transport/frame -update 生成）。
+      # atlas 为私有仓：检出用只读 PAT（fine-grained，仅授 atlas 仓 Contents:Read），
+      # 经 secrets.ATLAS_CI_TOKEN 注入；未配置时守卫步骤给出配置指引后失败。
+      - name: 校验向量源仓访问凭证
+        env:
+          TOKEN_SET: ${{ secrets.ATLAS_CI_TOKEN != '' }}
+        run: |
+          if [ "$TOKEN_SET" != "true" ]; then
+            echo "::error::secrets.ATLAS_CI_TOKEN 未配置：atlas 主仓为私有仓，CI 检出需要只读 PAT。"
+            echo "::error::GitHub → Settings → Developer settings → Fine-grained tokens 新建（仅 atlas 仓，Contents: Read）"
+            echo "::error::再到本仓 Settings → Secrets and variables → Actions 添加 ATLAS_CI_TOKEN，然后 Re-run 本工作流。"
+            exit 1
+          fi
       - uses: actions/checkout@v4
         with:
           repository: huangyuCN/atlas
           ref: feat/actor
           path: atlas
+          token: ${{ secrets.ATLAS_CI_TOKEN }}
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26'
