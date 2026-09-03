@@ -3,7 +3,27 @@
 > 本文档是下一批次开发的交接说明。协议规范：atlas 主仓
 > `docs/superpowers/specs/2026-08-28-client-sdk-multilang-design.md`（只读参考，
 > README 不依赖它）。服务端对接基准：atlas `feat/actor` 分支（golden manifest
-> `atlasCommit` 字段锁定，当前 `0ba52c0`）。
+> `atlasCommit` 字段锁定，当前 `40d8e74`）。golden 向量源：atlas 主仓
+> `testdata/golden/`（2026-09-03 迁入主仓，协议单点；本仓 frame 包消费同一份
+> 文件并执行语义断言，向量目录由 ATLAS_GOLDEN_DIR 或同级 atlas 仓默认路径解析）。
+
+## 增量（2026-09-03，contrib/protojson 序列化器）
+
+- **contrib/protojson**：`client.Serializer` 的可选实现，protoc-gen-go 生成的
+  proto message 直通 `Invoke` req/resp（无需经 sdkgen 生成 JSON DTO）。
+  - 动机：默认 JSONSerializer 走 encoding/json，与 protoc 生成类型的 json tag
+    （snake_case）不匹配会**静默丢字段**（线上是 protojson camelCase + int64
+    字符串形态）；本实现补齐「复用既有 proto 生成物」路径。
+  - 语义：Marshal 走 protojson（EmitUnpopulated 对齐服务端零值下发）；
+    Unmarshal 走 protojson（DiscardUnknown 容忍未知字段、int64 字符串/数值
+    双形态）；非 proto 类型回退 encoding/json（与默认 JSONSerializer 行为
+    一致，两类 req/resp 可混用）。
+  - 依赖分层：google.golang.org/protobuf 仅进 contrib 子包，核心 client/frame
+    仍不依赖 protobuf（同 atlas 主仓 contrib 约定）。
+  - 测试：单测用 dynamicpb 进程内组装 proto3 描述符（免 protoc；wrappers/
+    NullValue 等 WKT 在 protojson 下是特殊 JSON 映射，不能代表普通业务
+    message），覆盖 camelCase/int64 字符串/枚举名/零值下发/未知字段/回退；
+    另有真实 Dial/Invoke e2e（TCP 假服务端）验证完整链路。`-race` 全绿。
 
 ## 当前状态（2026-09-01，v0.5 完成——SDK 侧路线图收官）
 
@@ -63,7 +83,8 @@
     三形态冒烟通过；dual 重连演练（重启 gateway）双通道独立恢复（业务重登 + 战斗重绑定）。
 - 目录速览：`frame/`（协议层，零依赖）、`client/`（client 编排器 / channel 连接本体 /
   options / transport（TCP+WS）/ invoke / notify / heartbeat / reconnect / queue / errors /
-  serializer）、`examples/smoke/`（`-transport tcp|ws` / `-dual` 三形态）、`testdata/golden/`。
+  serializer）、`examples/smoke/`（`-transport tcp|ws` / `-dual` 三形态）。golden
+vectors 消费测试在 `frame/golden_test.go`（向量源为 atlas 主仓 testdata/golden）。
 - 实测经验（对接真实网关时注意）：**战斗通道不要做业务 Login**——网关会话为
   每玩家单会话，二次登录会顶掉业务通道会话（规范 §5.2 会话绑定业务通道）；
   战斗通道连通性验证用传输心跳 `client.HeartbeatOperation` 往返即可。
@@ -152,8 +173,9 @@ Channel（连接本体，内部）
 
 ## 开发约定
 
-- 新增/变更线格式：先改 atlas 规范 + golden vectors（`-update` 重新生成，
-  manifest 双 sha256 随之更新），四语言实现跟进——规范先行。
+- 新增/变更线格式：先改 atlas 规范 + golden vectors（向量包在 atlas 主仓
+  `transport/frame/golden_test.go` 生成器维护，主仓 `go test ./transport/frame
+  -update` 重新生成），四语言实现跟进——规范先行。
 - 环境与验证：集成服务器 10.10.9.36（SSH `shimmer-bi@10.10.9.36`，
   常驻 etcd 12379 / redis 16379 / nats 14222 / mongo 27018）；
   同步用 atlas 仓 `.template-workspace/it-run.sh sync` + `git archive feat/actor`

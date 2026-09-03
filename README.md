@@ -36,8 +36,9 @@ Atlas 帧协议的 Go 客户端 SDK。用于游戏客户端、机器人与压测
   （默认 64 条，重连成功后按序重发）；重连成功后执行会话重登钩子。
 - **结构化错误**：业务拒绝还原为带 `Code/Reason/Metadata` 的 `BusinessError`；
   网络故障、超时、协议错误各自成类，`errors.Is/As` 判定。
-- **协议一致性**：内置 21 个字节级 golden vectors（含截断、非法头、64 位整数等
-  边界），CI 逐用例校验；各语言 SDK 共用同一份向量，行为跨语言一致。
+- **协议一致性**：22 个字节级 golden vectors（含截断、非法头、64 位整数等边界）
+  逐用例校验；向量源在 atlas 主仓（规范与向量同仓），各语言 SDK 消费同一份向量，
+  行为跨语言一致。
 
 ## 安装
 
@@ -45,9 +46,11 @@ Atlas 帧协议的 Go 客户端 SDK。用于游戏客户端、机器人与压测
 go get github.com/huangyuCN/atlas-sdk-go
 ```
 
-要求 Go 1.26+。第三方依赖只有 WebSocket 与 KCP 通道的两个库
-（[gorilla/websocket](https://github.com/gorilla/websocket)、
-[kcp-go v5](https://github.com/xtaci/kcp-go)），其余零依赖。
+要求 Go 1.26+。核心包（`client`/`frame`）第三方依赖只有 WebSocket 与 KCP 通道的
+两个库（[gorilla/websocket](https://github.com/gorilla/websocket)、
+[kcp-go v5](https://github.com/xtaci/kcp-go)）；可选的 protojson 序列化器
+（[contrib/protojson](contrib/protojson/)）会额外携带
+[protobuf](https://github.com/protocolbuffers/protobuf-go) 依赖，仅 import 该包时参与编译。
 
 ## 快速开始
 
@@ -172,7 +175,7 @@ if errors.As(err, &be) {
 | `WithHeartbeatInterval(d)` | 30s | 传输心跳周期；连续 3 次失败判定死链；`≤0` 关闭（每通道独立） |
 | `WithInvokeTimeout(d)` | 10s | 请求默认超时（可 per-call 覆盖） |
 | `WithMaxBodySize(n)` | 2MiB | 单帧 body 上限（需与服务端对齐，单端调大有断连风险） |
-| `WithSerializer(s)` | JSON | 序列化插槽（可替换为二进制实现） |
+| `WithSerializer(s)` | JSON | 序列化插槽；[contrib/protojson](contrib/protojson/) 提供可选实现，让 protoc 生成的 proto message 直通 Invoke |
 | `WithAutoReconnect(b)` | true | 断线自动重连开关（每通道独立） |
 | `WithBackoff(base, max)` | 500ms/30s | 重连退避参数（×2 封顶 + 抖动） |
 | `WithReconnectQueueSize(n)` | 64 | 重连期间请求排队上限（满后立即失败） |
@@ -191,6 +194,7 @@ if errors.As(err, &be) {
 | `DialDual(business, battle ChannelConfig, opts...) (*Client, error)` | dual 双通道编排 |
 | `Invoke(ctx, op, req, resp any, opts...) error` | 请求-响应（默认业务通道）；`req=nil` 时不带 payload |
 | `On(op, handler) (off func())` | 订阅推送；同一 handler 幂等去重；返回退订函数 |
+| `OnReadExit(fn func(error))` | 默认业务通道读循环退出回调（诊断用；自动重连场景通常无需关心） |
 | `Channel(kind) *ChannelView` | 通道视图：独立 `Invoke/On/State`；生命周期归 Client |
 | `State() State` | 聚合状态 `connected/reconnecting/disconnected`：任一通道非 connected 即向下降级 |
 | `Close() error` | 优雅关闭全部通道：取消全部 in-flight（`NetworkError`）、停止心跳与读循环 |
@@ -230,13 +234,18 @@ if errors.As(err, &be) {
 | 枚举是字符串名 | 未知枚举值可能以数字出现，DTO 判别不要穷举失败 |
 | message 字段未设置为 `null` | 仅标量字段保证零值下发 |
 
-> 游戏项目的 DTO 无需手写：`atlas sdk gen --lang go` 可从 proto 定义直接生成。
+> 游戏项目的 DTO 无需手写：`atlas sdk gen --lang go` 可从 proto 定义直接生成；
+> 若项目已有 protoc-gen-go 生成类型，可换用
+> [contrib/protojson](contrib/protojson/) 序列化器直通 `Invoke`
+> （默认 JSON 序列化器与 protoc 类型的 json tag 形态不匹配，不可混用）。
 
 ## 兼容性
 
-atlas-sdk-go v0.1–v0.5 与 atlas 服务端 `feat/actor` 分支（commit `40d8e74`）的
-帧协议对齐，由 `testdata/golden/` 中的 21 个字节级用例锁定。服务端协议变更时
-向量随之更新，保证跨版本行为可查。
+当前代码（含 v0.1–v0.5 全部能力）与 atlas 服务端 `feat/actor` 分支（golden
+manifest 锁定 commit `40d8e74`）的帧协议对齐，由 22 个字节级 golden 用例校验
+（向量源在 [atlas](https://github.com/huangyuCN/atlas) 主仓 `testdata/golden/`，
+协议单点；本仓测试消费同一份文件）。服务端协议变更时向量随之更新，保证行为
+变更可查。
 
 ## 开发
 
@@ -244,8 +253,11 @@ atlas-sdk-go v0.1–v0.5 与 atlas 服务端 `feat/actor` 分支（commit `40d8e
 make build    # 构建
 make test     # 全量单测（-race，含 golden vectors）
 make lint     # gofmt + go vet
-make update   # 协议用例变更后重新生成 golden vectors
 ```
+
+> golden vectors 向量包在 atlas 主仓 `testdata/golden/`（协议用例变更时在主仓
+> `go test ./transport/frame -update` 重新生成）。本地测试默认读取与本仓同级的
+> `../atlas/testdata/golden`，或用环境变量 `ATLAS_GOLDEN_DIR` 指定。
 
 可运行冒烟示例：`examples/smoke`（支持 `-transport tcp|ws|kcp|udp` 与 `-dual` 形态，
 可对接真实网关验证注册/登录/心跳/重连流程）。
@@ -256,8 +268,14 @@ make update   # 协议用例变更后重新生成 golden vectors
 - [x] v0.2：断线自动重连（退避 + 排队 + 会话重登钩子 + 连接状态机）
 - [x] v0.3：dual 双通道编排、WebSocket 通道
 - [x] v0.4：KCP / UDP 通道（四通道矩阵补齐）
-- [x] v0.5：`atlas sdk gen` DTO 生成器（Go/TS，随 [atlas CLI](https://github.com/huangyuCN/atlas) 交付）
-- [ ] 后续：C# 仓（Unity/WebGL）、跨仓 CI 机器人
+- [x] v0.5：`atlas sdk gen` DTO 生成器（Go/TS 后端，随 [atlas CLI](https://github.com/huangyuCN/atlas) 交付，不在本仓）
+
+> v0.x 为功能里程碑编号：v0.1–v0.5 均已交付至 main 分支，尚未发布对应的 Git tag，
+> `go get` 默认安装 main 分支最新提交。
+
+TypeScript / C# 版 SDK、跨仓 CI 机器人等生态级后续规划由
+[atlas](https://github.com/huangyuCN/atlas) 主仓统一推进，见
+[多语言客户端 SDK 设计规范](https://github.com/huangyuCN/atlas/blob/main/docs/superpowers/specs/2026-08-28-client-sdk-multilang-design.md)。
 
 ## License
 
