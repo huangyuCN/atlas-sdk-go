@@ -10,6 +10,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # golden vectors 源在 atlas 主仓（协议单点：规范与向量同仓，transport/frame -update 生成）
+      - uses: actions/checkout@v4
+        with:
+          repository: huangyuCN/atlas
+          ref: feat/actor
+          path: atlas
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26'
@@ -21,5 +27,7 @@ jobs:
         run: go vet ./...
       - name: 单测 + golden vectors
         run: go test ./... -count=1 -race -timeout 5m
+        env:
+          ATLAS_GOLDEN_DIR: ${{ github.workspace }}/atlas/testdata/golden
       - name: 构建
         run: go build ./...

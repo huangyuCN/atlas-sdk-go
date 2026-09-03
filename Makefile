@@ -5,8 +5,8 @@ GO ?= go
 test: ## 单测 + golden vectors
 	$(GO) test ./... -count=1 -race -timeout 5m
 
-update: ## 重新生成 golden vectors（协议用例变更时）
-	$(GO) test ./frame -update
+update: ## 重新生成 golden vectors（已迁至 atlas 主仓，此处仅校验消费）
+	$(GO) test ./frame -count=1
 
 lint: ## gofmt + go vet
 	@out="$$(gofmt -l . | grep -v '^third_party/' || true)"; \

@@ -1,7 +1,0 @@
-{
-  "error": "",
-  "operation": "/lockstep.v1.Session/OnFrame",
-  "payloadHex": "7b226672616d654964223a22313233343536373839303132333435222c2277696e6e6572223a22222c2273636f726573223a307d",
-  "seq": 2,
-  "type": 1
-}

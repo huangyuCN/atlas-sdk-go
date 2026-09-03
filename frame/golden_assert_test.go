@@ -8,6 +8,18 @@ import (
 	"testing"
 )
 
+// jsonFloat 把期望 JSON 里的数字统一为 float64（文件解码形态）。
+func jsonFloat(v any) float64 {
+	switch x := v.(type) {
+	case float64:
+		return x
+	case int:
+		return float64(x)
+	default:
+		return -1
+	}
+}
+
 // assertFrameCase 执行帧解码并断言与期望一致。
 func assertFrameCase(t *testing.T, c goldenCase) {
 	t.Helper()
@@ -19,11 +31,11 @@ func assertFrameCase(t *testing.T, c goldenCase) {
 	if gotErr != errNone {
 		return
 	}
-	if int(h.Type) != c.want["type"] {
-		t.Fatalf("type = %d, 期望 %d", h.Type, c.want["type"])
+	if float64(h.Type) != jsonFloat(c.want["type"]) {
+		t.Fatalf("type = %d, 期望 %v", h.Type, c.want["type"])
 	}
-	if uint64(h.Seq) != uint64(c.want["seq"].(int)) {
-		t.Fatalf("seq = %d, 期望 %d", h.Seq, c.want["seq"])
+	if uint64(h.Seq) != uint64(jsonFloat(c.want["seq"])) {
+		t.Fatalf("seq = %d, 期望 %v", h.Seq, c.want["seq"])
 	}
 	op, payload, err := ParseRequestBody(body)
 	if err != nil {
