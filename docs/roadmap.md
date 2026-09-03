@@ -5,7 +5,23 @@
 > README 不依赖它）。服务端对接基准：atlas `feat/actor` 分支（golden manifest
 > `atlasCommit` 字段锁定，当前 `0ba52c0`）。
 
-## 当前状态（2026-08-31，v0.4 完成）
+## 当前状态（2026-09-01，v0.5 完成——SDK 侧路线图收官）
+
+- **v0.5 交付**：`atlas sdk gen` DTO 生成器（atlas 主仓 `internal/atlascli/sdkgen` +
+  CLI 接线，接管并废弃旧 HTTP 骨架生成器）。
+  - 输入 FileDescriptorSet（protoc `--descriptor_set_out` 产物；CLI 不调 protoc、
+    不解析 .proto 源文件）；protojson 映射规则（§6.2 逐条单测 + golden 快照 +
+    独立模块真编译往返对拍）；WKT 映射表（§6.1）；Reason 常量与 `IsBusinessError`
+    与 `api/error/v1` ErrorReason 同源生成（§6.3）。
+  - 产物布局按 proto 包分目录（每包一个 Go 子包；跨包引用经 `--go-import-prefix`
+    显式导入——模板 gateway.v1/battle.v1 同名 JoinBattleReply 的 e2e 实证决策）；
+    TS 侧相对导入天然无冲突，helpers 按目录生成。
+  - 语言后端：Go + TypeScript（C# 后置，同一中间模型可扩展）；模板 api/** 端到端
+    验证：Go 生成物真实模块 `go build`+`go vet` 全绿，TS 产物 tsc strict 零错误。
+  - Go SDK 本仓不受影响（生成物消费本仓的 protojson 形态约定；`--sdk-import`
+    默认指向本仓 client 包生成 Reason 判断辅助）。
+
+## 前序状态（2026-08-31，v0.4 完成）
 
 - **v0.4 交付**：KCP / UDP 通道（四通道矩阵补齐）。
   - KCP：`transport_kcp.go`（kcp-go v5.6.72 与服务端同源；明文、无 FEC，
@@ -124,14 +140,15 @@ Channel（连接本体，内部）
 - 交接备注：atlas 服务端 `NewDatagramEngine` 缺内置 Ping 自动注册（见上方「服务端
   偏差」），SDK 已兼容；v0.5 起若服务端补齐则 UDP 通道心跳将自动恢复语义一致。
 
-## v0.5：atlas sdk gen DTO 生成器
+## v0.5：atlas sdk gen DTO 生成器（已完成，atlas 主仓交付）
 
 - 输入 `FileDescriptorSet`（protoc `--descriptor_set_out`，include roots
-  `-I. -Ithird_party`）；只消费游戏项目 `api/**` 的 message。
+  `-I. -Ithird_party`）；只消费游戏项目 `api/**` 的 message（被引用依赖自动并入）。
 - protojson 映射规则与 WKT 映射表见规范 §6.1/§6.2（64 位整数→string、
-  message null、未知枚举数字形态、map key 字符串化、NaN/Infinity——
-  golden vectors 已有对应用例）。
-- 接管 CLI 现有 `atlas sdk gen`（旧 HTTP 骨架生成器废弃）。
+  message null、未知枚举数字形态、map key 字符串化、NaN/Infinity）。
+- 接管 CLI 现有 `atlas sdk gen`（旧 HTTP 骨架生成器已删除）。
+- 产物按 proto 包分目录 + 跨包导入前缀（模板 e2e 实证决策，详见 atlas 主仓
+  `docs/superpowers/plans/2026-09-01-sdk-gen-dto-generator.md`）。
 
 ## 开发约定
 

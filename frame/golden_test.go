@@ -323,7 +323,9 @@ func appendProtoBytes(dst []byte, fieldNum int, b []byte) []byte {
 
 // goldenAtlasCommit 是本向量包对应的 atlas 协议基线 commit（规范 §0/§8.1）。
 // 基线分支 feat/actor；合入 main 后同步更新此处与 manifest。
-const goldenAtlasCommit = "0ba52c039ae8264939bfb61c97743d8b634cdbea"
+// 2026-09-01：基线推进至 40d8e74（feat/actor 顶点，与 main 同顶点）；
+// 0ba52c0→40d8e74 间 transport 层变更为纯 gofmt，线格式未变，向量不变。
+const goldenAtlasCommit = "40d8e74ceacb341492437e528d1fcede76b58965"
 
 // writeGolden 生成 testdata/golden 全量文件。
 // 格式符合规范 §8.1：manifest 锁定 atlas 基线 commit、逐用例 meta 信息、
