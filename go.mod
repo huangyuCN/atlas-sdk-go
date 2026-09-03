@@ -5,6 +5,7 @@ go 1.26.5
 require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/xtaci/kcp-go/v5 v5.6.72
+	google.golang.org/protobuf v1.36.12
 )
 
 require (
