@@ -22,6 +22,13 @@ import (
 	"time"
 
 	"github.com/huangyuCN/atlas-sdk-go/client"
+	"github.com/huangyuCN/atlas-sdk-go/examples/smoke/gatewayv1"
+)
+
+// ops 与 mode 是当前编码模式的认证操作 DTO 适配与 serializer（main 中按 -serializer 设置）。
+var (
+	ops  authOps
+	mode smokeMode
 )
 
 // 协议常量与消息 DTO（与模板 api/gateway/v1 一致；正式 DTO 将由 atlas sdk gen 生成）。
@@ -33,32 +40,6 @@ const (
 )
 
 const smokePassword = "pw-123456"
-
-type registerReq struct {
-	Account  string `json:"account"`
-	Password string `json:"password"`
-	Nickname string `json:"nickname"`
-}
-
-type registerReply struct {
-	PlayerId string `json:"playerId"`
-}
-
-type loginReq struct {
-	PlayerId string `json:"playerId"`
-	Password string `json:"password"`
-}
-
-type loginReply struct {
-	PlayerId string `json:"playerId"`
-	Token    string `json:"token"`
-}
-
-type heartbeatReq struct {
-	Token    string `json:"token"`
-	PlayerId string `json:"playerId"`
-	Ts       string `json:"ts"` // int64 → protojson 字符串
-}
 
 // dialFn 封装形态差异的拨号入口（TCP / WS / dual）。
 type dialFn func(opts ...client.Option) (*client.Client, error)
@@ -83,7 +64,16 @@ func main() {
 	battleTransport := flag.String("battle-transport", "ws", "dual 形态战斗通道传输 ws|kcp（-dual 时生效）")
 	dual := flag.Bool("dual", false, "dual 双通道编排：业务 TCP + 战斗通道（-battle-transport 指定，默认 WS；忽略 -transport）")
 	reconnectAfter := flag.Duration("reconnect-after", 0, "该时长后进入重连演练等待（0 = 不演练）")
+	serializer := flag.String("serializer", "json", "载荷编码 json|protojson|protobuf")
 	flag.Parse()
+
+	m, ok := parseMode(*serializer)
+	if !ok {
+		fail("未知 -serializer %q（json|protojson|protobuf）", *serializer)
+	}
+	mode = m
+	ops = newAuthOps(mode)
+	fmt.Printf("[冒烟] 载荷编码: %s\n", serializerName(mode))
 
 	account := fmt.Sprintf("smoke-%d", rand.Int63())
 	switch {
@@ -272,9 +262,11 @@ func runDual(tcpAddr, wsAddr, kcpAddr, wsPath, battleTransport, account string, 
 	fmt.Printf("冒烟通过（dual 双通道闭环：业务TCP/战斗%s 独立重连+重登+重绑定）\n", battleKind)
 }
 
-// smokeDialOpts 公共拨号参数（冒烟内加速心跳与重连节奏）；会话钩子由各通道单独配置。
+// smokeDialOpts 公共拨号参数（冒烟内加速心跳与重连节奏 + 载荷编码 serializer）；
+// 会话钩子由各通道单独配置。
 func smokeDialOpts() []client.Option {
 	return []client.Option{
+		serializerOf(mode),
 		client.WithHeartbeatInterval(5 * time.Second), // 冒烟内加速验证传输心跳
 		client.WithInvokeTimeout(5 * time.Second),
 		client.WithBackoff(200*time.Millisecond, 3*time.Second),
@@ -284,14 +276,12 @@ func smokeDialOpts() []client.Option {
 // relogin 会话重登：调用方持久化新令牌（player 与 token 均写回闭包变量）。
 func relogin(c *client.Client, account string, player, token *string, done chan struct{}, rebindCalls *atomic.Int32) error {
 	rebindCalls.Add(1)
-	var rep loginReply
-	if err := c.Invoke(context.Background(), opLogin, loginReq{
-		PlayerId: *player, Password: smokePassword,
-	}, &rep); err != nil {
+	p, t, err := ops.login(context.Background(), c, *player, smokePassword)
+	if err != nil {
 		fmt.Printf("[冒烟] 重连后重登失败（随下一轮重连重试）: %v\n", err)
 		return err
 	}
-	*player, *token = rep.PlayerId, rep.Token
+	*player, *token = p, t
 	fmt.Println("[冒烟] 重连后重登成功（新令牌已存）")
 	signalOnce(done)
 	return nil
@@ -309,8 +299,14 @@ func sessionHeartbeatOpt(player, token *string) client.Option {
 		if *token == "" {
 			return "", nil // 未登录：跳过
 		}
-		return opHeartbeat, heartbeatReq{
-			Token: *token, PlayerId: *player, Ts: fmt.Sprintf("%d", time.Now().UnixMilli()),
+		// 会话心跳 DTO 形态随编码模式：json 用 plain struct，proto 用 proto message。
+		if _, isJSON := ops.(jsonAuthOps); isJSON {
+			return opHeartbeat, jsonHeartbeatReq{
+				Token: *token, PlayerId: *player, Ts: fmt.Sprintf("%d", time.Now().UnixMilli()),
+			}
+		}
+		return opHeartbeat, &gatewayv1.HeartbeatRequest{
+			Token: *token, PlayerId: *player, Ts: time.Now().UnixMilli(),
 		}
 	})
 }
@@ -323,33 +319,25 @@ func signalOnce(done chan struct{}) {
 	}
 }
 
-// registerAndLogin 注册并登录，返回 playerId 与 token。
+// registerAndLogin 注册并登录，返回 playerId 与 token（DTO 形态随编码模式）。
 func registerAndLogin(c *client.Client, account string) (string, string) {
-	var reg registerReply
-	if err := c.Invoke(context.Background(), opRegister,
-		registerReq{Account: account, Password: smokePassword, Nickname: "冒烟玩家"}, &reg); err != nil {
+	ctx := context.Background()
+	player, err := ops.register(ctx, c, account)
+	if err != nil {
 		fail("注册失败: %v", err)
 	}
-	fmt.Printf("[冒烟] 注册成功 playerId=%s\n", reg.PlayerId)
-
-	var rep loginReply
-	if err := c.Invoke(context.Background(), opLogin, loginReq{
-		PlayerId: reg.PlayerId, Password: smokePassword,
-	}, &rep); err != nil {
+	fmt.Printf("[冒烟] 注册成功 playerId=%s\n", player)
+	p, t, err := ops.login(ctx, c, player, smokePassword)
+	if err != nil {
 		fail("登录失败: %v", err)
 	}
-	return rep.PlayerId, rep.Token
+	return p, t
 }
 
 // businessHeartbeats 业务心跳往返（双层心跳的会话续租层；传输心跳由 SDK 周期自动发送）。
 func businessHeartbeats(c *client.Client, player, token string, n int) {
 	for i := 0; i < n; i++ {
-		var hb struct {
-			Ok bool `json:"ok"`
-		}
-		if err := c.Invoke(context.Background(), opHeartbeat, heartbeatReq{
-			Token: token, PlayerId: player, Ts: fmt.Sprintf("%d", time.Now().UnixMilli()),
-		}, &hb); err != nil {
+		if err := ops.heartbeat(context.Background(), c, player, token); err != nil {
 			fail("业务心跳失败: %v", err)
 		}
 		time.Sleep(200 * time.Millisecond)
