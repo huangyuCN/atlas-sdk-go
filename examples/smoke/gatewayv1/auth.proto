@@ -45,3 +45,15 @@ service GatewayAuth {
   rpc Login (LoginRequest) returns (LoginReply);
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatReply);
 }
+
+// JoinBattle 战斗绑定（UDP/KCP 战斗通道 op；模板 D6 战斗协议）。
+message JoinBattleRequest {
+  string token = 1;
+  string player_id = 2;
+  string battle_id = 3;
+}
+
+message JoinBattleReply {
+  bool ok = 1;
+  string message = 2;
+}

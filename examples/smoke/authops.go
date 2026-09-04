@@ -20,7 +20,9 @@ type authOps interface {
 	login(ctx context.Context, c *client.Client, player, password string) (string, string, error)
 	// heartbeat 业务心跳往返。
 	heartbeat(ctx context.Context, c *client.Client, player, token string) error
-	// loginReq 供重登钩子构造（返回 login req 的泛型载体）。
+	// joinBattle 战斗绑定探针（KCP/UDP 战斗通道；伪造 token 验证业务 payload
+	// 编解码——服务端因会话无效回业务拒绝即证明解码成功）。
+	joinBattle(ctx context.Context, c *client.Client) error
 }
 
 // jsonAuthOps 是 json 编码的 plain struct DTO（与既有 smoke 一致）。
@@ -62,6 +64,15 @@ type jsonHeartbeatReq struct {
 type jsonHeartbeatReply struct {
 	Ok bool `json:"ok"`
 }
+type jsonJoinBattleReq struct {
+	Token    string `json:"token"`
+	PlayerId string `json:"playerId"`
+	BattleId string `json:"battleId"`
+}
+type jsonJoinBattleReply struct {
+	Ok      bool   `json:"ok"`
+	Message string `json:"message"`
+}
 
 func (jsonAuthOps) register(ctx context.Context, c *client.Client, account string) (string, error) {
 	var rep jsonRegisterReply
@@ -79,6 +90,11 @@ func (jsonAuthOps) login(ctx context.Context, c *client.Client, player, password
 		return "", "", err
 	}
 	return rep.PlayerId, rep.Token, nil
+}
+
+func (jsonAuthOps) joinBattle(ctx context.Context, c *client.Client) error {
+	var rep jsonJoinBattleReply
+	return c.Invoke(ctx, opJoinBattle, jsonJoinBattleReq{Token: "no-token", PlayerId: "none", BattleId: "b1"}, &rep)
 }
 
 func (jsonAuthOps) heartbeat(ctx context.Context, c *client.Client, player, token string) error {
@@ -108,6 +124,13 @@ func (protoAuthOps) login(ctx context.Context, c *client.Client, player, passwor
 		return "", "", err
 	}
 	return rep.GetPlayerId(), rep.GetToken(), nil
+}
+
+func (protoAuthOps) joinBattle(ctx context.Context, c *client.Client) error {
+	var rep gatewayv1.JoinBattleReply
+	return c.Invoke(ctx, opJoinBattle, &gatewayv1.JoinBattleRequest{
+		Token: "no-token", PlayerId: "none", BattleId: "b1",
+	}, &rep)
 }
 
 func (protoAuthOps) heartbeat(ctx context.Context, c *client.Client, player, token string) error {

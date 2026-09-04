@@ -346,6 +346,119 @@ func (x *HeartbeatReply) GetServerTimeUnixMs() uint64 {
 	return 0
 }
 
+// JoinBattle 战斗绑定（UDP/KCP 战斗通道 op；模板 D6 战斗协议）。
+type JoinBattleRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Token         string                 `protobuf:"bytes,1,opt,name=token,proto3" json:"token,omitempty"`
+	PlayerId      string                 `protobuf:"bytes,2,opt,name=player_id,json=playerId,proto3" json:"player_id,omitempty"`
+	BattleId      string                 `protobuf:"bytes,3,opt,name=battle_id,json=battleId,proto3" json:"battle_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *JoinBattleRequest) Reset() {
+	*x = JoinBattleRequest{}
+	mi := &file_gatewayv1_auth_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *JoinBattleRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*JoinBattleRequest) ProtoMessage() {}
+
+func (x *JoinBattleRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_gatewayv1_auth_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use JoinBattleRequest.ProtoReflect.Descriptor instead.
+func (*JoinBattleRequest) Descriptor() ([]byte, []int) {
+	return file_gatewayv1_auth_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *JoinBattleRequest) GetToken() string {
+	if x != nil {
+		return x.Token
+	}
+	return ""
+}
+
+func (x *JoinBattleRequest) GetPlayerId() string {
+	if x != nil {
+		return x.PlayerId
+	}
+	return ""
+}
+
+func (x *JoinBattleRequest) GetBattleId() string {
+	if x != nil {
+		return x.BattleId
+	}
+	return ""
+}
+
+type JoinBattleReply struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Ok            bool                   `protobuf:"varint,1,opt,name=ok,proto3" json:"ok,omitempty"`
+	Message       string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *JoinBattleReply) Reset() {
+	*x = JoinBattleReply{}
+	mi := &file_gatewayv1_auth_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *JoinBattleReply) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*JoinBattleReply) ProtoMessage() {}
+
+func (x *JoinBattleReply) ProtoReflect() protoreflect.Message {
+	mi := &file_gatewayv1_auth_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use JoinBattleReply.ProtoReflect.Descriptor instead.
+func (*JoinBattleReply) Descriptor() ([]byte, []int) {
+	return file_gatewayv1_auth_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *JoinBattleReply) GetOk() bool {
+	if x != nil {
+		return x.Ok
+	}
+	return false
+}
+
+func (x *JoinBattleReply) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
 var File_gatewayv1_auth_proto protoreflect.FileDescriptor
 
 const file_gatewayv1_auth_proto_rawDesc = "" +
@@ -371,7 +484,14 @@ const file_gatewayv1_auth_proto_rawDesc = "" +
 	"\x02ts\x18\x03 \x01(\x03R\x02ts\"O\n" +
 	"\x0eHeartbeatReply\x12\x0e\n" +
 	"\x02ts\x18\x01 \x01(\x03R\x02ts\x12-\n" +
-	"\x13server_time_unix_ms\x18\x02 \x01(\x04R\x10serverTimeUnixMs2\xd3\x01\n" +
+	"\x13server_time_unix_ms\x18\x02 \x01(\x04R\x10serverTimeUnixMs\"c\n" +
+	"\x11JoinBattleRequest\x12\x14\n" +
+	"\x05token\x18\x01 \x01(\tR\x05token\x12\x1b\n" +
+	"\tplayer_id\x18\x02 \x01(\tR\bplayerId\x12\x1b\n" +
+	"\tbattle_id\x18\x03 \x01(\tR\bbattleId\";\n" +
+	"\x0fJoinBattleReply\x12\x0e\n" +
+	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x18\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage2\xd3\x01\n" +
 	"\vGatewayAuth\x12B\n" +
 	"\bRegister\x12\x1b.gateway.v1.RegisterRequest\x1a\x19.gateway.v1.RegisterReply\x129\n" +
 	"\x05Login\x12\x18.gateway.v1.LoginRequest\x1a\x16.gateway.v1.LoginReply\x12E\n" +
@@ -389,14 +509,16 @@ func file_gatewayv1_auth_proto_rawDescGZIP() []byte {
 	return file_gatewayv1_auth_proto_rawDescData
 }
 
-var file_gatewayv1_auth_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
+var file_gatewayv1_auth_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_gatewayv1_auth_proto_goTypes = []any{
-	(*RegisterRequest)(nil),  // 0: gateway.v1.RegisterRequest
-	(*RegisterReply)(nil),    // 1: gateway.v1.RegisterReply
-	(*LoginRequest)(nil),     // 2: gateway.v1.LoginRequest
-	(*LoginReply)(nil),       // 3: gateway.v1.LoginReply
-	(*HeartbeatRequest)(nil), // 4: gateway.v1.HeartbeatRequest
-	(*HeartbeatReply)(nil),   // 5: gateway.v1.HeartbeatReply
+	(*RegisterRequest)(nil),   // 0: gateway.v1.RegisterRequest
+	(*RegisterReply)(nil),     // 1: gateway.v1.RegisterReply
+	(*LoginRequest)(nil),      // 2: gateway.v1.LoginRequest
+	(*LoginReply)(nil),        // 3: gateway.v1.LoginReply
+	(*HeartbeatRequest)(nil),  // 4: gateway.v1.HeartbeatRequest
+	(*HeartbeatReply)(nil),    // 5: gateway.v1.HeartbeatReply
+	(*JoinBattleRequest)(nil), // 6: gateway.v1.JoinBattleRequest
+	(*JoinBattleReply)(nil),   // 7: gateway.v1.JoinBattleReply
 }
 var file_gatewayv1_auth_proto_depIdxs = []int32{
 	0, // 0: gateway.v1.GatewayAuth.Register:input_type -> gateway.v1.RegisterRequest
@@ -423,7 +545,7 @@ func file_gatewayv1_auth_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_gatewayv1_auth_proto_rawDesc), len(file_gatewayv1_auth_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   6,
+			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
