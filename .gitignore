@@ -37,3 +37,4 @@ bin/
 
 # 冒烟程序编译产物（不影响 examples/smoke 源码跟踪）
 examples/smoke/smoke
+/examples/smoke/smoke
