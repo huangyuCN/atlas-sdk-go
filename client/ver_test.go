@@ -20,8 +20,8 @@ import (
 func TestInvokeProtobufVersion2(t *testing.T) {
 	s := startFakeServer(t)
 	defer func() { _ = s.ln.Close() }()
-	s.replyVer = frame.Version2
-	s.handleHook = func(op string, payload []byte) (resp []byte, closeConn bool) {
+	s.setVer(frame.Version2)
+	s.setHook(func(op string, payload []byte) (resp []byte, closeConn bool) {
 		var req wrapperspb.StringValue
 		if err := proto.Unmarshal(payload, &req); err != nil {
 			t.Fatalf("服务端解 protobuf 请求: %v", err)
@@ -35,7 +35,7 @@ func TestInvokeProtobufVersion2(t *testing.T) {
 		}
 		// ver=2 的响应仍沿用统一 Reply 包络（编码无关），data 为 protobuf wire 字节。
 		return replyBytes(nil, data), false
-	}
+	})
 	c, err := Dial(s.addr(), WithSerializer(pbserializer.Serializer{}))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
@@ -55,14 +55,14 @@ func TestInvokeProtobufVersion2(t *testing.T) {
 func TestInvokeVersionMismatch(t *testing.T) {
 	s := startFakeServer(t)
 	defer func() { _ = s.ln.Close() }()
-	s.replyVer = frame.Version // 服务端违约：客户端 ver=2 却回 ver=1
-	s.handleHook = func(op string, payload []byte) (resp []byte, closeConn bool) {
+	s.setVer(frame.Version) // 服务端违约：客户端 ver=2 却回 ver=1
+	s.setHook(func(op string, payload []byte) (resp []byte, closeConn bool) {
 		data, err := proto.Marshal(wrapperspb.String("x"))
 		if err != nil {
 			t.Fatalf("Marshal: %v", err)
 		}
 		return replyBytes(nil, data), false
-	}
+	})
 	c, err := Dial(s.addr(), WithSerializer(pbserializer.Serializer{}))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)

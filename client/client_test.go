@@ -72,8 +72,39 @@ type fakeServer struct {
 	connN      atomic.Int32 // 接受的连接总数（重连观测用）
 	// 载荷编码 ver 分派测试钩子（ver_test.go）：replyVer 为响应帧头 version
 	//（0 = 默认 1）；handleHook 非空时替代 echoService.handleRequest。
+	// mu 保护两者——测试主 goroutine 写、服务端 handle goroutine 读（评审修复：
+	// -race 下 TestInvokeProtobufVersion2 等检测到数据竞争）。
+	mu         sync.Mutex
 	replyVer   uint8
 	handleHook func(op string, payload []byte) (resp []byte, closeConn bool)
+}
+
+// setVer 设置响应帧头 version（测试主 goroutine 调用；服务端 handle 读）。
+func (s *fakeServer) setVer(v uint8) {
+	s.mu.Lock()
+	s.replyVer = v
+	s.mu.Unlock()
+}
+
+// setHook 设置请求处理钩子（测试主 goroutine 调用；服务端 handle 读）。
+func (s *fakeServer) setHook(h func(op string, payload []byte) (resp []byte, closeConn bool)) {
+	s.mu.Lock()
+	s.handleHook = h
+	s.mu.Unlock()
+}
+
+// getVer 读响应帧头 version（服务端 handle goroutine）。
+func (s *fakeServer) getVer() uint8 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.replyVer
+}
+
+// getHook 读请求处理钩子（服务端 handle goroutine）。
+func (s *fakeServer) getHook() func(op string, payload []byte) (resp []byte, closeConn bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.handleHook
 }
 
 func startFakeServer(t *testing.T) *fakeServer {
@@ -122,8 +153,8 @@ func (s *fakeServer) handle(conn net.Conn) {
 		if err != nil {
 			return
 		}
-		if s.handleHook != nil {
-			resp, closeConn := s.handleHook(op, payload)
+		if h := s.getHook(); h != nil {
+			resp, closeConn := h(op, payload)
 			s.replyWithVer(conn, hdr.Seq, resp)
 			if closeConn {
 				return
@@ -150,7 +181,7 @@ func (s *fakeServer) reply(conn net.Conn, seq uint32, body []byte) {
 
 // replyWithVer 按服务端配置的响应帧头 version 回帧（0 = 默认 1）。
 func (s *fakeServer) replyWithVer(conn net.Conn, seq uint32, body []byte) {
-	_ = frame.Write(conn, frame.Header{Type: frame.MsgTypeResponse, Version: s.replyVer, Seq: seq}, body, frame.MaxBodySize)
+	_ = frame.Write(conn, frame.Header{Type: frame.MsgTypeResponse, Version: s.getVer(), Seq: seq}, body, frame.MaxBodySize)
 }
 
 // push 主动向客户端推送一条 Notify 帧（body 为完整帧 body）。
