@@ -185,7 +185,7 @@ func (ch *channel) invokeOnce(ctx context.Context, op string, req, resp any) err
 	defer ch.inflight.Delete(key)
 
 	ch.writeMu.Lock()
-	writeErr := g.tr.WriteFrame(frame.Header{Type: frame.MsgTypeRequest, Seq: key.seq}, body, ch.maxBodySize)
+	writeErr := g.tr.WriteFrame(frame.Header{Type: frame.MsgTypeRequest, Version: ch.ver, Seq: key.seq}, body, ch.maxBodySize)
 	ch.writeMu.Unlock()
 	if writeErr != nil {
 		return NewNetworkError(fmt.Errorf("client: 写帧失败: %w", writeErr))
@@ -256,6 +256,11 @@ func (ch *channel) resultToError(op string, r invokeResult, resp any) error {
 // 包络非法为协议级致命错误（规范 §7：不可重试、连接已断）——上抛 readLoop 终止
 // 本通道（评审 B5 修复：不再只回当前请求后继续用失步连接）。
 func (ch *channel) dispatchResponse(hdr frame.Header, body []byte) (fatalErr error) {
+	// 响应帧 ver 校验：服务端应回显请求的载荷编码版本（规范 §3.1）；不一致即
+	// 失步或服务端违约——协议级致命（终止连接，不重连）。
+	if hdr.Version != ch.ver {
+		return NewProtocolError(fmt.Errorf("client: 响应帧 version %d 与载荷编码 %d 不一致", hdr.Version, ch.ver))
+	}
 	data, st, err := frame.DecodeReply(body)
 	if err != nil {
 		return NewProtocolError(err)
@@ -273,15 +278,26 @@ func (ch *channel) dispatchResponse(hdr frame.Header, body []byte) (fatalErr err
 }
 
 // failAllInflight 连接断开或通道关闭时取消全部 in-flight。
+// 协议级错误（版本不匹配/帧非法等，不可重试）原样结算——调用方据此决定不重试；
+// 其余（网络断连/关闭）包 NetworkError（评审 Blocker：此前一律包 NetworkError，
+// 协议致命时 in-flight 收到可重试语义但通道已 terminate，语义矛盾）。
 func (ch *channel) failAllInflight(cause error) {
 	if cause == nil {
 		cause = errors.New("client: 连接已关闭")
 	}
-	networkErr := NewNetworkError(cause)
+	// 协议错误原样投递（调用方 errors.Is(err, ErrProtocol) 判定不可重试）；
+	// 其余包 NetworkError（errors.Is(err, ErrNetwork)）。
+	var perr *ProtocolError
+	var settleErr error
+	if errors.As(cause, &perr) {
+		settleErr = cause
+	} else {
+		settleErr = NewNetworkError(cause)
+	}
 	ch.inflight.Range(func(key, value any) bool {
 		if _, loaded := ch.inflight.LoadAndDelete(key); loaded {
 			if res, ok := value.(chan invokeResult); ok {
-				res <- invokeResult{err: networkErr}
+				res <- invokeResult{err: settleErr}
 			}
 		}
 		return true

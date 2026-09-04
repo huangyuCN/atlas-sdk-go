@@ -29,8 +29,12 @@ const (
 	HeaderSize = 16
 	// Magic 是帧协议魔数（"ATLS"）。
 	Magic uint32 = 0x41544C53
-	// Version 是当前协议版本。
+	// Version 是当前默认协议版本（载荷编码 ver=1：protojson JSON，规范 §3.1）。
 	Version uint8 = 1
+	// Version2 是载荷编码 ver=2（protobuf 二进制 wire format；规范 §3.1 载荷编码
+	// 协商，2026-09-04 v0.5 设计决策）。可选增强：服务端支持 ver=2 前勿在真实
+	// 连接启用（protojson ver=1 永续支持）。
+	Version2 uint8 = 2
 	// MaxBodySize 是单帧 body 的绝对上限（2MiB，与服务端 frame.MaxBodySize 对齐）。
 	MaxBodySize = 2 << 20
 	// MaxOperationLen 是 operation 名的独立上限（服务端 dispatch.go 同款，防垃圾字符串耗内存）。
@@ -70,7 +74,9 @@ func (h *Header) Check(maxBodySize int) error {
 	if h.Type != MsgTypeRequest && h.Type != MsgTypeResponse && h.Type != MsgTypeNotify {
 		return fmt.Errorf("frame: invalid type: %x: %w", h.Type, ErrProtocol)
 	}
-	if h.Version != Version {
+	// 版本白名单：ver=1（protojson）/ ver=2（protobuf 二进制）；其余拒绝（前向
+	// 版本协商位留给未来扩展，未知版本即协议非法）。
+	if h.Version != Version && h.Version != Version2 {
 		return fmt.Errorf("frame: invalid version: %x: %w", h.Version, ErrProtocol)
 	}
 	if uint64(h.Length) > uint64(maxBodySize) {
@@ -157,4 +163,12 @@ func readHeader(r io.Reader, maxBodySize int) (Header, error) {
 		return Header{}, err
 	}
 	return h, nil
+}
+
+// Versioned 是序列化器的可选扩展接口（载荷编码版本声明，规范 §3.1 载荷编码
+// 协商）：client.Serializer 的实现者（如 contrib/protobuf）可选择性实现，
+// 未实现者默认 ver=1（protojson）。放在 frame 层以避免 contrib → client 的
+// 依赖环（载荷编码版本本就是帧协议层概念）。
+type Versioned interface {
+	Version() uint8
 }

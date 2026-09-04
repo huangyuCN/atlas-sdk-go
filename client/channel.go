@@ -25,6 +25,9 @@ type channel struct {
 	writeMu sync.Mutex // 帧级写锁：并发 Invoke 下整帧不交错
 
 	serial Serializer
+	// ver 是本通道的载荷编码版本（由 serializer 推导：Versioned 接口或默认
+	// ver=1）；写帧时填帧头 version，响应帧校验与之比对（规范 §3.1 载荷编码协商）。
+	ver uint8
 	// inflight 表按 (epoch, seq) 匹配（规范 §5.2）：值使用单一所有权语义——
 	// 认领（LoadAndDelete）后发送，timer/ctx/断连/迟到响应四方竞争恰好一次投递。
 	inflight sync.Map // inflightKey → chan invokeResult
@@ -91,6 +94,11 @@ func newChannel(cfg ChannelConfig, defaults []Option) (*channel, error) {
 	if s.addr == "" {
 		return nil, fmt.Errorf("client: 通道 %s 缺少服务端地址", cfg.Kind)
 	}
+	// 载荷编码版本白名单校验（拨号前把关：非法声明不浪费拨号尝试）。
+	ver, err := serializerVersion(s.serial)
+	if err != nil {
+		return nil, err
+	}
 	tr, err := dialTransport(context.Background(), s.transport, s.addr, s.path, s.maxBodySize)
 	if err != nil {
 		return nil, fmt.Errorf("client: 通道 %s 拨号失败: %w", cfg.Kind, err)
@@ -99,6 +107,7 @@ func newChannel(cfg ChannelConfig, defaults []Option) (*channel, error) {
 		kind:              cfg.Kind,
 		addr:              s.addr,
 		serial:            s.serial,
+		ver:               ver,
 		heartbeatInterval: s.heartbeatInterval,
 		invokeTimeout:     s.invokeTimeout,
 		maxBodySize:       s.maxBodySize,

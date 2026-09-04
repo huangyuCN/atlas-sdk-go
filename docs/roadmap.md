@@ -171,6 +171,24 @@ Channel（连接本体，内部）
 - 产物按 proto 包分目录 + 跨包导入前缀（模板 e2e 实证决策，详见 atlas 主仓
   `docs/superpowers/plans/2026-09-01-sdk-gen-dto-generator.md`）。
 
+## v0.5：载荷编码 ver=2（protobuf 二进制）打样——已完成（2026-09-04，随规范 §3.1 载荷编码协商设计）
+
+- **规范先行**：载荷编码协商设计已写入规范 §3.1（帧头 version = 载荷编码版本，
+  帧级自描述；ver=1 protojson 永续 / ver=2 protobuf 二进制可选；Reply 包络结构
+  跨 ver 统一，仅 data 编码按 ver 区分）。
+- **本仓三个增量点（打样就绪，内核与现有 API 零破坏）**：
+  1. `frame`：版本白名单放宽（Check 接受 {1,2}，未知版本仍拒绝）；`frame.Versioned`
+     可选接口（载荷编码版本声明——放 frame 层避免 contrib → client 依赖环）；
+  2. `client`：`Versioned` 零破坏接入（serializerVersion 推导，未实现者默认 ver=1）；
+     请求帧头 ver 由 serializer 决定；响应帧头 ver 校验（不一致 = 失步，协议级
+     致命终止不重连）；
+  3. `contrib/protobuf`：`ProtobufSerializer`（proto.Message 断言式，ver=2）——
+     DTO 须为 protoc 生成类型；`WithSerializer(pbserializer.Serializer{})` 一换即用。
+- **测试**：frame 白名单（1/2/未知拒绝）+ ver=2 帧读写往返 + protobuf serializer
+  往返 + 内核集成（ver=2 invoke 成功与 ver 不一致失步终止）；全量 `-race` 绿。
+- **边界**：服务端支持 ver=2 前勿在真实连接启用（打样就绪形态）；golden vectors
+  二进制形态用例与 TS 侧 @bufbuild/protobuf 跟进属后续批次。
+
 ## 开发约定
 
 - 新增/变更线格式：先改 atlas 规范 + golden vectors（向量包在 atlas 主仓
