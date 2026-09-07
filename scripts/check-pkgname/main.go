@@ -7,9 +7,10 @@
 //
 // 用法：
 //
-//	go run ./scripts/check-pkgname [目录] [豁免文件]
+//	go run ./scripts/check-pkgname [目录] [豁免文件] [排除目录...]
 //
 // 目录默认当前目录，递归遍历 .go 文件，排除 _test.go / .pb.go / third_party。
+// 排除目录为相对路径前缀（如 atlas/ 表示跳过 CI 检出的依赖源码树），可传多个。
 // 豁免文件每行一条「相对路径:标识符」（如 log/logger.go:Logger），记录经人工
 // 裁断确认的非违规项（完整词惯例类型名、跨包接口实现方法等）；命中豁免的
 // 标识符不再报告。违规时输出清单并退出码 1。
@@ -35,10 +36,24 @@ func main() {
 	if len(os.Args) > 2 {
 		allow = readAllow(os.Args[2])
 	}
+	excludes := os.Args[3:]
 	found := false
 	filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") {
+		if err != nil || !strings.HasSuffix(path, ".go") {
 			return nil
+		}
+		if info.IsDir() {
+			for _, ex := range excludes {
+				if strings.HasPrefix(path+string(filepath.Separator), ex) {
+					return filepath.SkipDir
+				}
+			}
+			return nil
+		}
+		for _, ex := range excludes {
+			if strings.HasPrefix(path, ex) {
+				return nil
+			}
 		}
 		if strings.HasSuffix(path, "_test.go") || strings.HasSuffix(path, ".pb.go") ||
 			strings.Contains(path, string(filepath.Separator)+"third_party"+string(filepath.Separator)) {

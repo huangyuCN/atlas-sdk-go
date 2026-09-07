@@ -39,7 +39,7 @@ jobs:
       - name: go vet
         run: go vet ./...
       - name: 命名规范检查（导出标识符不得以包名开头）
-        run: go run ./scripts/check-pkgname . ./scripts/check-pkgname/allowlist.txt
+        run: go run ./scripts/check-pkgname . ./scripts/check-pkgname/allowlist.txt atlas/
       - name: 单测 + golden vectors
         run: go test ./... -count=1 -race -timeout 5m
         env:
