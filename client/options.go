@@ -35,7 +35,7 @@ type channelSettings struct {
 // defaultSettings 返回内核默认参数（与规范 §5.2 对齐）。
 func defaultSettings() channelSettings {
 	return channelSettings{
-		serial:            JSONSerializer{},
+		serial:            ProtoJSONSerializer{},
 		heartbeatInterval: defaultHeartbeatInterval,
 		invokeTimeout:     defaultInvokeTimeout,
 		maxBodySize:       frame.MaxBodySize,
