@@ -1,43 +1,43 @@
-// serializer 适配层：真机冒烟按 -serializer 参数切换三种载荷编码。
-// json = plain struct + JSONSerializer（零值字段不下发）；
-// protojson = proto message + contrib/protojson（零值字段省略，三库统一语义）；
+// serializer 适配层：真机冒烟按 -serializer 参数切换载荷编码。
+// json/protojson = proto message + 默认 ProtoJSONSerializer（三库统一：
+// protojson 语义、零值省略——json 为历史名，语义同 protojson，与 TS 一致）；
 // protobuf = proto message + contrib/protobuf（ver=2 二进制）。
 package main
 
 import (
 	"github.com/huangyuCN/atlas-sdk-go/client"
 	pbserializer "github.com/huangyuCN/atlas-sdk-go/contrib/protobuf"
-	pjson "github.com/huangyuCN/atlas-sdk-go/contrib/protojson"
 )
 
-// smokeMode 是三编码的运行模式。
+// smokeMode 是编码运行模式（json/protojson 语义相同，protobuf 独立）。
 type smokeMode int
 
 const (
-	modeJSON smokeMode = iota
+	modeJSON smokeMode = iota // 历史名：语义同 protojson（零值省略）
 	modeProtoJSON
 	modeProtobuf
 )
 
-// serializerOf 返回该模式的 serializer 选项（nil = 默认 JSON）。
+// serializerOf 返回该模式的 serializer 选项（默认 ProtoJSONSerializer——proto
+// message 走 protojson、非 proto 回退 encoding/json）。
 func serializerOf(m smokeMode) client.Option {
 	switch m {
-	case modeProtoJSON:
-		return client.WithSerializer(pjson.Serializer{})
 	case modeProtobuf:
 		return client.WithSerializer(pbserializer.Serializer{})
 	default:
-		return client.WithSerializer(client.JSONSerializer{})
+		// modeJSON/modeProtoJSON 一致：默认双通道 ProtoJSONSerializer（pb.go 请求
+		// 经 protojson 编码，int64 线上为字符串；零值省略——三库统一语义）。
+		return client.WithSerializer(client.ProtoJSONSerializer{})
 	}
 }
 
 // serializerName 供日志展示。
 func serializerName(m smokeMode) string {
 	switch m {
-	case modeProtoJSON:
-		return "protojson"
 	case modeProtobuf:
 		return "protobuf"
+	case modeProtoJSON:
+		return "protojson"
 	default:
 		return "json"
 	}

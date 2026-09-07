@@ -157,10 +157,10 @@ func runBattleChannelSmoke(dial dialFn, form string, reconnectAfter time.Duratio
 	}
 	fmt.Printf("[冒烟] %s 通道往返探针 OK\n", form)
 
-	// 战斗 payload 编解码验证（非 json 模式）：发 JoinBattle（伪造 token）——
+	// 战斗 payload 编解码验证（三编码统一）：发 JoinBattle（伪造 token）——
 	// 服务端按 ver 分派 codec 解码后因会话无效回业务拒绝（BusinessError）即证明
 	// payload 编解码正确（协议错误/解码失败才说明编解码问题）。
-	if mode != modeJSON {
+	{
 		err := ops.joinBattle(context.Background(), c)
 		if err == nil {
 			fail("%s JoinBattle 应被拒绝（伪造 token），却成功", form)
@@ -317,12 +317,8 @@ func sessionHeartbeatOpt(player, token *string) client.Option {
 		if *token == "" {
 			return "", nil // 未登录：跳过
 		}
-		// 会话心跳 DTO 形态随编码模式：json 用 plain struct，proto 用 proto message。
-		if _, isJSON := ops.(jsonAuthOps); isJSON {
-			return opHeartbeat, jsonHeartbeatReq{
-				Token: *token, PlayerId: *player, Ts: fmt.Sprintf("%d", time.Now().UnixMilli()),
-			}
-		}
+		// 会话心跳 DTO 统一 proto message（三编码同构——json/protojson 走默认
+		// ProtoJSONSerializer，protobuf 走 contrib/protobuf）。
 		return opHeartbeat, &gatewayv1.HeartbeatRequest{
 			Token: *token, PlayerId: *player, Ts: time.Now().UnixMilli(),
 		}
