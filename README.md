@@ -46,11 +46,12 @@ Atlas 帧协议的 Go 客户端 SDK。用于游戏客户端、机器人与压测
 go get github.com/huangyuCN/atlas-sdk-go
 ```
 
-要求 Go 1.26+。核心包（`client`/`frame`）第三方依赖只有 WebSocket 与 KCP 通道的
-两个库（[gorilla/websocket](https://github.com/gorilla/websocket)、
-[kcp-go v5](https://github.com/xtaci/kcp-go)）；可选的 protojson 序列化器
-（[contrib/protojson](contrib/protojson/)）会额外携带
-[protobuf](https://github.com/protocolbuffers/protobuf-go) 依赖，仅 import 该包时参与编译。
+要求 Go 1.26+。依赖情况：
+- `frame`（协议层）：零第三方依赖（手写 wire 解码，字节级 golden 校验）。
+- `client`（编排器）：WebSocket / KCP 通道库（[gorilla/websocket](https://github.com/gorilla/websocket)、
+  [kcp-go v5](https://github.com/xtaci/kcp-go)）+ 默认序列化器所需的
+  [protobuf-go](https://github.com/protocolbuffers/protobuf-go)
+  （v0.6 起：默认 `ProtoJSONSerializer` 对 proto message 走官方 protojson）。
 
 ## 快速开始
 
@@ -84,7 +85,12 @@ func main() {
 	})
 	defer off()
 
-	// 请求-响应（payload 为 JSON，字段名 camelCase）。
+	// 请求-响应。DTO 两种形态（默认双通道序列化器都支持）：
+	//  ① 推荐：protoc-gen-go 生成的 pb.go message（proto.Message）→ 自动走官方
+	//     protojson（camelCase + int64 字符串 + 零值省略）；
+	//  ② 兼容：手写 plain struct/map（非 proto）→ 回退 encoding/json，
+	//     64 位整数字段须自行用 string 表达线上字符串形态。
+	// 下方示例用②展示零依赖兼容用法。
 	var resp struct {
 		PlayerId string `json:"playerId"`
 		Nickname string `json:"nickname"`
@@ -175,7 +181,7 @@ if errors.As(err, &be) {
 | `WithHeartbeatInterval(d)` | 30s | 传输心跳周期；连续 3 次失败判定死链；`≤0` 关闭（每通道独立） |
 | `WithInvokeTimeout(d)` | 10s | 请求默认超时（可 per-call 覆盖） |
 | `WithMaxBodySize(n)` | 2MiB | 单帧 body 上限（需与服务端对齐，单端调大有断连风险） |
-| `WithSerializer(s)` | JSON | 序列化插槽；[contrib/protojson](contrib/protojson/) 提供可选实现，让 protoc 生成的 proto message 直通 Invoke |
+| `WithSerializer(s)` | `ProtoJSONSerializer`（双通道） | 序列化插槽；默认对 proto message 走官方 protojson（零值省略）、非 proto 回退 encoding/json。显式传 `contrib/protobuf.Serializer` 切 ver=2 二进制 |
 | `WithAutoReconnect(b)` | true | 断线自动重连开关（每通道独立） |
 | `WithBackoff(base, max)` | 500ms/30s | 重连退避参数（×2 封顶 + 抖动） |
 | `WithReconnectQueueSize(n)` | 64 | 重连期间请求排队上限（满后立即失败） |
@@ -227,21 +233,24 @@ if errors.As(err, &be) {
 
 | 规则 | 说明 |
 |------|------|
-| 字段名 camelCase | `player_id` → `json:"playerId"` |
-| **64 位整数为字符串** | 线上是 `"123"` 而非 `123`——DTO 字段用 `string`，避免精度丢失 |
-| 零值字段会下发 | 服务端编码请求/响应时零值字段也下发，判空不能依赖「字段缺失」 |
-| 未知字段被忽略 | 旧 SDK 对新服务端字段向后兼容 |
+| 字段名 camelCase | `player_id` → protojson camelCase |
+| **64 位整数为字符串** | 线上是 `"123"` 而非 `123`——避免精度丢失 |
+| **客户端请求零值省略** | v0.6 起默认序列化器（protojson）零值字段省略——三库（Go/TS/C#）统一客户端请求语义；判空不要依赖「字段省略」来表达业务含义 |
+| 服务端响应零值下发 | 服务端编码响应时零值字段下发；客户端解码容忍显式零值（protojson 默认接受） |
+| 未知字段被忽略 | 客户端解码 DiscardUnknown——服务端加字段不破坏旧客户端 |
 | 枚举是字符串名 | 未知枚举值可能以数字出现，DTO 判别不要穷举失败 |
-| message 字段未设置为 `null` | 仅标量字段保证零值下发 |
+| message 字段未设置为 `null` | proto message 有 presence：nil message 字段在 protojson 下输出 `null`（与标量零值省略不同）——区分未设置 vs 显式零值请用 proto3 optional 或 message 字段 |
 
-> 游戏项目的 DTO 无需手写：`atlas sdk gen --lang go` 可从 proto 定义直接生成；
-> 若项目已有 protoc-gen-go 生成类型，可换用
-> [contrib/protojson](contrib/protojson/) 序列化器直通 `Invoke`
-> （默认 JSON 序列化器与 protoc 类型的 json tag 形态不匹配，不可混用）。
+> **DTO 推荐 protoc-gen-go 生成类型（pb.go）**：proto 定义即 DTO 源（官方生成器产
+> `proto.Message` 实现），直接作 `Invoke` 的 req/resp，由默认序列化器自动走官方
+> protojson（camelCase + int64 字符串 + 零值省略）。
+> 非 proto 手写 DTO（plain struct / map）仍可用——默认序列化器回退
+> encoding/json（v0.6 兼容保留）；但 64 位整数字段须自行用 `string` 表达
+> （线上字符串形态），并注意 camelCase json tag。
 
 ## 兼容性
 
-当前代码（含 v0.1–v0.5 全部能力）与 atlas 服务端 `feat/actor` 分支（golden
+当前代码（含 v0.1–v0.6 全部能力）与 atlas 服务端 `feat/actor` 分支（golden
 manifest 锁定 commit `40d8e74`）的帧协议对齐，由 22 个字节级 golden 用例校验
 （向量源在 [atlas](https://github.com/huangyuCN/atlas) 主仓 `testdata/golden/`，
 协议单点；本仓测试消费同一份文件）。服务端协议变更时向量随之更新，保证行为
@@ -268,10 +277,44 @@ make lint     # gofmt + go vet
 - [x] v0.2：断线自动重连（退避 + 排队 + 会话重登钩子 + 连接状态机）
 - [x] v0.3：dual 双通道编排、WebSocket 通道
 - [x] v0.4：KCP / UDP 通道（四通道矩阵补齐）
-- [x] v0.5：`atlas sdk gen` DTO 生成器（Go/TS 后端，随 [atlas CLI](https://github.com/huangyuCN/atlas) 交付，不在本仓）
+- [x] v0.5：载荷编码 ver=2（protobuf 二进制）打样 + `atlas sdk gen` DTO 生成器
+  （Go/TS 后端，随 [atlas CLI](https://github.com/huangyuCN/atlas) 交付，不在本仓）
+- [x] v0.6：三库官方栈统一——默认序列化器改双通道 protojson（见下方「v0.6 破坏性变更」）
 
-> v0.x 为功能里程碑编号：v0.1–v0.5 均已交付至 main 分支，尚未发布对应的 Git tag，
+> v0.x 为功能里程碑编号：v0.1–v0.6 均已交付至 main 分支，尚未发布对应的 Git tag，
 > `go get` 默认安装 main 分支最新提交。
+
+## v0.6 破坏性变更（官方栈统一，2026-09-07）
+
+**背景**：Go/TS/C# 三库序列化语义统一。C#/TS 已用官方 protobuf 栈（DTO 即生成
+类型、json 即官方 protojson）；Go v0.6 跟进——默认序列化器从纯 Go JSON 改为
+双通道 `ProtoJSONSerializer`，DTO 推荐 protoc-gen-go 产物。
+
+### 变更点
+
+1. **默认序列化器**：`client.Dial` 等构造器默认 `serializer` 从
+   `JSONSerializer`（纯 `encoding/json`）改为 `ProtoJSONSerializer`（双通道）。
+   - 影响：以 proto message（pb.go）作 req/resp 的调用方，之前需显式
+     `WithSerializer(contrib/protojson.Serializer{})`——现在默认即可；
+   - 非 proto 类型（plain struct / map）行为不变（回退 `encoding/json`）；
+   - 纯手写 DTO + 显式 `WithSerializer(client.JSONSerializer{})` 的调用方
+     不受影响（该类型保留）。
+2. **客户端请求零值省略**：默认 protojson 编码零值字段省略（此前
+   contrib/protojson 为 `EmitUnpopulated` 零值下发）。与 C#（JsonFormatter
+   默认）、TS（手写 plain object）一致。服务端解析不受影响（缺失字段 ≡
+   零值）；**服务端响应仍零值下发**（服务端语义，客户端解码容忍显式零值）。
+3. **DTO 推荐 pb.go**：`atlas sdk gen` 的 Go/TS 后端随官方栈统一退役（atlas
+   主仓 sdkgen），DTO 一律 protoc-gen-go（Go）/ protoc-gen-es（TS）生成。
+4. **contrib/protojson**：逻辑已并入核心 `client.ProtoJSONSerializer`，
+   contrib 子包退役（见 docs/roadmap.md v0.6 增量段）。
+
+### 升级指引
+
+- 已用 pb.go + `WithSerializer(contrib/protojson...)`：删掉该 Option，默认即同语义
+  （唯一差异：请求零值从下发改省略——若依赖下发，需显式传自建
+  `EmitUnpopulated` serializer）。
+- 已用 plain struct / map + 默认：行为不变。
+- 已用 `JSONSerializer` 显式 + plain struct：不变（该类型保留）。
 
 TypeScript / C# 版 SDK、跨仓 CI 机器人等生态级后续规划由
 [atlas](https://github.com/huangyuCN/atlas) 主仓统一推进，见

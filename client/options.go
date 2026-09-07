@@ -74,7 +74,8 @@ func WithMaxBodySize(n int) Option {
 	}
 }
 
-// WithSerializer 设置序列化器（默认 JSON）。
+// WithSerializer 设置序列化器（默认 ProtoJSONSerializer——双通道：proto message
+// 走官方 protojson 零值省略、非 proto 回退 encoding/json）。
 func WithSerializer(s Serializer) Option {
 	return func(c *channelSettings) { c.serial = s }
 }

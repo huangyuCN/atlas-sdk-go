@@ -7,6 +7,35 @@
 > `testdata/golden/`（2026-09-03 迁入主仓，协议单点；本仓 frame 包消费同一份
 > 文件并执行语义断言，向量目录由 ATLAS_GOLDEN_DIR 或同级 atlas 仓默认路径解析）。
 
+## 增量（2026-09-07，v0.6——三库官方栈统一）
+
+**决策背景**：Go/TS/C# 三库序列化语义统一为官方 protobuf 栈（DTO 即生成类型、
+json 即官方 protojson、客户端请求零值省略）。C#/TS 已先行（C# 全 Google.Protobuf、
+TS 换 protoc-gen-es 生成代码）；Go 本次跟进。**本段记录对下文的更正**——下方
+历史段落的 contrib/protojson 描述为当时状态（EmitUnpopulated 零值下发、核心零
+protobuf 依赖），v0.6 起已变：
+
+- **核心默认序列化器**：`client/serializer.go` 新增 `ProtoJSONSerializer`（双通道：
+  proto message → 官方 protojson（零值省略）；非 proto → 回退 encoding/json），
+  `defaultSettings.serial` 从 `JSONSerializer` 切到它——client 包因此直接依赖
+  protobuf-go（不再是「contrib 才背 protobuf」）。`frame` 包仍零第三方依赖。
+- **请求零值省略**（三库统一）：protojson 编码不再 `EmitUnpopulated`；服务端
+  响应仍零值下发（服务端语义不变），客户端解码 `DiscardUnknown` 容忍显式零值。
+- **smoke 统一 pb.go**：`examples/smoke` 的 json 模式 DTO 从手写 plain struct
+  换为 protoc-gen-go 产物（authops.go 删 jsonAuthOps 与全部 json* struct），
+  三编码共用 gatewayv1 pb.go 一套 DTO；`-serializer json` 为历史名、语义同
+  protojson（与 TS 一致）。
+- **JSONSerializer 保留**（API 兼容，非默认）：纯 Go json，供非 proto 手写 DTO
+  显式选用；文档建议默认 ProtoJSONSerializer。
+- **contrib/protojson 待退役**：逻辑已并入核心（client.ProtoJSONSerializer ≡
+  contrib/protojson.Serializer），contrib 子包在后续批次退役（见下方「v0.6 待办」）。
+- **破坏性变更**：pb.go 用户此前须显式 `WithSerializer(contrib/protojson...)`
+  才能用 proto message——现在默认即可；唯一行为差异是请求零值从下发改省略
+  （依赖零值下发的调用方需显式自建 `EmitUnpopulated` serializer）。
+
+**v0.6 待办**：contrib/protojson 退役（删目录/改引用）；atlas 主仓 sdkgen Go/TS
+后端退役（DTO 全走 protoc 官方生成器）；三库回归与真机验证。
+
 ## 增量（2026-09-03，contrib/protojson 序列化器）
 
 - **contrib/protojson**：`client.Serializer` 的可选实现，protoc-gen-go 生成的
