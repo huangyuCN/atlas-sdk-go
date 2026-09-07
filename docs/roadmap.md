@@ -27,13 +27,13 @@ protobuf 依赖），v0.6 起已变：
   protojson（与 TS 一致）。
 - **JSONSerializer 保留**（API 兼容，非默认）：纯 Go json，供非 proto 手写 DTO
   显式选用；文档建议默认 ProtoJSONSerializer。
-- **contrib/protojson 待退役**：逻辑已并入核心（client.ProtoJSONSerializer ≡
-  contrib/protojson.Serializer），contrib 子包在后续批次退役（见下方「v0.6 待办」）。
+- **contrib/protojson 已退役**：逻辑已并入核心（client.ProtoJSONSerializer ≡
+  contrib/protojson.Serializer），contrib 子包已删除（本批次）。
 - **破坏性变更**：pb.go 用户此前须显式 `WithSerializer(contrib/protojson...)`
   才能用 proto message——现在默认即可；唯一行为差异是请求零值从下发改省略
   （依赖零值下发的调用方需显式自建 `EmitUnpopulated` serializer）。
 
-**v0.6 待办**：contrib/protojson 退役（删目录/改引用）；atlas 主仓 sdkgen Go/TS
+**v0.6 待办**：atlas 主仓 sdkgen Go/TS
 后端退役（DTO 全走 protoc 官方生成器）；三库回归与真机验证。
 
 ## 增量（2026-09-03，contrib/protojson 序列化器）
