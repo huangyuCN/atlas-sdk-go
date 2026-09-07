@@ -2,9 +2,12 @@
 // 使 protoc-gen-go 生成的 proto message 可直接作为 Invoke 的 req/resp，
 // 无需经 `atlas sdk gen` 生成 JSON DTO。
 //
-// 线上载荷本就是 protojson 风格 JSON（服务端 MarshalOptions{EmitUnpopulated: true}），
-// 本实现与其天然兼容：编码 EmitUnpopulated 对齐「零值字段也下发」；解码
+// 线上载荷是 protojson 风格 JSON。编码（客户端请求）：零值字段省略
+// （protojson 默认，对齐 C# JsonFormatter/TS 手写——三库统一语义；服务端
+// Unmarshal 用 DiscardUnknown，缺失字段 ≡ 零值，互通不受影响）；解码
 // DiscardUnknown 对齐「未知字段忽略」（服务端加字段不破坏旧客户端）。
+// 服务端响应仍 EmitUnpopulated 下发零值（服务端 Marshal 语义），客户端
+// Unmarshal 容忍显式零值——请求编码与响应解码解耦，无需对齐。
 // 非 proto 类型回退 encoding/json（行为同默认 JSONSerializer），两类 req/resp
 // 可在同一 Client 内混用。
 //
@@ -33,11 +36,11 @@ import (
 // （protojson 官方行为），勿做字节级比对。
 type Serializer struct{}
 
-// Marshal 编码请求：proto message 经 protojson（EmitUnpopulated 对齐服务端
-// 零值下发），其余类型经 encoding/json。
+// Marshal 编码请求：proto message 经 protojson（默认零值省略，三库统一
+// 客户端请求语义），其余类型经 encoding/json。
 func (Serializer) Marshal(v any) ([]byte, error) {
 	if m, ok := v.(proto.Message); ok {
-		return protojson.MarshalOptions{EmitUnpopulated: true}.Marshal(m)
+		return protojson.MarshalOptions{}.Marshal(m)
 	}
 	return json.Marshal(v)
 }

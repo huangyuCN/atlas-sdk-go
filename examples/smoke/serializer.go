@@ -1,6 +1,6 @@
 // serializer 适配层：真机冒烟按 -serializer 参数切换三种载荷编码。
-// json = plain struct + JSONSerializer（无 EmitUnpopulated，零值字段不下发）；
-// protojson = proto message + contrib/protojson（EmitUnpopulated 零值下发）；
+// json = plain struct + JSONSerializer（零值字段不下发）；
+// protojson = proto message + contrib/protojson（零值字段省略，三库统一语义）；
 // protobuf = proto message + contrib/protobuf（ver=2 二进制）。
 package main
 

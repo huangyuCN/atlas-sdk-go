@@ -101,7 +101,8 @@ func newLoginReply(t *testing.T, md protoreflect.MessageDescriptor, fill bool) *
 }
 
 // TestMarshalProtoMessage 验证普通 proto message 走 protojson 编码：
-// 字段名 camelCase、int64 → 字符串、枚举 → 字符串名、EmitUnpopulated 零值下发。
+// 字段名 camelCase、int64 → 字符串、枚举 → 字符串名、零值字段省略
+// （客户端请求零值省略语义，对齐 C#/TS——三库统一）。
 func TestMarshalProtoMessage(t *testing.T) {
 	md := loginReplyDesc(t)
 	var s Serializer
@@ -116,14 +117,16 @@ func TestMarshalProtoMessage(t *testing.T) {
 		t.Errorf("映射规则不符:\n got: %s\nwant: %s", cs, want)
 	}
 
-	// 零值 message：EmitUnpopulated 使零值字段也下发（对齐服务端编码）。
+	// 零值 message：protojson 默认省略零值字段（客户端请求零值省略，
+	// 与 C# JsonFormatter/TS 手写一致；服务端 DiscardUnknown 解析时
+	// 缺失字段 ≡ 零值，互通不受影响）。
 	got, err = s.Marshal(newLoginReply(t, md, false))
 	if err != nil {
 		t.Fatalf("Marshal 失败: %v", err)
 	}
-	want = `{"playerId":"","gold":"0","mode":"MODE_UNSPECIFIED"}`
+	want = `{}`
 	if cs := compact(t, got); cs != want {
-		t.Errorf("零值字段应下发:\n got: %s\nwant: %s", cs, want)
+		t.Errorf("零值字段应省略:\n got: %s\nwant: %s", cs, want)
 	}
 }
 
