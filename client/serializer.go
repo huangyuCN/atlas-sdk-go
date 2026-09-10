@@ -65,5 +65,8 @@ func (ProtoJSONSerializer) Unmarshal(data []byte, v any) error {
 // 64 位整数字段必须是 string 类型（protojson 线上形态，见规范 §6.2）。
 type JSONSerializer struct{}
 
-func (JSONSerializer) Marshal(v any) ([]byte, error)      { return json.Marshal(v) }
+// Marshal 直接以 encoding/json 编码（无 protojson 分支）。
+func (JSONSerializer) Marshal(v any) ([]byte, error) { return json.Marshal(v) }
+
+// Unmarshal 直接以 encoding/json 解码（无 protojson 分支）。
 func (JSONSerializer) Unmarshal(data []byte, v any) error { return json.Unmarshal(data, v) }

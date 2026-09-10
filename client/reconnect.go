@@ -39,4 +39,5 @@ var errClosed = errClosedSentinel{}
 
 type errClosedSentinel struct{}
 
+// Error 实现 error（关闭哨兵，固定文案 "client: closed"）。
 func (errClosedSentinel) Error() string { return "client: closed" }

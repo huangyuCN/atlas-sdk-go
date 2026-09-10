@@ -22,6 +22,7 @@ import (
 // Marshal/Unmarshal 的请求与响应 DTO 须实现 proto.Message（protoc 生成类型）。
 type Serializer struct{}
 
+// Marshal 以 protobuf 二进制编码请求 DTO（须实现 proto.Message）。
 func (Serializer) Marshal(v any) ([]byte, error) {
 	m, ok := v.(proto.Message)
 	if !ok {
@@ -30,6 +31,7 @@ func (Serializer) Marshal(v any) ([]byte, error) {
 	return proto.Marshal(m)
 }
 
+// Unmarshal 以 protobuf 二进制解码响应 DTO（须实现 proto.Message）。
 func (Serializer) Unmarshal(data []byte, v any) error {
 	m, ok := v.(proto.Message)
 	if !ok {

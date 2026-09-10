@@ -81,10 +81,12 @@ type kcpTransport struct {
 	writeMu sync.Mutex // kcp 写侧整帧单次写（与内核通道写锁双保险）
 }
 
+// ReadFrame 从 KCP 会话读取一帧（消息模式，一次 Read 收回一个完整帧）。
 func (t *kcpTransport) ReadFrame(maxBodySize int) (frame.Header, []byte, error) {
 	return frame.Read(t.sess, maxBodySize)
 }
 
+// WriteFrame 向 KCP 会话写入一帧（整帧单次写，写超时兜底防死链永久阻塞）。
 func (t *kcpTransport) WriteFrame(h frame.Header, body []byte, maxBodySize int) error {
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
@@ -94,4 +96,5 @@ func (t *kcpTransport) WriteFrame(h frame.Header, body []byte, maxBodySize int) 
 	return frame.Write(t.sess, h, body, maxBodySize)
 }
 
+// Close 关闭底层 KCP 会话。
 func (t *kcpTransport) Close() error { return t.sess.Close() }

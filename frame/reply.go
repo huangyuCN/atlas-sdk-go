@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-// 错误分类标记（errors.Is 判定用）：协议非法与业务拒绝之外的失败一律视为传输类。
+// ErrProtocol 错误分类标记（errors.Is 判定用）：协议非法与业务拒绝之外的失败一律视为传输类。
 var ErrProtocol = fmt.Errorf("frame: protocol")
 
 // DecodeReply 解析响应包络：

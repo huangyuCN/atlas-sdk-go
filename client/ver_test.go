@@ -15,7 +15,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// TestInvokeProtobufVersion2：protobuf serializer 下请求帧头 ver=2，
+// TestInvokeProtobufVersion2 protobuf serializer 下请求帧头 ver=2，
 // 服务端回显 ver=2 + protobuf 编码 payload → invoke 成功且 DTO 填充。
 func TestInvokeProtobufVersion2(t *testing.T) {
 	s := startFakeServer(t)
@@ -51,7 +51,7 @@ func TestInvokeProtobufVersion2(t *testing.T) {
 	}
 }
 
-// TestInvokeVersionMismatch：服务端响应帧 ver 与客户端载荷编码不一致 → 协议级致命。
+// TestInvokeVersionMismatch 服务端响应帧 ver 与客户端载荷编码不一致 → 协议级致命。
 func TestInvokeVersionMismatch(t *testing.T) {
 	s := startFakeServer(t)
 	defer func() { _ = s.ln.Close() }()
