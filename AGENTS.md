@@ -20,3 +20,4 @@ Atlas 帧协议的 Go 客户端 SDK：供游戏客户端、机器人与压测脚
   5. **注释与声明之间不能有空行**（否则不算 doc 注释，触发 Missing comment）；首句以句号结尾。
   6. 行内注释、`//go:` 指令注释不受「首词」限制；非导出声明不强制 doc 注释。
   7. 新增/修改代码时必须自查，code review 必查项：注释首词是否等于声明名。
+  8. 全仓自动检查：`make comment-lint`（`scripts/go-comment-lint`，违规时以退出码 1 失败）；`make lint` 已包含该检查。
