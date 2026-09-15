@@ -41,6 +41,7 @@ func Decode(msg []byte, maxBodySize int) (Header, []byte, error) {
 		Magic:   binary.BigEndian.Uint32(msg[0:4]),
 		Version: msg[4],
 		Type:    MsgType(msg[5]),
+		Flags:   msg[6],
 		Seq:     binary.BigEndian.Uint32(msg[8:12]),
 		Length:  binary.BigEndian.Uint32(msg[12:16]),
 	}
@@ -58,6 +59,7 @@ func encodeHeaderInto(buf []byte, h Header) {
 	binary.BigEndian.PutUint32(buf[0:4], h.Magic)
 	buf[4] = h.Version
 	buf[5] = byte(h.Type)
+	buf[6] = h.Flags
 	binary.BigEndian.PutUint32(buf[8:12], h.Seq)
 	binary.BigEndian.PutUint32(buf[12:16], h.Length)
 }

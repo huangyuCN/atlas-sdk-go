@@ -59,6 +59,11 @@ type channel struct {
 
 	sessionHBInterval time.Duration
 	sessionHBOp       func() (string, any)
+
+	// 帧级会话槽：无连接传输（UDP/KCP）为 true——请求帧自动携带会话凭据供服务端
+	// 验证身份；长连接（TCP/WS）为 false，身份按连接绑定（登录时绑定）。
+	frameSessionSlot bool
+	sessionToken     func() string
 }
 
 // generation 是一次连接代际的完整快照（评审 B3 修复）：
@@ -119,6 +124,8 @@ func newChannel(cfg ChannelConfig, defaults []Option) (*channel, error) {
 		onReconnected:     s.onReconnected,
 		sessionHBInterval: s.sessionHeartbeatInterval,
 		sessionHBOp:       s.sessionHeartbeatOp,
+		frameSessionSlot:  s.transport == TransportKCP || s.transport == TransportUDP,
+		sessionToken:      s.sessionToken,
 		notifies:          make(map[string]map[uintptr]notifyEntry),
 		closeCh:           make(chan struct{}),
 	}

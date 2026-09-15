@@ -30,6 +30,8 @@ type channelSettings struct {
 
 	sessionHeartbeatOp       func() (string, any) // 会话心跳请求工厂（返回 operation 与 req；nil 跳过本轮）
 	sessionHeartbeatInterval time.Duration        // 会话心跳周期
+
+	sessionToken func() string // 会话凭据提供者（Session 对象注入；无连接传输按帧携带）
 }
 
 // defaultSettings 返回内核默认参数（与规范 §5.2 对齐）。
@@ -133,4 +135,12 @@ func WithSessionHeartbeat(interval time.Duration, opFactory func() (string, any)
 // （业务重登成功 → 战斗重绑），要求两个钩子都配置在 ChannelConfig.Opts。
 func WithOnReconnected(fn func() error) Option {
 	return func(s *channelSettings) { s.onReconnected = fn }
+}
+
+// WithSessionTokenProvider 注入会话凭据提供者（由 Session 对象装配；业务层亦可自给）：
+// 无连接传输（UDP/KCP）的请求帧据此自动携带会话槽（frame.FlagSession），
+// 服务端按凭据验证身份；长连接（TCP/WS）按连接绑定，不携带。
+// 闭包返回空串表示当前无会话（匿名帧，如登录前的 Login 请求）。
+func WithSessionTokenProvider(fn func() string) Option {
+	return func(s *channelSettings) { s.sessionToken = fn }
 }

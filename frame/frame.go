@@ -4,12 +4,15 @@
 // atlas 仓库 docs/superpowers/specs/2026-08-28-client-sdk-multilang-design.md）：
 //
 //	┌──────────┬──────┬──────┬────────┬───────┬───────────┐
-//	│ magic(4) │ ver  │ type │ rsv(2) │ seq(4)│ bodyLen(4)│  大端，头固定 16B
+//	│ magic(4) │ ver  │ type │flags(1)│rsv(1) │ seq(4)│bodyLen(4)│  大端，头固定 16B
 //	└──────────┴──────┴──────┴────────┴───────┴───────────┘
 //
-//	┌──────────────────────────────────────┐
-//	│ opLen(2) │ operation utf-8 │ payload │  body 内部封装
-//	└──────────────────────────────────────┘
+//	┌───────────────────────────────────────────────┐
+//	│ opLen(2) │ operation │ [sessionLen(2) │ session] │ payload │  body 内部封装
+//	└───────────────────────────────────────────────┘
+//
+// 会话槽（flags bit0 = FlagSession）：无连接传输（UDP/KCP）的请求帧携带会话
+// 凭据供服务端验证身份；长连接（TCP/WS）按连接绑定、不置位、body 无会话字段。
 //
 // 粘包处理：先 io.ReadFull 读满 16B 头，按 bodyLen 读满 body；半包阻塞补齐、
 // 多包按 Length 切分。校验失败（magic/version/type/seq/长度）返回错误，由
@@ -39,6 +42,8 @@ const (
 	MaxBodySize = 2 << 20
 	// MaxOperationLen 是 operation 名的独立上限（服务端 dispatch.go 同款，防垃圾字符串耗内存）。
 	MaxOperationLen = 4096
+	// MaxSessionLen 是会话槽（会话凭据）的最大长度。
+	MaxSessionLen = 256
 )
 
 // MsgType 是帧类型。
@@ -56,9 +61,19 @@ type Header struct {
 	Magic   uint32
 	Version uint8
 	Type    MsgType
+	Flags   uint8 // flags 位图（原 rsv 首字节；bit0 = FlagSession）
 	Seq     uint32
 	Length  uint32
 }
+
+// Frame flags 位图（帧头 flags 字节的位定义）。
+const (
+	// FlagSession 表示请求帧 body 携带会话槽（sessionLen + session + payload）。
+	// 仅无连接传输（UDP/KCP）的请求帧置位；长连接按连接绑定身份。
+	FlagSession uint8 = 1 << 0
+	// flagReservedMask 是未定义的保留位掩码（未知位即协议非法）。
+	flagReserved uint8 = 0xFE
+)
 
 // Check 校验帧头合法性；maxBodySize ≤0 时回退绝对上限。
 func (h *Header) Check(maxBodySize int) error {
@@ -78,6 +93,9 @@ func (h *Header) Check(maxBodySize int) error {
 	// 版本协商位留给未来扩展，未知版本即协议非法）。
 	if h.Version != Version && h.Version != Version2 {
 		return fmt.Errorf("frame: invalid version: %x: %w", h.Version, ErrProtocol)
+	}
+	if h.Flags&flagReserved != 0 {
+		return fmt.Errorf("frame: invalid flags: %x: %w", h.Flags, ErrProtocol)
 	}
 	if uint64(h.Length) > uint64(maxBodySize) {
 		return fmt.Errorf("frame: body too large: %d > %d: %w", h.Length, maxBodySize, ErrProtocol)
@@ -156,6 +174,7 @@ func readHeader(r io.Reader, maxBodySize int) (Header, error) {
 		Magic:   binary.BigEndian.Uint32(buf[0:4]),
 		Version: buf[4],
 		Type:    MsgType(buf[5]),
+		Flags:   buf[6],
 		Seq:     binary.BigEndian.Uint32(buf[8:12]),
 		Length:  binary.BigEndian.Uint32(buf[12:16]),
 	}

@@ -174,18 +174,32 @@ func (ch *channel) invokeOnce(ctx context.Context, op string, req, resp any) err
 			return NewProtocolError(fmt.Errorf("client: 序列化请求失败: %w", err))
 		}
 	}
-	body, err := frame.BuildRequestBody(op, payload)
+	var body []byte
+	var err error
+	hdr := frame.Header{Type: frame.MsgTypeRequest, Version: ch.ver}
+	if ch.frameSessionSlot && ch.sessionToken != nil {
+		// 无连接传输：凭据非空时置位会话槽，供服务端按帧验证身份（匿名帧不置位）。
+		if tok := ch.sessionToken(); tok != "" {
+			hdr.Flags = frame.FlagSession
+			body, err = frame.BuildRequestBodyWithSession(op, tok, payload)
+		} else {
+			body, err = frame.BuildRequestBody(op, payload)
+		}
+	} else {
+		body, err = frame.BuildRequestBody(op, payload)
+	}
 	if err != nil {
 		return NewProtocolError(err)
 	}
 
 	key := inflightKey{epoch: g.epoch, seq: ch.nextSeq()}
+	hdr.Seq = key.seq
 	chRes := make(chan invokeResult, 1)
 	ch.inflight.Store(key, chRes)
 	defer ch.inflight.Delete(key)
 
 	ch.writeMu.Lock()
-	writeErr := g.tr.WriteFrame(frame.Header{Type: frame.MsgTypeRequest, Version: ch.ver, Seq: key.seq}, body, ch.maxBodySize)
+	writeErr := g.tr.WriteFrame(hdr, body, ch.maxBodySize)
 	ch.writeMu.Unlock()
 	if writeErr != nil {
 		return NewNetworkError(fmt.Errorf("client: 写帧失败: %w", writeErr))
