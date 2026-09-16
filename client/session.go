@@ -187,6 +187,33 @@ func (s *Session) Resume(ctx context.Context) (SessionReply, error) {
 	return s.call(ctx, s.ops.Resume, ResumeReq{Token: token, PlayerID: s.PlayerID()})
 }
 
+// SessionHeartbeatReply 是会话心跳回执（客户端对时用；int64 经 protojson 为字符串）。
+type SessionHeartbeatReply struct {
+	ServerTimeUnixMs string `json:"serverTimeUnixMs,omitempty"`
+}
+
+// Heartbeat 手动触发一次会话心跳并返回对时回执（无载荷：服务端按连接/帧槽
+// 定位会话续租）。与内置定时心跳语义一致；未登录显式报错（内置定时器为静默跳过）。
+func (s *Session) Heartbeat(ctx context.Context) (SessionHeartbeatReply, error) {
+	if s.Token() == "" {
+		return SessionHeartbeatReply{}, errors.New("session: 无会话凭据（未登录）")
+	}
+	var reply SessionHeartbeatReply
+	if err := s.invoke(ctx, s.ops.Heartbeat, nil, &reply); err != nil {
+		return SessionHeartbeatReply{}, err
+	}
+	return reply, nil
+}
+
+// Restore 用外部凭据恢复会话（成功后凭据由 Session 保管）：断线重连/接管恢复
+// 场景——凭据来自上一代连接（如 prev.token），区别于 Resume（用保管中的凭据）。
+func (s *Session) Restore(ctx context.Context, token, playerID string) (SessionReply, error) {
+	if token == "" || playerID == "" {
+		return SessionReply{}, errors.New("session: 恢复凭据与玩家 ID 不能为空")
+	}
+	return s.call(ctx, s.ops.Resume, ResumeReq{Token: token, PlayerID: playerID})
+}
+
 // Logout 登出并清空本地凭据。
 func (s *Session) Logout(ctx context.Context) error {
 	err := s.invoke(ctx, s.ops.Logout, LogoutReq{Token: s.Token()}, nil)
