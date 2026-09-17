@@ -66,7 +66,7 @@ func (s *udpTestServer) serve() {
 		if err != nil {
 			continue // 坏数据报静默丢弃，不拆「连接」
 		}
-		op, payload, err := frame.ParseRequestBody(body)
+		op, _, _, payload, err := frame.ParseRequestBodyFull(body, hdr.Flags)
 		if err != nil {
 			continue
 		}

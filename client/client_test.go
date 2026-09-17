@@ -149,7 +149,7 @@ func (s *fakeServer) handle(conn net.Conn) {
 		if hdr.Type != frame.MsgTypeRequest {
 			continue
 		}
-		op, payload, err := frame.ParseRequestBody(body)
+		op, _, _, payload, err := frame.ParseRequestBodyFull(body, hdr.Flags)
 		if err != nil {
 			return
 		}

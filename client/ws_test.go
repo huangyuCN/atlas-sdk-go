@@ -58,7 +58,7 @@ func (s *wsTestServer) handleWS(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return // 协议非法：断开
 		}
-		op, payload, err := frame.ParseRequestBody(body)
+		op, _, _, payload, err := frame.ParseRequestBodyFull(body, hdr.Flags)
 		if err != nil {
 			return
 		}

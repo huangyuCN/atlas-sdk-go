@@ -60,7 +60,7 @@ func (s *restartableServer) handle(conn net.Conn) {
 		if hdr.Type != frame.MsgTypeRequest {
 			continue
 		}
-		_, payload, err := frame.ParseRequestBody(body)
+		_, _, _, payload, err := frame.ParseRequestBodyFull(body, hdr.Flags)
 		if err != nil {
 			return
 		}
