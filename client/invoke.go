@@ -2,6 +2,8 @@ package client
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"time"
@@ -19,11 +21,39 @@ type invokeResult struct {
 // InvokeOption 定制单次 Invoke 行为。
 type InvokeOption func(*invokeOpts)
 
-type invokeOpts struct{ failFast bool }
+type invokeOpts struct {
+	failFast       bool
+	idempotencyKey string // 显式幂等键（覆盖自动生成；跨重试语义由调用方保证）
+	noIdempotency  bool   // 本次不带幂等键（即使默认自动生成也跳过）
+}
 
 // WithFailFast 使本次 Invoke 在重连期间不排队、立即失败（默认排队等待重连成功后重发）。
 func WithFailFast() InvokeOption {
 	return func(o *invokeOpts) { o.failFast = true }
+}
+
+// WithIdempotencyKey 显式指定本次 Invoke 的幂等键（覆盖自动生成）：同一键的
+// 重发/重试在服务端去重窗口内不重复产生副作用——适合按业务实体幂等
+// （如以订单号/操作单号为键）。服务端是否启用去重由接口的 atlas.route.v1
+// idempotency 注解决定（注解未声明时该键不生效）。
+func WithIdempotencyKey(id string) InvokeOption {
+	return func(o *invokeOpts) { o.idempotencyKey = id }
+}
+
+// WithNoIdempotency 使本次 Invoke 不携带幂等键（逃生门）：高频无副作用调用
+// （纯轮询/心跳）可省去 ID 生成与帧携带；服务端即使注解声明了幂等也收到空 ID
+// （诚实地不去重）。
+func WithNoIdempotency() InvokeOption {
+	return func(o *invokeOpts) { o.noIdempotency = true }
+}
+
+// newRequestID 生成请求幂等键（crypto/rand 12 字节 base64url，无外部依赖）。
+func newRequestID() string {
+	var b [12]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "" // 熵源异常：本次调用诚实降级为不携带（服务端不去重）
+	}
+	return base64.RawURLEncoding.EncodeToString(b[:])
 }
 
 // invoke 发送请求并等待响应：分配 (epoch, seq)、写帧、匹配响应、超时取消。
@@ -38,6 +68,17 @@ func (ch *channel) invoke(ctx context.Context, op string, req, resp any, opts ..
 	for _, opt := range opts {
 		opt(&o)
 	}
+	// 幂等键在入口一次决定：重发（drain 重投）复用同一 ID——服务端按
+	// (pid, request_id) 去重窗口保证不重复产生副作用（逃生门见
+	// WithIdempotencyKey/WithNoIdempotency）。
+	requestID := ""
+	switch {
+	case o.noIdempotency:
+	case o.idempotencyKey != "":
+		requestID = o.idempotencyKey
+	default:
+		requestID = newRequestID()
+	}
 	// 排队判定与入队在 genMu 临界区内原子完成（评审 B4 修复）：
 	// supervisor 的 drain 也在同一临界区，二者串行化——
 	// 判定为 Reconnecting 后入队的请求，要么被本次 drain 消费，要么队列满立即失败，
@@ -50,30 +91,30 @@ func (ch *channel) invoke(ctx context.Context, op string, req, resp any, opts ..
 	// 无法按 goroutine 区分钩子内外调用（Go 无 goroutine-local），此为公开 API
 	// 约束下的既定取舍。
 	if ch.hookBypass.Load() {
-		return ch.invokeOnce(ctx, op, req, resp)
+		return ch.invokeOnce(ctx, op, req, resp, requestID)
 	}
 	if !o.failFast {
 		ch.genMu.Lock()
 		reconnecting := ch.state.Load() == int32(StateReconnecting)
 		if !reconnecting {
 			ch.genMu.Unlock()
-			return ch.invokeOnce(ctx, op, req, resp)
+			return ch.invokeOnce(ctx, op, req, resp, requestID)
 		}
 		// 排队（临界区内：与 supervisor 的 state 置位/drain 互斥）。
-		q, err := ch.enqueueLocked(ctx, op, req, resp)
+		q, err := ch.enqueueLocked(ctx, op, req, resp, requestID)
 		ch.genMu.Unlock()
 		if err != nil {
 			return err
 		}
 		return ch.awaitQueued(ctx, q)
 	}
-	return ch.invokeOnce(ctx, op, req, resp)
+	return ch.invokeOnce(ctx, op, req, resp, requestID)
 }
 
 // enqueueLocked 将请求排入重连队列（调用方必须持有 genMu）。
 // 排队期限：单次超时（invokeTimeout）与 ctx deadline 取较早者——
 // 排队阶段计入超时（评审 Important 修复：不再无限等待重连）。
-func (ch *channel) enqueueLocked(ctx context.Context, op string, req, resp any) (*queuedInvoke, error) {
+func (ch *channel) enqueueLocked(ctx context.Context, op string, req, resp any, requestID string) (*queuedInvoke, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -82,14 +123,15 @@ func (ch *channel) enqueueLocked(ctx context.Context, op string, req, resp any) 
 		queueDeadline = deadline
 	}
 	q := &queuedInvoke{
-		ctx:      ctx,
-		op:       op,
-		req:      req,
-		resp:     resp,
-		result:   make(chan error, 1),
-		deadline: queueDeadline,
-		ctxDone:  ctx.Done(),
-		closeCh:  ch.closeCh,
+		ctx:       ctx,
+		op:        op,
+		req:       req,
+		resp:      resp,
+		requestID: requestID,
+		result:    make(chan error, 1),
+		deadline:  queueDeadline,
+		ctxDone:   ctx.Done(),
+		closeCh:   ch.closeCh,
 	}
 	select {
 	case ch.queue <- q:
@@ -153,8 +195,9 @@ func (ch *channel) awaitQueued(ctx context.Context, q *queuedInvoke) error {
 	}
 }
 
-// invokeOnce 执行一次「快照取代 → 写帧 → 等待响应」。
-func (ch *channel) invokeOnce(ctx context.Context, op string, req, resp any) error {
+// invokeOnce 执行一次「快照取代 → 写帧 → 等待响应」；requestID 非空时
+// body 携带请求幂等键段（帧头 FlagRequestID 置位，服务端按注解决定去重）。
+func (ch *channel) invokeOnce(ctx context.Context, op string, req, resp any, requestID string) error {
 	// Reconnecting 期间不写帧：死连接的写可能进内核缓冲后无响应，等待完整超时。
 	// （failFast 路径与 drain 前的旧调用在此被拦截，立即失败。）
 	// 例外：会话钩子执行期间（hookBypass，评审 v0.3-B1）放行——
@@ -174,20 +217,21 @@ func (ch *channel) invokeOnce(ctx context.Context, op string, req, resp any) err
 			return NewProtocolError(fmt.Errorf("client: 序列化请求失败: %w", err))
 		}
 	}
-	var body []byte
 	var err error
 	hdr := frame.Header{Type: frame.MsgTypeRequest, Version: ch.ver}
+	// 无连接传输：凭据非空时置位会话槽，供服务端按帧验证身份（匿名帧不置位）。
+	slotToken := ""
 	if ch.frameSessionSlot && ch.sessionToken != nil {
-		// 无连接传输：凭据非空时置位会话槽，供服务端按帧验证身份（匿名帧不置位）。
-		if tok := ch.sessionToken(); tok != "" {
-			hdr.Flags = frame.FlagSession
-			body, err = frame.BuildRequestBodyWithSession(op, tok, payload)
-		} else {
-			body, err = frame.BuildRequestBody(op, payload)
+		slotToken = ch.sessionToken()
+		if slotToken != "" {
+			hdr.Flags |= frame.FlagSession
 		}
-	} else {
-		body, err = frame.BuildRequestBody(op, payload)
 	}
+	// 幂等键非空时置位请求 ID 段（客户端重发/重试复用同一 ID，服务端按注解决定去重）。
+	if requestID != "" {
+		hdr.Flags |= frame.FlagRequestID
+	}
+	body, err := frame.BuildRequestBodyFull(op, slotToken, requestID, payload)
 	if err != nil {
 		return NewProtocolError(err)
 	}
@@ -352,7 +396,7 @@ func (ch *channel) drainQueue() {
 				continue
 			}
 			// 认领成功：重发并投递结果。
-			q.result <- ch.invokeOnce(q.ctx, q.op, q.req, q.resp)
+			q.result <- ch.invokeOnce(q.ctx, q.op, q.req, q.resp, q.requestID)
 		default:
 			return
 		}

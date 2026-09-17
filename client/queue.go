@@ -11,11 +11,12 @@ import (
 // CAS 成功者唯一负责投递结果；已认领（过期）的请求 drain 时跳过不重发
 // （评审 Important 修复：调用方已放弃的请求不再发往服务端）。
 type queuedInvoke struct {
-	ctx    context.Context
-	op     string
-	req    any
-	resp   any
-	result chan error
+	ctx       context.Context
+	op        string
+	req       any
+	resp      any
+	requestID string // 幂等键：drain 重发复用同一 ID（服务端去重窗口内不重复执行）
+	result    chan error
 
 	deadline time.Time       // 排队期限（单次超时与 ctx deadline 取较早）
 	ctxDone  <-chan struct{} // ctx.Done()（Background 时为 nil 语义由看护处理）

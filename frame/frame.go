@@ -71,9 +71,16 @@ const (
 	// FlagSession 表示请求帧 body 携带会话槽（sessionLen + session + payload）。
 	// 仅无连接传输（UDP/KCP）的请求帧置位；长连接按连接绑定身份。
 	FlagSession uint8 = 1 << 0
-	// flagReservedMask 是未定义的保留位掩码（未知位即协议非法）。
-	flagReserved uint8 = 0xFE
+	// FlagRequestID 表示请求帧 body 携带请求幂等键（requestIDLen + requestID 段，
+	// 紧随会话槽之后、payload 之前）。客户端重试/重发复用同一 ID；服务端按
+	// atlas.route.v1 注解决定是否注入投递去重键。
+	FlagRequestID uint8 = 1 << 1
+	// flagReserved 是未定义的保留位（非零即协议非法）。
+	flagReserved uint8 = 0xFC
 )
+
+// MaxRequestIDLen 是请求幂等键的最大长度（与服务端引擎解析上限对齐）。
+const MaxRequestIDLen = 128
 
 // Check 校验帧头合法性；maxBodySize ≤0 时回退绝对上限。
 func (h *Header) Check(maxBodySize int) error {

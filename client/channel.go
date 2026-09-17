@@ -313,7 +313,7 @@ func (ch *channel) sessionHeartbeatLoop(g *generation) {
 			if op == "" {
 				continue // 工厂未就绪（如尚未登录无 token）：跳过本轮
 			}
-			if err := ch.invokeOnce(context.Background(), op, req, nil); err != nil {
+			if err := ch.invokeOnce(context.Background(), op, req, nil, ""); err != nil {
 				if _, ok := err.(*BusinessError); ok {
 					ch.triggerReloginHook()
 				}

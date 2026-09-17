@@ -9,7 +9,7 @@ import (
 // TestSessionSlotRoundTrip 验证会话槽 body 编解码往返：
 // [opLen][op][sessionLen][session][payload] 与帧头 FlagSession 配对解析。
 func TestSessionSlotRoundTrip(t *testing.T) {
-	body, err := BuildRequestBodyWithSession("/game.v1.PlayerService/EnterMatchQueue", "tok-abc", []byte(`{"ruleset":"rank"}`))
+	body, err := BuildRequestBodyWithSession("/game.v1.PlayerService/EnterMatchQueue", "tok-abc", "", []byte(`{"ruleset":"rank"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ func TestSessionSlotAbsent(t *testing.T) {
 
 // TestSessionSlotTruncated 验证置位但槽截断时报协议错误。
 func TestSessionSlotTruncated(t *testing.T) {
-	body, _ := BuildRequestBodyWithSession("/op", "abc", nil)
+	body, _ := BuildRequestBodyWithSession("/op", "abc", "", nil)
 	bad := body[:len(body)-1]
 	if _, _, _, err := ParseRequestBodyWithSession(bad, FlagSession); err == nil {
 		t.Fatal("截断会话槽应报错")
@@ -58,7 +58,7 @@ func TestSessionSlotTruncated(t *testing.T) {
 // TestHeaderFlagsRoundTrip 验证 flags 经流式帧与消息边界帧的完整往返。
 func TestHeaderFlagsRoundTrip(t *testing.T) {
 	h := Header{Type: MsgTypeRequest, Version: Version, Flags: FlagSession, Seq: 7}
-	body, _ := buildRequestBody("/op", "tok", nil)
+	body, _ := buildRequestBody("/op", "tok", "", nil)
 
 	// 流式：Read/Write 往返。
 	var buf bytes.Buffer
@@ -95,8 +95,38 @@ func TestHeaderFlagsRoundTrip(t *testing.T) {
 
 // TestHeaderRejectsUnknownFlags 验证未知 flags 位被拒绝（前向保留位白名单）。
 func TestHeaderRejectsUnknownFlags(t *testing.T) {
-	h := Header{Magic: Magic, Type: MsgTypeRequest, Version: Version, Flags: 0x02, Seq: 1}
+	h := Header{Magic: Magic, Type: MsgTypeRequest, Version: Version, Flags: 0x04, Seq: 1}
 	if err := h.Check(0); err == nil || !strings.Contains(err.Error(), "flags") {
 		t.Fatalf("未知 flags 应报错, got %v", err)
+	}
+}
+
+// TestRequestIDSlotRoundTrip 验证请求幂等键段编解码往返：
+// [opLen][op][sessionLen][session][requestIDLen][requestID][payload] 与
+// FlagSession|FlagRequestID 配对解析；仅幂等键段（无会话槽）同样可解析。
+func TestRequestIDSlotRoundTrip(t *testing.T) {
+	body, err := BuildRequestBodyFull("/game.v1.PlayerService/GrantItem", "tok", "req-id-1", []byte(`{"x":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, session, requestID, payload, err := ParseRequestBodyFull(body, FlagSession|FlagRequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op != "/game.v1.PlayerService/GrantItem" || session != "tok" || requestID != "req-id-1" || string(payload) != `{"x":1}` {
+		t.Fatalf("op=%q session=%q requestID=%q payload=%q", op, session, requestID, payload)
+	}
+	// 仅幂等键段（无会话槽）。
+	idOnly, err := BuildRequestBodyFull("/op", "", "req-2", []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, session, requestID, payload, err = ParseRequestBodyFull(idOnly, FlagRequestID)
+	if err != nil || session != "" || requestID != "req-2" || string(payload) != `{}` {
+		t.Fatalf("仅幂等键段: session=%q requestID=%q payload=%q err=%v", session, requestID, payload, err)
+	}
+	// 超长幂等键拒绝。
+	if _, err := BuildRequestBodyFull("/op", "", string(make([]byte, MaxRequestIDLen+1)), nil); err == nil {
+		t.Fatal("超长幂等键应报错")
 	}
 }
