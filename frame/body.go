@@ -59,7 +59,6 @@ func buildRequestBody(operation, session, requestID string, payload []byte) ([]b
 	return body, nil
 }
 
-
 // BuildRequestBodyFull 封装全部可选段（会话槽 + 请求幂等键）：
 // [opLen][operation][sessionLen][session][requestIDLen][requestID][payload]，
 // 空串段不写入（布局最小化）；调用方按置位的 flags 解析。配合帧头使用。
