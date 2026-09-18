@@ -29,9 +29,10 @@ type sdkLogger struct {
 	out *os.File
 }
 
-// logf 按级别输出（时间戳 + 级别 + 消息）；静默或低于最小级别时丢弃。
+// logf 按级别输出（时间戳 + 级别 + 消息）；静默或比最小级别更细的丢弃
+// （min=Error 时仅 Error；min=Debug 时全部输出）。
 func (l *sdkLogger) logf(lv logLevel, format string, args ...any) {
-	if l == nil || lv < l.min {
+	if l == nil || lv > l.min {
 		return
 	}
 	l.mu.Lock()
