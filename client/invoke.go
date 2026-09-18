@@ -242,10 +242,12 @@ func (ch *channel) invokeOnce(ctx context.Context, op string, req, resp any, req
 	ch.inflight.Store(key, chRes)
 	defer ch.inflight.Delete(key)
 
+	ch.logger.debugf("send op=%s seq=%d id=%s req=%s", op, key.seq, requestID, ch.snippet(payload))
 	ch.writeMu.Lock()
 	writeErr := g.tr.WriteFrame(hdr, body, ch.maxBodySize)
 	ch.writeMu.Unlock()
 	if writeErr != nil {
+		ch.logger.errorf("send failed op=%s seq=%d: %v", op, key.seq, writeErr)
 		return NewNetworkError(fmt.Errorf("client: 写帧失败: %w", writeErr))
 	}
 	return ch.awaitResult(ctx, op, key, chRes, resp)
@@ -265,6 +267,7 @@ func (ch *channel) awaitResult(ctx context.Context, op string, key inflightKey, 
 	timer := time.AfterFunc(timeout, func() {
 		// 原子认领后才发送：保证「恰好一次」结果投递。
 		if _, loaded := ch.inflight.LoadAndDelete(key); loaded {
+			ch.logger.warnf("invoke timeout op=%s seq=%d (%s)", op, key.seq, timeout)
 			chRes <- invokeResult{err: NewTimeoutError(fmt.Errorf("client: %s 超时（%s）", op, timeout))}
 		}
 	})
@@ -283,6 +286,9 @@ func (ch *channel) awaitResult(ctx context.Context, op string, key inflightKey, 
 			return NewNetworkError(ctx.Err())
 		}
 	case r := <-chRes:
+		if r.err == nil {
+			ch.logger.debugf("recv op=%s seq=%d resp=%s", op, key.seq, ch.snippet(r.data))
+		}
 		return ch.resultToError(op, r, resp)
 	}
 }
@@ -401,4 +407,15 @@ func (ch *channel) drainQueue() {
 			return
 		}
 	}
+}
+
+// snippet 取 payload 调试摘要（Debug 日志用：完整 JSON 截断到 512 字节，防日志爆炸）。
+func (ch *channel) snippet(data []byte) string {
+	if len(data) == 0 {
+		return "{}"
+	}
+	if len(data) > 512 {
+		return string(data[:512]) + "...(truncated)"
+	}
+	return string(data)
 }

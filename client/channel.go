@@ -64,6 +64,10 @@ type channel struct {
 	// 验证身份；长连接（TCP/WS）为 false，身份按连接绑定（登录时绑定）。
 	frameSessionSlot bool
 	sessionToken     func() string
+
+	// logger 是调试日志实现（WithLog* Option；nil = 默认 Error 级 stderr，
+	// WithLogSilence 时为全静默哨兵——logf nil/级别过滤统一短路）。
+	logger *sdkLogger
 }
 
 // generation 是一次连接代际的完整快照（评审 B3 修复）：
@@ -108,6 +112,10 @@ func newChannel(cfg ChannelConfig, defaults []Option) (*channel, error) {
 	if err != nil {
 		return nil, fmt.Errorf("client: 通道 %s 拨号失败: %w", cfg.Kind, err)
 	}
+	chLogger := s.logger
+	if chLogger == nil && !s.logOff {
+		chLogger = newSDKLogger(logDefaultLevel) // 未显式设置：默认 Error 级
+	}
 	ch := &channel{
 		kind:              cfg.Kind,
 		addr:              s.addr,
@@ -116,6 +124,7 @@ func newChannel(cfg ChannelConfig, defaults []Option) (*channel, error) {
 		heartbeatInterval: s.heartbeatInterval,
 		invokeTimeout:     s.invokeTimeout,
 		maxBodySize:       s.maxBodySize,
+		logger:            chLogger,
 		autoReconnect:     s.autoReconnect,
 		backoffBase:       s.backoffBase,
 		backoffMax:        s.backoffMax,

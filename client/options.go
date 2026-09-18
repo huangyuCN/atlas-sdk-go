@@ -32,6 +32,9 @@ type channelSettings struct {
 	sessionHeartbeatInterval time.Duration        // 会话心跳周期
 
 	sessionToken func() string // 会话凭据提供者（Session 对象注入；无连接传输按帧携带）
+
+	logger *sdkLogger // 调试日志（WithLog* Option；nil + logOff=false = 默认 Error 级）
+	logOff bool       // WithLogSilence：完全静默（显式关闭默认 Error 输出）
 }
 
 // defaultSettings 返回内核默认参数（与规范 §5.2 对齐）。
