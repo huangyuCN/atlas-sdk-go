@@ -34,9 +34,9 @@ var (
 // 协议常量与消息 DTO（与模板 api/gateway/v1 一致；正式 DTO 将由 atlas sdk gen 生成）。
 // 字段名按 protojson 规则 camelCase；int64 线上为字符串（规范 §6.2）。
 const (
-	opRegister  = "/gateway.v1.GatewayAuth/Register"
-	opLogin     = "/gateway.v1.GatewayAuth/Login"
-	opHeartbeat = "/gateway.v1.GatewayAuth/Heartbeat"
+	opRegister  = "/gateway.v1.Session/Register"
+	opLogin     = "/gateway.v1.Session/Login"
+	opHeartbeat = "/gateway.v1.Session/Heartbeat"
 )
 
 const smokePassword = "pw-123456"
