@@ -210,30 +210,13 @@ func (ch *channel) invokeOnce(ctx context.Context, op string, req, resp any, req
 	if g == nil || ch.closed.Load() {
 		return NewNetworkError(errors.New("client: 连接已关闭"))
 	}
-	var payload []byte
-	if req != nil {
-		var err error
-		if payload, err = ch.serial.Marshal(req); err != nil {
-			return NewProtocolError(fmt.Errorf("client: 序列化请求失败: %w", err))
-		}
-	}
-	var err error
-	hdr := frame.Header{Type: frame.MsgTypeRequest, Version: ch.ver}
-	// 无连接传输：凭据非空时置位会话槽，供服务端按帧验证身份（匿名帧不置位）。
-	slotToken := ""
-	if ch.frameSessionSlot && ch.sessionToken != nil {
-		slotToken = ch.sessionToken()
-		if slotToken != "" {
-			hdr.Flags |= frame.FlagSession
-		}
-	}
-	// 幂等键非空时置位请求 ID 段（客户端重发/重试复用同一 ID，服务端按注解决定去重）。
-	if requestID != "" {
-		hdr.Flags |= frame.FlagRequestID
-	}
-	body, err := frame.BuildRequestBodyFull(op, slotToken, requestID, payload)
+	payload, err := ch.marshalRequest(req)
 	if err != nil {
-		return NewProtocolError(err)
+		return err
+	}
+	hdr, body, err := ch.buildRequestFrame(op, payload, requestID)
+	if err != nil {
+		return err
 	}
 
 	key := inflightKey{epoch: g.epoch, seq: ch.nextSeq()}
@@ -251,6 +234,40 @@ func (ch *channel) invokeOnce(ctx context.Context, op string, req, resp any, req
 		return NewNetworkError(fmt.Errorf("client: 写帧失败: %w", writeErr))
 	}
 	return ch.awaitResult(ctx, op, key, chRes, resp)
+}
+
+// marshalRequest 序列化请求载荷（nil 请求 = 空载荷，不写 body）。
+func (ch *channel) marshalRequest(req any) ([]byte, error) {
+	if req == nil {
+		return nil, nil
+	}
+	payload, err := ch.serial.Marshal(req)
+	if err != nil {
+		return nil, NewProtocolError(fmt.Errorf("client: 序列化请求失败: %w", err))
+	}
+	return payload, nil
+}
+
+// buildRequestFrame 组装请求帧头与 body：无连接传输置位会话槽，幂等键非空置位请求 ID 段。
+func (ch *channel) buildRequestFrame(op string, payload []byte, requestID string) (frame.Header, []byte, error) {
+	hdr := frame.Header{Type: frame.MsgTypeRequest, Version: ch.ver}
+	// 无连接传输：凭据非空时置位会话槽，供服务端按帧验证身份（匿名帧不置位）。
+	slotToken := ""
+	if ch.frameSessionSlot && ch.sessionToken != nil {
+		slotToken = ch.sessionToken()
+		if slotToken != "" {
+			hdr.Flags |= frame.FlagSession
+		}
+	}
+	// 幂等键非空时置位请求 ID 段（客户端重发/重试复用同一 ID，服务端按注解决定去重）。
+	if requestID != "" {
+		hdr.Flags |= frame.FlagRequestID
+	}
+	body, err := frame.BuildRequestBodyFull(op, slotToken, requestID, payload)
+	if err != nil {
+		return frame.Header{}, nil, NewProtocolError(err)
+	}
+	return hdr, body, nil
 }
 
 // awaitResult 等待响应或超时（超时与响应竞态：先到者胜出，后者静默）。
@@ -299,12 +316,13 @@ func (ch *channel) resultToError(op string, r invokeResult, resp any) error {
 	case r.err != nil:
 		return r.err
 	case r.st != nil:
-		// 业务拒绝：还原为 SDK 级 BusinessError（规范 §7），Reason 为主键。
+		// 业务拒绝：还原为 SDK 级 BusinessError（规范 §7），Reason 为主键，class 随投影带出。
 		return &BusinessError{
 			Code:     r.st.Code,
 			Reason:   r.st.Reason,
 			Message:  r.st.Message,
 			Metadata: r.st.Metadata,
+			Class:    r.st.Class,
 		}
 	default:
 		if resp != nil && len(r.data) > 0 {

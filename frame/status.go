@@ -6,7 +6,9 @@ import (
 
 // DecodeStatus 手写解析 atlas errors.Status 的 protobuf wire 格式。
 // 字段号：code=1 (varint int32)、reason=2 (string)、message=3 (string)、
-// metadata=4 (map<string,string>，每个 entry 为嵌套 message：key=1、value=2)。
+// metadata=4 (map<string,string>，每个 entry 为嵌套 message：key=1、value=2)、
+// class=5 (varint；框架 errors.proto 的 ErrorClass 枚举，与枚举化前的 int32 同号同
+// wire 类型，故解码不变；文本口径的解析见 ParseClass)。
 // 未知字段跳过（与服务端 DiscardUnknown 语义对齐）。
 func DecodeStatus(b []byte) (*Status, error) {
 	st := &Status{}
@@ -27,6 +29,8 @@ func DecodeStatus(b []byte) (*Status, error) {
 				st.Metadata = make(map[string]string)
 			}
 			st.Metadata[k] = v
+		case fieldNum == 5 && wire == wireVarint:
+			st.Class = Class(num)
 		}
 		return nil // 未知字段静默跳过
 	}); err != nil {

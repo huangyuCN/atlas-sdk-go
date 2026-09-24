@@ -24,36 +24,35 @@ import (
 	"fmt"
 	"io"
 	"net"
+
+	goframe "github.com/huangyuCN/atlas-sdk-go/frame/gen"
 )
 
-// 帧协议常量。
+// 帧协议常量：唯一来源是框架仓 gen-frame 生成物（scripts/gen-dto.sh 逐字节复制到
+// frame/gen/frame_gen.go），本包只做类型化引用——手写副本会与服务端漂移。
 const (
 	// HeaderSize 是帧头固定长度（字节）。
-	HeaderSize = 16
+	HeaderSize = goframe.HeaderSize
 	// Magic 是帧协议魔数（"ATLS"）。
-	Magic uint32 = 0x41544C53
+	Magic uint32 = goframe.Magic
 	// Version 是当前默认协议版本（载荷编码 ver=1：protojson JSON，规范 §3.1）。
-	Version uint8 = 1
+	Version uint8 = goframe.Version
 	// Version2 是载荷编码 ver=2（protobuf 二进制 wire format；规范 §3.1 载荷编码
 	// 协商，2026-09-04 v0.5 设计决策）。可选增强：服务端支持 ver=2 前勿在真实
 	// 连接启用（protojson ver=1 永续支持）。
-	Version2 uint8 = 2
+	Version2 uint8 = goframe.Version2
 	// MaxBodySize 是单帧 body 的绝对上限（2MiB，与服务端 frame.MaxBodySize 对齐）。
-	MaxBodySize = 2 << 20
-	// MaxOperationLen 是 operation 名的独立上限（服务端 dispatch.go 同款，防垃圾字符串耗内存）。
-	MaxOperationLen = 4096
-	// MaxSessionLen 是会话槽（会话凭据）的最大长度。
-	MaxSessionLen = 256
+	MaxBodySize = goframe.MaxBodySize
 )
 
 // MsgType 是帧类型。
 type MsgType uint8
 
-// 帧类型：请求 / 响应 / 服务端推送（不参与请求匹配）。
+// 帧类型：请求 / 响应 / 服务端推送（不参与请求匹配）；取值取自生成物。
 const (
-	MsgTypeRequest  MsgType = 1
-	MsgTypeResponse MsgType = 2
-	MsgTypeNotify   MsgType = 3
+	MsgTypeRequest  MsgType = MsgType(goframe.MsgTypeRequest)
+	MsgTypeResponse MsgType = MsgType(goframe.MsgTypeResponse)
+	MsgTypeNotify   MsgType = MsgType(goframe.MsgTypeNotify)
 )
 
 // Header 是帧头的客户端侧表示。
@@ -66,21 +65,18 @@ type Header struct {
 	Length  uint32
 }
 
-// Frame flags 位图（帧头 flags 字节的位定义）。
+// Frame flags 位图（帧头 flags 字节的位定义）；已定义位取自生成物。
 const (
 	// FlagSession 表示请求帧 body 携带会话槽（sessionLen + session + payload）。
 	// 仅无连接传输（UDP/KCP）的请求帧置位；长连接按连接绑定身份。
-	FlagSession uint8 = 1 << 0
+	FlagSession uint8 = goframe.FlagSession
 	// FlagRequestID 表示请求帧 body 携带请求幂等键（requestIDLen + requestID 段，
 	// 紧随会话槽之后、payload 之前）。客户端重试/重发复用同一 ID；服务端按
 	// atlas.route.v1 注解决定是否注入投递去重键。
-	FlagRequestID uint8 = 1 << 1
-	// flagReserved 是未定义的保留位（非零即协议非法）。
-	flagReserved uint8 = 0xFC
+	FlagRequestID uint8 = goframe.FlagRequestID
+	// flagReserved 是未定义的保留位（非零即协议非法）：已定义位的补集，无需手写常量。
+	flagReserved uint8 = ^(FlagSession | FlagRequestID)
 )
-
-// MaxRequestIDLen 是请求幂等键的最大长度（与服务端引擎解析上限对齐）。
-const MaxRequestIDLen = 128
 
 // Check 校验帧头合法性；maxBodySize ≤0 时回退绝对上限。
 func (h *Header) Check(maxBodySize int) error {

@@ -1,5 +1,7 @@
-// client_log.go 是 SDK 的内置调试日志：显式级别 Option 控制（接入时参数决定，
+// 本文件（log.go）是 SDK 的内置调试日志：显式级别 Option 控制（接入时参数决定，
 // 无环境变量），按级别过滤输出——开发时全开核对收发，生产默认 Error 只看异常。
+// 包级文档见 client.go 的 Package client 注释。
+
 package client
 
 import (

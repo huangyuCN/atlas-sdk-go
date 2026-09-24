@@ -145,6 +145,14 @@ func (c *Client) On(op string, h NotifyHandler) (off func()) {
 	return c.business.on(op, h)
 }
 
+// OnAny 订阅默认业务通道的全部 Notify 帧（不区分 operation），返回退订函数。
+// 用途：协议无关的订阅方——会话状态机据此把每条推送交给 SessionProtocol 接缝判定
+// 「被挤下线」（推送 op 属协议事实，SDK 内核不硬编码）。语义与 On 一致（幂等去重、
+// 重连后订阅保留、handler 隔离执行）。
+func (c *Client) OnAny(h NotifyHandler) (off func()) {
+	return c.business.onAny(h)
+}
+
 // OnReadExit 注册默认业务通道的读循环退出回调（每次连接断开触发一次；如需自定义
 // 重连建议改用 WithAutoReconnect/WithOnReconnected；每通道版本见 ChannelView）。
 func (c *Client) OnReadExit(fn func(error)) {
@@ -263,29 +271,46 @@ func DialUDP(addr string, opts ...Option) (*Client, error) {
 // （业务通道重登 / 战斗通道 Join 重绑定，经 ChannelConfig.Opts 配置）。
 // 任一通道拨号失败即整体失败（已建通道被回滚关闭）。
 func DialDual(business, battle ChannelConfig, opts ...Option) (*Client, error) {
+	if err := normalizeDualRoles(&business, &battle); err != nil {
+		return nil, err
+	}
+	// 评审 v0.3-B2 修复：业务重登成功后自动触发战斗通道重绑（Join），
+	// 规范 §5.2「业务通道重连成功后由 SDK 自动对战斗通道执行重新绑定」。
+	var clientSlot atomic.Pointer[Client]
+	business.Opts = append(business.Opts, chainedBattleHook(battle.Opts, &clientSlot))
+	c, err := dialChannels([]ChannelConfig{business, battle}, opts)
+	if err == nil {
+		clientSlot.Store(c)
+	}
+	return c, err
+}
+
+// normalizeDualRoles 校验并归一 dual 两通道角色：零值按参数位置推断为战斗通道，
+// 角色重复或非法即报错。
+func normalizeDualRoles(business, battle *ChannelConfig) error {
 	if business.Kind != KindBusiness && business.Kind != KindBattle {
-		return nil, fmt.Errorf("client: 非法业务通道角色 %d", int(business.Kind))
+		return fmt.Errorf("client: 非法业务通道角色 %d", int(business.Kind))
 	}
 	if battle.Kind == KindBusiness {
 		// 零值视为未设置，按参数位置推断为战斗通道。
 		battle.Kind = KindBattle
 	}
 	if business.Kind == battle.Kind {
-		return nil, fmt.Errorf("client: dual 通道角色重复（%s）", business.Kind)
+		return fmt.Errorf("client: dual 通道角色重复（%s）", business.Kind)
 	}
-	// 评审 v0.3-B2 修复：业务重登成功后自动触发战斗通道重绑（Join），
-	// 规范 §5.2「业务通道重连成功后由 SDK 自动对战斗通道执行重新绑定」。
-	// 实现为链式包装（追加到业务通道）：业务钩子 = 业务重登 → 成功后调用战斗钩子。
-	// 注意：链式编排要求两个钩子都配置在 ChannelConfig.Opts——
-	// 顶层 Option 配置的钩子按「全部通道默认值」生效，不参与链式编排。
-	var clientSlot atomic.Pointer[Client]
-	// 战斗钩子提取（链式调用的第二环）。
+	return nil
+}
+
+// chainedBattleHook 构造业务通道的重连钩子：业务重登成功后调用战斗通道的 Join 钩子。
+// 链式编排要求两个钩子都配置在 ChannelConfig.Opts——顶层 Option 配置的钩子按
+// 「全部通道默认值」生效，不参与链式编排。
+func chainedBattleHook(battleOpts []Option, clientSlot *atomic.Pointer[Client]) Option {
 	batProbe := defaultSettings()
-	for _, o := range battle.Opts {
+	for _, o := range battleOpts {
 		o(&batProbe)
 	}
 	batHook := batProbe.onReconnected
-	business.Opts = append(business.Opts, func(s *channelSettings) {
+	return func(s *channelSettings) {
 		prev := s.onReconnected
 		s.onReconnected = func() error {
 			if prev != nil {
@@ -306,12 +331,7 @@ func DialDual(business, battle ChannelConfig, opts ...Option) (*Client, error) {
 			}
 			return batHook()
 		}
-	})
-	c, err := dialChannels([]ChannelConfig{business, battle}, opts)
-	if err == nil {
-		clientSlot.Store(c)
 	}
-	return c, err
 }
 
 // dialChannels 是全部构造器的公共路径：逐通道构建连接本体并启动监管；

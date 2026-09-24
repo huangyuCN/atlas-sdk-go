@@ -34,7 +34,8 @@ type channel struct {
 	seq      atomic.Uint32
 
 	notifyMu      sync.Mutex
-	notifies      map[string]map[uintptr]notifyEntry // op → handler 集合（函数值指针幂等去重）
+	notifies      map[string]map[notifyKey]notifyEntry // op → handler 集合（稳定键幂等去重）
+	notifyAny     map[notifyKey]notifyEntry            // 通配订阅（不区分 op；会话接缝判定被挤下线用）
 	onReadExitPtr atomic.Pointer[func(error)]
 
 	// 重连配置与状态。
@@ -86,20 +87,23 @@ type inflightKey struct {
 	seq   uint32
 }
 
-// notifyEntry 是订阅表条目：以函数值本身判等（配合 reflect 型指针比较实现幂等）。
+// notifyKey 是订阅表的稳定去重键：op（按 op 订阅；通配订阅为空）+ 订阅方标识。
+// 不用闭包指针做键——同一会话重复 Bind 会生成不同闭包，闭包指针去重必然失效，
+// 且两个会话绑同一 Client 时后者会顶掉前者。
+type notifyKey struct {
+	op string
+	id string
+}
+
+// notifyEntry 是订阅表条目：fn 以推送信封（op + 帧头版本 + 原始字节）为入参。
 type notifyEntry struct {
-	fn NotifyHandler
+	fn func(PushEnvelope)
 }
 
 // newChannel 构建单条通道：合并默认与通道级配置、建立首连、启动读循环/心跳/监管。
 // 首连失败返回错误（调用方决定整体回滚）。
 func newChannel(cfg ChannelConfig, defaults []Option) (*channel, error) {
-	s := defaultSettings()
-	s.transport = cfg.Transport
-	s.addr = cfg.Addr
-	s.path = cfg.Path
-	s.apply(defaults)
-	s.apply(cfg.Opts)
+	s := channelSettingsOf(cfg, defaults)
 	if s.addr == "" {
 		return nil, fmt.Errorf("client: 通道 %s 缺少服务端地址", cfg.Kind)
 	}
@@ -112,6 +116,29 @@ func newChannel(cfg ChannelConfig, defaults []Option) (*channel, error) {
 	if err != nil {
 		return nil, fmt.Errorf("client: 通道 %s 拨号失败: %w", cfg.Kind, err)
 	}
+	ch := newChannelWithSettings(cfg, s, ver)
+
+	// 首代连接：generation 在本 goroutine 构造（代际切换只在 supervisor/Dial 串行发生）。
+	ch.setConn(tr)
+	ch.state.Store(int32(StateConnected)) // 首连已在手，置位先于 supervisor 调度
+	ch.wg.Add(1)
+	go ch.supervisor()
+	return ch, nil
+}
+
+// channelSettingsOf 合并默认选项与通道级选项，得到本通道的生效配置。
+func channelSettingsOf(cfg ChannelConfig, defaults []Option) channelSettings {
+	s := defaultSettings()
+	s.transport = cfg.Transport
+	s.addr = cfg.Addr
+	s.path = cfg.Path
+	s.apply(defaults)
+	s.apply(cfg.Opts)
+	return s
+}
+
+// newChannelWithSettings 按生效配置组装通道本体（不含拨号与代际登记）。
+func newChannelWithSettings(cfg ChannelConfig, s channelSettings, ver uint8) *channel {
 	chLogger := s.logger
 	if chLogger == nil && !s.logOff {
 		chLogger = newSDKLogger(logDefaultLevel) // 未显式设置：默认 Error 级
@@ -135,20 +162,15 @@ func newChannel(cfg ChannelConfig, defaults []Option) (*channel, error) {
 		sessionHBOp:       s.sessionHeartbeatOp,
 		frameSessionSlot:  s.transport == TransportKCP || s.transport == TransportUDP,
 		sessionToken:      s.sessionToken,
-		notifies:          make(map[string]map[uintptr]notifyEntry),
+		notifies:          make(map[string]map[notifyKey]notifyEntry),
+		notifyAny:         make(map[notifyKey]notifyEntry),
 		closeCh:           make(chan struct{}),
 	}
 	ch.dialFn = func(ctx context.Context) (channelTransport, error) {
 		return dialTransport(ctx, s.transport, s.addr, s.path, s.maxBodySize)
 	}
 	ch.queue = make(chan *queuedInvoke, ch.queueSize)
-
-	// 首代连接：generation 在本 goroutine 构造（代际切换只在 supervisor/Dial 串行发生）。
-	ch.setConn(tr)
-	ch.state.Store(int32(StateConnected)) // 首连已在手，置位先于 supervisor 调度
-	ch.wg.Add(1)
-	go ch.supervisor()
-	return ch, nil
+	return ch
 }
 
 // setConn 登记新一代连接：构造不可变 generation 整体替换 genPtr。

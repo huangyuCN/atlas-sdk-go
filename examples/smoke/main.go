@@ -2,6 +2,10 @@
 // 连接真实 gateway 服务端，执行 注册 → 登录 → 业务心跳 → 传输心跳保活，
 // 并演练断线自动重连（-reconnect-after 触发等待，由外层脚本重启服务端）。
 //
+// 协议素材全部取自本仓生成物（scripts/gen-dto.sh 产出）：op 名与凭据提取来自模板仓
+// 生成的会话 stub（api/gateway/v1/opclient），会话状态机经 client.WithSessionProtocol
+// 接入；战斗绑定走生成的战斗 stub（api/battle/v1/opclient）。冒烟内不写字面量契约。
+//
 // 形态（TCP / WS / KCP / UDP 单通道 + dual 组合）：
 //
 //	go run ./examples/smoke -addr 127.0.0.1:9001                    # TCP 单通道
@@ -21,41 +25,16 @@ import (
 	"sync/atomic"
 	"time"
 
+	battlev1 "github.com/huangyuCN/atlas-sdk-go/api/battle/v1"
+	battlev1opclient "github.com/huangyuCN/atlas-sdk-go/api/battle/v1/opclient"
 	"github.com/huangyuCN/atlas-sdk-go/client"
-	"github.com/huangyuCN/atlas-sdk-go/examples/smoke/gatewayv1"
 )
 
-// ops 与 mode 是当前编码模式的认证操作 DTO 适配与 serializer（main 中按 -serializer 设置）。
-var (
-	ops  authOps
-	mode smokeMode
-)
-
-// 协议常量与消息 DTO（与模板 api/gateway/v1 一致；正式 DTO 将由 atlas sdk gen 生成）。
-// 字段名按 protojson 规则 camelCase；int64 线上为字符串（规范 §6.2）。
-const (
-	opRegister  = "/gateway.v1.Session/Register"
-	opLogin     = "/gateway.v1.Session/Login"
-	opHeartbeat = "/gateway.v1.Session/Heartbeat"
-)
-
-const smokePassword = "pw-123456"
-
-// opJoinBattle 是战斗绑定 op（KCP/UDP 战斗通道；模板 D6 战斗协议）。
-const opJoinBattle = "/gateway.v1.GatewayBattle/JoinBattle"
+// mode 是当前 -serializer 选定的载荷编码模式（main 中设置）。
+var mode smokeMode
 
 // dialFn 封装形态差异的拨号入口（TCP / WS / dual）。
 type dialFn func(opts ...client.Option) (*client.Client, error)
-
-// smokeOpts 是一次冒烟运行的形态参数。
-type smokeOpts struct {
-	dial           dialFn
-	account        string
-	reconnectAfter time.Duration
-	// dual 形态专用：战斗通道视图与 Join 重绑定完成信号。
-	battleView *client.ChannelView
-	rejoined   chan struct{}
-}
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:9001", "gateway TCP 地址")
@@ -75,7 +54,6 @@ func main() {
 		fail("未知 -serializer %q（json|protojson|protobuf）", *serializer)
 	}
 	mode = m
-	ops = newAuthOps(mode)
 	fmt.Printf("[冒烟] 载荷编码: %s\n", serializerName(mode))
 
 	account := fmt.Sprintf("smoke-%d", rand.Int63())
@@ -102,37 +80,62 @@ func main() {
 	}
 }
 
+// newSmokeSession 装配冒烟会话：接缝取自模板生成的会话描述符（项目侧一行接入）；
+// 自动 Resume 关闭——本冒烟演练的是服务端重启（会话随之丢失）后的业务重登。
+// 内置会话心跳周期 2s（远小于网关会话租期 30s）。
+func newSmokeSession() *client.Session {
+	return client.NewSession(
+		client.WithSessionProtocol(sessionProtocol{}),
+		client.WithAutoResume(false),
+		client.WithSessionHeartbeatInterval(2*time.Second),
+	)
+}
+
+// dialSession 拨号并绑定会话：冒烟内核参数 + 会话通道选项（凭据提供者/内置心跳）+ 形态
+// 特有选项；Bind 订阅全部推送并由接缝判定被挤下线。
+func dialSession(dial dialFn, sess *client.Session, extra ...client.Option) (*client.Client, error) {
+	opts := append(smokeDialOpts(), sess.ChannelOptions()...)
+	opts = append(opts, extra...)
+	c, err := dial(opts...)
+	if err != nil {
+		return nil, err
+	}
+	if err := sess.Bind(c); err != nil {
+		_ = c.Close()
+		return nil, fmt.Errorf("会话接缝接入失败: %w", err)
+	}
+	return c, nil
+}
+
 // runSingle 单通道冒烟：注册 → 登录 → 业务心跳 →（可选）重连演练 → 传输心跳确认。
 // 会话重登钩子：服务端重启后会话丢失，重登由业务层负责（规范 §5.2 双层心跳）；
-// SDK 内置会话心跳调度（WithSessionHeartbeat）按周期续租会话。
+// SDK 内置会话心跳调度（Session.ChannelOptions）按周期续租会话。
 func runSingle(dial dialFn, account string, reconnectAfter time.Duration) {
 	var (
-		c           *client.Client
 		player      string
-		token       string
 		rebindCalls atomic.Int32
 		reloggedIn  = make(chan struct{})
 	)
-	var err error
-	c, err = dial(append(smokeDialOpts(),
-		client.WithOnReconnected(func() error {
-			return relogin(c, account, &player, &token, reloggedIn, &rebindCalls)
-		}),
-		sessionHeartbeatOpt(&player, &token),
-	)...)
+	sess := newSmokeSession()
+	c, err := dialSession(dial, sess, client.WithOnReconnected(func() error {
+		return relogin(sess, player, reloggedIn, &rebindCalls)
+	}))
 	if err != nil {
 		fail("连接失败: %v", err)
 	}
 	defer func() { _ = c.Close() }()
 
-	player, token = registerAndLogin(c, account)
+	player, err = registerAndLogin(c, sess, account)
+	if err != nil {
+		fail("%v", err)
+	}
 	fmt.Printf("[冒烟] 登录成功 playerId=%s token 已存\n", player)
 
-	businessHeartbeats(c, player, token, 3)
+	businessHeartbeats(sess, 3)
 	fmt.Println("[冒烟] 业务心跳 3 次往返 OK")
 
 	reconnectDrill(c, reconnectAfter, &rebindCalls, reloggedIn, func() {
-		businessHeartbeats(c, player, token, 3)
+		businessHeartbeats(sess, 3)
 		fmt.Println("[冒烟] 重连后业务心跳 3 次往返 OK")
 	})
 
@@ -157,13 +160,13 @@ func runBattleChannelSmoke(dial dialFn, form string, reconnectAfter time.Duratio
 	}
 	fmt.Printf("[冒烟] %s 通道往返探针 OK\n", form)
 
-	// 战斗 payload 编解码验证（三编码统一）：发 JoinBattle（伪造 token）——
+	// 战斗 payload 编解码验证（三编码统一）：发 JoinBattle（伪造目标）——
 	// 服务端按 ver 分派 codec 解码后因会话无效回业务拒绝（BusinessError）即证明
 	// payload 编解码正确（协议错误/解码失败才说明编解码问题）。
 	{
-		err := ops.joinBattle(context.Background(), c)
+		err := joinBattle(context.Background(), c)
 		if err == nil {
-			fail("%s JoinBattle 应被拒绝（伪造 token），却成功", form)
+			fail("%s JoinBattle 应被拒绝（伪造会话），却成功", form)
 		}
 		var be *client.BusinessError
 		if !errors.As(err, &be) {
@@ -205,6 +208,65 @@ func probeAlive(c *client.Client) bool {
 	return errors.As(err, &be)
 }
 
+// joinBattle 战斗绑定探针：走生成的战斗 stub（op 来自生成描述符）；invoker 由调用方按
+// 形态给定（单通道 = 默认业务通道；dual = 战斗通道视图）。
+func joinBattle(ctx context.Context, invoker client.Invoker) error {
+	_, err := battlev1opclient.NewBattleService(invoker).JoinBattle(ctx, &battlev1.JoinBattleReq{BattleId: "smoke-b1"})
+	return err
+}
+
+// dualRun 是 dual 冒烟运行态：通道、会话与两个重连钩子的共享状态。
+type dualRun struct {
+	c           *client.Client
+	sess        *client.Session
+	player      string
+	rebindCalls atomic.Int32
+	joinCalls   atomic.Int32
+	reloggedIn  chan struct{}
+	rejoined    chan struct{}
+}
+
+// dial 拨号 dual 双通道并绑定会话：业务通道装配重登钩子，战斗通道装配重绑定钩子。
+func (d *dualRun) dial(tcpAddr, wsPath string, battleKind client.Transport, battleAddr string) error {
+	c, err := client.DialDual(
+		client.ChannelConfig{
+			Addr: tcpAddr,
+			Opts: append(d.sess.ChannelOptions(), client.WithOnReconnected(d.relogin)),
+		},
+		client.ChannelConfig{
+			Transport: battleKind,
+			Addr:      battleAddr,
+			Path:      wsPath,
+			Opts:      []client.Option{client.WithOnReconnected(d.rebindBattle)},
+		},
+		smokeDialOpts()...,
+	)
+	if err != nil {
+		return err
+	}
+	d.c = c
+	return d.sess.Bind(c)
+}
+
+// relogin 业务通道重连后的重登钩子（凭据由 Session 保管）。
+func (d *dualRun) relogin() error {
+	return relogin(d.sess, d.player, d.reloggedIn, &d.rebindCalls)
+}
+
+// rebindBattle 战斗通道重连后的重绑定钩子（模板 JoinBattle 语义的冒烟替身）：在战斗
+// 通道上做一次传输心跳往返，证明通道重连后可用。注意战斗通道不做业务 Login——网关
+// 会话为每玩家单会话，二次登录会顶掉业务通道会话（规范 §5.2：会话绑定业务通道）。
+func (d *dualRun) rebindBattle() error {
+	d.joinCalls.Add(1)
+	if err := battlePing(d.c); err != nil {
+		fmt.Printf("[冒烟] 战斗通道重绑定失败（随下一轮重连重试）: %v\n", err)
+		return err
+	}
+	fmt.Println("[冒烟] 战斗通道重连后重绑定成功")
+	signalOnce(d.rejoined)
+	return nil
+}
+
 // runDual dual 双通道冒烟（模板 dual 形态）：业务 TCP + 战斗通道（WS 或 KCP）。
 // 业务通道重登钩子 + 战斗通道 Join 重绑定钩子各自独立触发与演练。
 func runDual(tcpAddr, wsAddr, kcpAddr, wsPath, battleTransport, account string, reconnectAfter time.Duration) {
@@ -212,76 +274,47 @@ func runDual(tcpAddr, wsAddr, kcpAddr, wsPath, battleTransport, account string, 
 	if battleTransport == "kcp" {
 		battleKind, battleAddr = client.TransportKCP, kcpAddr
 	}
-	var (
-		c           *client.Client
-		player      string
-		token       string
-		rebindCalls atomic.Int32
-		joinCalls   atomic.Int32
-		reloggedIn  = make(chan struct{})
-		rejoined    = make(chan struct{})
-	)
-	var err error
-	c, err = client.DialDual(
-		client.ChannelConfig{
-			Addr: tcpAddr,
-			Opts: []client.Option{
-				client.WithOnReconnected(func() error {
-					return relogin(c, account, &player, &token, reloggedIn, &rebindCalls)
-				}),
-				sessionHeartbeatOpt(&player, &token), // 会话心跳仅业务通道生效
-			},
-		},
-		client.ChannelConfig{
-			Transport: battleKind,
-			Addr:      battleAddr,
-			Path:      wsPath,
-			Opts: []client.Option{client.WithOnReconnected(func() error {
-				// 战斗通道重绑定（模板 JoinBattle 语义的冒烟替身）：
-				// 在战斗通道上做一次传输心跳往返，证明 WS 通道重连后可用。
-				// 注意战斗通道不做业务 Login——网关会话为每玩家单会话，
-				// 二次登录会顶掉业务通道会话（规范 §5.2：会话绑定业务通道）。
-				joinCalls.Add(1)
-				if err := battlePing(c); err != nil {
-					fmt.Printf("[冒烟] 战斗通道重绑定失败（随下一轮重连重试）: %v\n", err)
-					return err
-				}
-				fmt.Println("[冒烟] 战斗通道重连后重绑定成功")
-				signalOnce(rejoined)
-				return nil
-			})},
-		},
-		smokeDialOpts()...,
-	)
-	if err != nil {
+	d := &dualRun{
+		sess:       newSmokeSession(),
+		reloggedIn: make(chan struct{}),
+		rejoined:   make(chan struct{}),
+	}
+	if err := d.dial(tcpAddr, wsPath, battleKind, battleAddr); err != nil {
 		fail("dual 连接失败: %v", err)
 	}
-	defer func() { _ = c.Close() }()
+	defer func() { _ = d.c.Close() }()
 
-	player, token = registerAndLogin(c, account)
+	player, err := registerAndLogin(d.c, d.sess, account)
+	if err != nil {
+		fail("%v", err)
+	}
+	d.player = player
 	fmt.Printf("[冒烟] 业务通道登录成功 playerId=%s token 已存\n", player)
-	battlePing(c)
+	battlePing(d.c)
 	fmt.Printf("[冒烟] 战斗通道（%s）传输心跳往返 OK\n", battleKind)
 
-	businessHeartbeats(c, player, token, 3)
+	businessHeartbeats(d.sess, 3)
 	fmt.Println("[冒烟] 业务心跳 3 次往返 OK")
 
-	// 重连演练：等待业务重登与战斗重绑定都完成。
 	if reconnectAfter > 0 {
-		fmt.Printf("[冒烟] %s 后请重启 gateway（等待双通道自动重连+重登/重绑定）\n", reconnectAfter)
-		time.Sleep(reconnectAfter)
-		waitSignal(reloggedIn, "业务重登", c, &rebindCalls)
-		waitSignal(rejoined, "战斗重绑定", c, &joinCalls)
-		businessHeartbeats(c, player, token, 3)
-		fmt.Println("[冒烟] 重连后业务心跳 3 次往返 OK")
+		dualReconnectDrill(d, reconnectAfter)
 	}
-
-	assertConnected(c, "dual")
+	assertConnected(d.c, "dual")
 	fmt.Printf("冒烟通过（dual 双通道闭环：业务TCP/战斗%s 独立重连+重登+重绑定）\n", battleKind)
 }
 
+// dualReconnectDrill 重连演练：等待业务重登与战斗重绑定都完成后复跑业务心跳。
+func dualReconnectDrill(d *dualRun, reconnectAfter time.Duration) {
+	fmt.Printf("[冒烟] %s 后请重启 gateway（等待双通道自动重连+重登/重绑定）\n", reconnectAfter)
+	time.Sleep(reconnectAfter)
+	waitSignal(d.reloggedIn, "业务重登", d.c, &d.rebindCalls)
+	waitSignal(d.rejoined, "战斗重绑定", d.c, &d.joinCalls)
+	businessHeartbeats(d.sess, 3)
+	fmt.Println("[冒烟] 重连后业务心跳 3 次往返 OK")
+}
+
 // smokeDialOpts 公共拨号参数（冒烟内加速心跳与重连节奏 + 载荷编码 serializer）；
-// 会话钩子由各通道单独配置。
+// 会话钩子由会话通道选项单独配置。
 func smokeDialOpts() []client.Option {
 	return []client.Option{
 		serializerOf(mode),
@@ -291,15 +324,14 @@ func smokeDialOpts() []client.Option {
 	}
 }
 
-// relogin 会话重登：调用方持久化新令牌（player 与 token 均写回闭包变量）。
-func relogin(c *client.Client, account string, player, token *string, done chan struct{}, rebindCalls *atomic.Int32) error {
-	rebindCalls.Add(1)
-	p, t, err := ops.login(context.Background(), c, *player, smokePassword)
-	if err != nil {
+// relogin 会话重登：服务端重启后会话丢失，重登由业务层负责；凭据由 Session 保管
+// （重登成功即更新令牌）。
+func relogin(sess *client.Session, player string, done chan struct{}, calls *atomic.Int32) error {
+	calls.Add(1)
+	if err := login(context.Background(), sess, player); err != nil {
 		fmt.Printf("[冒烟] 重连后重登失败（随下一轮重连重试）: %v\n", err)
 		return err
 	}
-	*player, *token = p, t
 	fmt.Println("[冒烟] 重连后重登成功（新令牌已存）")
 	signalOnce(done)
 	return nil
@@ -310,21 +342,6 @@ func battlePing(c *client.Client) error {
 	return c.Channel(client.KindBattle).Invoke(context.Background(), client.HeartbeatOperation, nil, nil)
 }
 
-// sessionHeartbeatOpt 会话心跳配置（规范 §5.2 业务层；闭包携带最新 token/player，
-// 未登录时跳过本轮）。网关会话租期 30s，周期取 2s（远小于 租期/2）。
-func sessionHeartbeatOpt(player, token *string) client.Option {
-	return client.WithSessionHeartbeat(2*time.Second, func() (string, any) {
-		if *token == "" {
-			return "", nil // 未登录：跳过
-		}
-		// 会话心跳 DTO 统一 proto message（三编码同构——json/protojson 走默认
-		// ProtoJSONSerializer，protobuf 走 contrib/protobuf）。
-		return opHeartbeat, &gatewayv1.HeartbeatRequest{
-			Token: *token, PlayerId: *player, Ts: time.Now().UnixMilli(),
-		}
-	})
-}
-
 // signalOnce 非阻塞通知（容量 1）：钩子多次成功触发（网关反复抖动）时只保留首个信号。
 func signalOnce(done chan struct{}) {
 	select {
@@ -333,25 +350,10 @@ func signalOnce(done chan struct{}) {
 	}
 }
 
-// registerAndLogin 注册并登录，返回 playerId 与 token（DTO 形态随编码模式）。
-func registerAndLogin(c *client.Client, account string) (string, string) {
-	ctx := context.Background()
-	player, err := ops.register(ctx, c, account)
-	if err != nil {
-		fail("注册失败: %v", err)
-	}
-	fmt.Printf("[冒烟] 注册成功 playerId=%s\n", player)
-	p, t, err := ops.login(ctx, c, player, smokePassword)
-	if err != nil {
-		fail("登录失败: %v", err)
-	}
-	return p, t
-}
-
 // businessHeartbeats 业务心跳往返（双层心跳的会话续租层；传输心跳由 SDK 周期自动发送）。
-func businessHeartbeats(c *client.Client, player, token string, n int) {
+func businessHeartbeats(sess *client.Session, n int) {
 	for i := 0; i < n; i++ {
-		if err := ops.heartbeat(context.Background(), c, player, token); err != nil {
+		if err := sessionHeartbeat(context.Background(), sess); err != nil {
 			fail("业务心跳失败: %v", err)
 		}
 		time.Sleep(200 * time.Millisecond)

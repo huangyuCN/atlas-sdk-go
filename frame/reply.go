@@ -55,13 +55,17 @@ func DecodeReply(b []byte) ([]byte, *Status, error) {
 }
 
 // Status 是 atlas errors.Status 的客户端侧还原（字段号见 atlas errors/errors.proto：
-// code=1 int32、reason=2 string、message=3 string、metadata=4 map<string,string>）。
-// 手写 protobuf wire 解码，避免引入完整 protobuf 运行时。
+// code=1 int32、reason=2 string、message=3 string、metadata=4 map<string,string>、
+// class=5 int32）。手写 protobuf wire 解码，避免引入完整 protobuf 运行时。
 type Status struct {
 	Code     int32
 	Reason   string
 	Message  string
 	Metadata map[string]string
+	// Class 是错误分类（0 未分类 / 1 业务 / 2 运行时 / 3 取消，与框架 errors.Class
+	// 及 errors.proto 的 Status.class 数值一一对应）：客户端按它决定日志定级与处置
+	// （业务拒绝可提示、运行时故障可上报、取消忽略）。
+	Class Class
 }
 
 // Error 实现 error（业务分支主键是 Reason，见规范 §7.1）。

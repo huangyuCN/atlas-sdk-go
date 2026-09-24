@@ -3,6 +3,20 @@ package frame
 import (
 	"encoding/binary"
 	"fmt"
+
+	goframe "github.com/huangyuCN/atlas-sdk-go/frame/gen"
+)
+
+// body 布局段的解析/封装上限：取值唯一来源是框架仓 gen-frame 生成物
+// （frame/gen/frame_gen.go 的 MaxOperationLen / MaxSessionLen / MaxRequestIDLen，
+// 由 scripts/gen-dto.sh 逐字节复制），本包只做类型化引用——手写副本会与服务端漂移。
+const (
+	// MaxOperationLen 是 operation 名的独立上限（防垃圾字符串耗内存）。
+	MaxOperationLen = goframe.MaxOperationLen
+	// MaxSessionLen 是会话槽（会话凭据）的最大长度。
+	MaxSessionLen = goframe.MaxSessionLen
+	// MaxRequestIDLen 是请求幂等键的最大长度（与服务端引擎解析上限对齐）。
+	MaxRequestIDLen = goframe.MaxRequestIDLen
 )
 
 // BuildRequestBody 封装帧 body（无可选段）：[opLen:u16 大端][operation][payload]。

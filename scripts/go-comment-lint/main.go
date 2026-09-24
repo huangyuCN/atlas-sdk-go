@@ -151,15 +151,11 @@ func hasDetachedComment(file string, pos token.Pos) bool {
 
 // scanFile 解析单个 Go 文件并逐声明检查（生成文件直接跳过）。
 func scanFile(path, pkgName string, isTest, isMain bool) {
-	src, err := os.ReadFile(path)
-	if err != nil {
+	if isGenerated(path) {
 		return
 	}
-	head := string(src)
-	if len(head) > 2048 {
-		head = head[:2048]
-	}
-	if strings.Contains(head, "Code generated") && strings.Contains(head, "DO NOT EDIT") {
+	src, err := os.ReadFile(path)
+	if err != nil {
 		return
 	}
 	f, err := parser.ParseFile(fset, path, src, parser.ParseComments)
@@ -169,16 +165,27 @@ func scanFile(path, pkgName string, isTest, isMain bool) {
 	rel, _ := filepath.Rel(rootDir, path)
 	parsedFiles[rel] = f
 
-	// 包注释形式检查（测试文件与 main 包跳过）。
-	if !isTest && !isMain && f.Doc != nil && !isDeprecated(f.Doc) {
-		if w, ok := firstWord(f.Doc); ok {
-			toks := strings.Fields(strings.TrimSpace(f.Doc.Text()))
-			if w != "Package" || len(toks) < 2 || !strings.HasPrefix(toks[1], pkgName) {
-				out = append(out, violation{rel, fset.Position(f.Package).Line, "pkg-form", pkgName, w})
-			}
-		}
-	}
+	checkPackageForm(rel, f, pkgName, isTest, isMain)
+	scanDecls(rel, f, isTest)
+}
 
+// checkPackageForm 检查包注释形式（测试文件与 main 包跳过）。
+func checkPackageForm(rel string, f *ast.File, pkgName string, isTest, isMain bool) {
+	if isTest || isMain || f.Doc == nil || isDeprecated(f.Doc) {
+		return
+	}
+	w, ok := firstWord(f.Doc)
+	if !ok {
+		return
+	}
+	toks := strings.Fields(strings.TrimSpace(f.Doc.Text()))
+	if w != "Package" || len(toks) < 2 || !strings.HasPrefix(toks[1], pkgName) {
+		out = append(out, violation{rel, fset.Position(f.Package).Line, "pkg-form", pkgName, w})
+	}
+}
+
+// scanDecls 逐顶层声明检查（函数、单条声明、带括号的声明组）。
+func scanDecls(rel string, f *ast.File, isTest bool) {
 	for _, d := range f.Decls {
 		switch d := d.(type) {
 		case *ast.FuncDecl:
@@ -199,19 +206,24 @@ func scanFile(path, pkgName string, isTest, isMain bool) {
 				continue
 			}
 			// 有括号的组：组注释可覆盖成员的 missing；成员自带注释则查首词。
-			for _, s := range d.Specs {
-				name := specName(s)
-				if name == "" {
-					continue
-				}
-				if sd := specDoc(s); sd != nil {
-					checkDecl(rel, name, true, s.Pos(), sd)
-					continue
-				}
-				if exported(name) && d.Doc == nil && !isTest {
-					out = append(out, violation{rel, fset.Position(s.Pos()).Line, "missing", name, "组内导出成员无注释且组无注释"})
-				}
-			}
+			scanGroup(rel, d, isTest)
+		}
+	}
+}
+
+// scanGroup 检查带括号声明组：组注释可覆盖成员的 missing；成员自带注释则查首词。
+func scanGroup(rel string, d *ast.GenDecl, isTest bool) {
+	for _, s := range d.Specs {
+		name := specName(s)
+		if name == "" {
+			continue
+		}
+		if sd := specDoc(s); sd != nil {
+			checkDecl(rel, name, true, s.Pos(), sd)
+			continue
+		}
+		if exported(name) && d.Doc == nil && !isTest {
+			out = append(out, violation{rel, fset.Position(s.Pos()).Line, "missing", name, "组内导出成员无注释且组无注释"})
 		}
 	}
 }
@@ -220,6 +232,19 @@ func scanFile(path, pkgName string, isTest, isMain bool) {
 func relOf(root, path string) string {
 	r, _ := filepath.Rel(root, path)
 	return r
+}
+
+// isGenerated 判断文件是否为代码生成物（文件头含 "Code generated" 与 "DO NOT EDIT" 标记）。
+func isGenerated(path string) bool {
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	head := string(src)
+	if len(head) > 2048 {
+		head = head[:2048]
+	}
+	return strings.Contains(head, "Code generated") && strings.Contains(head, "DO NOT EDIT")
 }
 
 // quickPkg 从源码首个 package 子句取包名与是否 main。
@@ -284,28 +309,40 @@ func main() {
 		}
 		scanFile(path, pkgName, isTest, isMain)
 	}
+	checkPackageDocs(root, files, pkgNameOf, isMainPkg)
 
-	// missing-pkg：非 main 包（至少一个非测试文件）没有任何包注释。
+	report()
+}
+
+// checkPackageDocs 检查 missing-pkg：非 main 包（至少一个非测试文件）没有任何包注释。
+// 纯生成物包（如 protoc 产物目录）无手写代码，不要求包注释。
+func checkPackageDocs(root string, files []string, pkgNameOf map[string]string, isMainPkg map[string]bool) {
 	for dir, pkgName := range pkgNameOf {
 		if isMainPkg[dir] || pkgName == "" {
 			continue
 		}
-		hasDoc := false
+		hasDoc, handwritten := false, false
 		for _, path := range files {
 			if filepath.Dir(path) != dir || strings.HasSuffix(path, "_test.go") {
 				continue
+			}
+			if !isGenerated(path) {
+				handwritten = true
 			}
 			if f := parsedFiles[relOf(root, path)]; f != nil && f.Doc != nil && !isDeprecated(f.Doc) {
 				hasDoc = true
 				break
 			}
 		}
-		if !hasDoc {
+		if !hasDoc && handwritten {
 			rel, _ := filepath.Rel(root, dir)
 			out = append(out, violation{rel, 0, "missing-pkg", pkgName, "包无任何包注释"})
 		}
 	}
+}
 
+// report 排序后输出分类计数与违规清单；有违规则退出码 1。
+func report() {
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].file != out[j].file {
 			return out[i].file < out[j].file

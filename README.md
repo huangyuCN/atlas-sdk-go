@@ -79,29 +79,26 @@ func main() {
 	}
 	defer c.Close()
 
-	// 订阅服务端推送（handler 在独立 goroutine 执行）。
-	off := c.On("/gateway.v1.GatewayAuth/Notify", func(op string, payload []byte) {
-		fmt.Println("收到推送:", op, string(payload))
+	// 订阅服务端推送（handler 在独立 goroutine 执行；op 名用生成物常量，不要手写）。
+	off := c.OnAny(func(op string, payload []byte) {
+		fmt.Println("收到推送:", op, len(payload), "bytes")
 	})
 	defer off()
 
-	// 请求-响应。DTO 两种形态（默认双通道序列化器都支持）：
-	//  ① 推荐：protoc-gen-go 生成的 pb.go message（proto.Message）→ 自动走官方
-	//     protojson（camelCase + int64 字符串 + 零值省略）；
-	//  ② 兼容：手写 plain struct/map（非 proto）→ 回退 encoding/json，
-	//     64 位整数字段须自行用 string 表达线上字符串形态。
-	// 下方示例用②展示零依赖兼容用法。
-	var resp struct {
-		PlayerId string `json:"playerId"`
-		Nickname string `json:"nickname"`
-	}
-	err = c.Invoke(context.Background(),
-		"/gateway.v1.GatewayAuth/Login",
-		map[string]any{"playerId": "p1", "password": "***"},
-		&resp,
+	// 会话经接缝：op 名与凭据提取全部取自生成物（见「生成物来源」一节）。
+	// 接缝的 Kicked(op, msg) 收到 client.PushEnvelope（op + 帧头 version + 原始字节）：
+	// ver=1 走 protojson、ver=2 走 protobuf wire，实现方按 Version 选解码器。
+	sess := client.NewSession(
+		client.WithSessionProtocol(sessionProtocol{}), // 项目侧接入（见 examples/smoke/protocol.go）
+		client.WithSessionHeartbeatInterval(30*time.Second),
 	)
+	if err := sess.Bind(c); err != nil { // 未注入接缝即 ErrNoSessionProtocol
+		panic(err)
+	}
+	defer sess.Close() // 退订推送并解绑（重复 Bind 会先退订旧订阅）
+	reply, err := sess.Login(ctx, &gatewayv1.LoginRequest{PlayerId: "p1", Password: "***"})
 	if err == nil {
-		fmt.Println("登录成功:", resp.PlayerId)
+		fmt.Println("登录成功:", reply.GetPlayer().GetPlayerId())
 		return
 	}
 	var be *client.BusinessError
@@ -166,6 +163,8 @@ KCP / UDP：`client.DialKCP("127.0.0.1:9003")` / `client.DialUDP("127.0.0.1:9004
 | `*client.NetworkError` | 连接断开、写失败 | 可重试（重连后） |
 | `*client.TimeoutError` | 请求超时 | 谨重重试（请求可能已到达服务端） |
 | `*client.ProtocolError` | 帧解码/包络非法 | 不可重试，需排查两端版本 |
+| `client.ErrSessionReplyUnresolved` | 会话回执未解析成已注册的生成 DTO | 项目二进制须链接生成的会话 DTO 包（`api/gateway/v1`） |
+| `client.ErrSessionCredentialsEmpty` | 回执解析成功但关键凭据为空 | 登录/注册至少要有 token 或 playerId；恢复必须有 playerId |
 
 ```go
 var be *client.BusinessError
@@ -222,7 +221,7 @@ if errors.As(err, &be) {
 ┌────────┬──────┬──────┬────────┬───────┬───────────┐   ┌──────────┬───────────┬─────────┐
 │ magic 4│ ver 1│ type 1│ rsv  2 │ seq 4 │ bodyLen 4 │ + │ opLen 2  │ operation │ payload │
 └────────┴──────┴──────┴────────┴───────┴───────────┘   └──────────┴───────────┴─────────┘
-  "ATLS"   =1    1=请求            单调递增   ≤2MiB      长度前缀   如 "/gateway.v1.GatewayAuth/Login"
+  "ATLS"   =1    1=请求            单调递增   ≤2MiB      长度前缀   如 "/gateway.v1.Session/Login"
                        2=响应
                        3=推送(Notify)
 ```
@@ -241,9 +240,24 @@ if errors.As(err, &be) {
 | 枚举是字符串名 | 未知枚举值可能以数字出现，DTO 判别不要穷举失败 |
 | message 字段未设置为 `null` | proto message 有 presence：nil message 字段在 protojson 下输出 `null`（与标量零值省略不同）——区分未设置 vs 显式零值请用 proto3 optional 或 message 字段 |
 
-> **DTO 推荐 protoc-gen-go 生成类型（pb.go）**：proto 定义即 DTO 源（官方生成器产
-> `proto.Message` 实现），直接作 `Invoke` 的 req/resp，由默认序列化器自动走官方
-> protojson（camelCase + int64 字符串 + 零值省略）。
+### 生成物来源（模板仓 descriptor set）
+
+本 SDK **不携带手写协议副本**：帧常量与域 DTO/会话 stub 全部由生成脚本从**模板仓**
+（`atlas-game-layout`）导出的 descriptor set 生成：
+
+```bash
+ATLAS_LAYOUT_DIR=../atlas-game-layout ATLAS_DIR=../atlas bash scripts/gen-dto.sh
+```
+
+| 产物 | 来源 | 用途 |
+|------|------|------|
+| `frame/gen/frame_gen.go` | 逐字节复制框架 `transport/frame/gen/goframe/frame_gen.go` | 帧协议常量（唯一来源；`frame` 包只做转发） |
+| `api/gateway/v1/**`、`api/battle/v1/**` 等 | 模板 descriptor set（两个 include 根：模板仓 + 框架仓）→ `--go_out`（M 映射到本仓包） | 域 DTO（`proto.Message`，ver=1 protojson / ver=2 protobuf 共用） |
+| `api/*/v1/opclient/*.pb.go` | `--atlas-client_out` + `go_client_package=github.com/huangyuCN/atlas-sdk-go/client` | 强类型客户端 stub 与**协议描述符**（5 会话 op + 3 提取器 + 推送 op） |
+
+> **DTO 直接用生成类型**：`proto.Message` 作 `Invoke` 的 req/resp，默认序列化器自动走
+> 官方 protojson（camelCase + int64 字符串 + 零值省略）；非 proto 的 struct/map 仍可
+> 作为兼容形态（回退 `encoding/json`，64 位整数须自行用 string 表达）。
 > 非 proto 手写 DTO（plain struct / map）仍可用——默认序列化器回退
 > encoding/json（v0.6 兼容保留）；但 64 位整数字段须自行用 `string` 表达
 > （线上字符串形态），并注意 camelCase json tag。

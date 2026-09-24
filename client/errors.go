@@ -3,6 +3,8 @@ package client
 import (
 	"errors"
 	"fmt"
+
+	"github.com/huangyuCN/atlas-sdk-go/frame"
 )
 
 // 错误四分类（规范 §7）：业务错误即 BusinessError（含 *frame.Status）；
@@ -75,6 +77,10 @@ type BusinessError struct {
 	Reason   string
 	Message  string
 	Metadata map[string]string
+	// Class 是服务端错误投影的错误分类（0 未分类 / 1 业务 / 2 运行时 / 3 取消，对齐框架
+	// errors.Class 与 frame.Class）：调用方据此决定日志定级与处置（业务拒绝可提示、
+	// 运行时故障可上报、取消忽略）。Reason 仍是分支主键，Class 只做处置口径。
+	Class frame.Class
 }
 
 // Error 实现 error。

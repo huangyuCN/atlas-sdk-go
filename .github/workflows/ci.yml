@@ -8,6 +8,12 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # 上游仓检出在 $GITHUB_WORKSPACE 下（path: atlas / atlas-game-layout），与
+      # gen-dto.sh 默认的「同级目录 ../atlas」布局不同，故显式给绝对路径；
+      # 不设这两个变量时脚本会找不到上游仓而失败。
+      ATLAS_DIR: ${{ github.workspace }}/atlas
+      ATLAS_LAYOUT_DIR: ${{ github.workspace }}/atlas-game-layout
     steps:
       - uses: actions/checkout@v4
       # golden vectors 源在 atlas 主仓（协议单点：规范与向量同仓，transport/frame -update 生成）。
@@ -29,9 +35,44 @@ jobs:
           ref: feat/actor
           path: atlas
           token: ${{ secrets.ATLAS_CI_TOKEN }}
+      # 会话/战斗 DTO 的协议源在模板仓 atlas-game-layout（R13）：gen-dto 门禁需要该检出。
+      # 未配置凭证时守卫步骤给出配置指引后失败（与上一条同款只读 PAT 约定）。
+      - name: 校验模板仓访问凭证
+        env:
+          TOKEN_SET: ${{ secrets.ATLAS_LAYOUT_CI_TOKEN != '' || secrets.ATLAS_CI_TOKEN != '' }}
+        run: |
+          if [ "$TOKEN_SET" != "true" ]; then
+            echo "::error::模板仓 atlas-game-layout 为私有仓，「生成物无 diff」门禁需要检出它。"
+            echo "::error::到本仓 Settings → Secrets and variables → Actions 添加 ATLAS_LAYOUT_CI_TOKEN"
+            echo "::error::（fine-grained，含该仓 Contents: Read；或让 ATLAS_CI_TOKEN 同时覆盖模板仓），然后 Re-run。"
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          repository: huangyuCN/atlas-game-layout
+          ref: main
+          path: atlas-game-layout
+          token: ${{ secrets.ATLAS_LAYOUT_CI_TOKEN || secrets.ATLAS_CI_TOKEN }}
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26'
+      # protoc 版本必须与入库生成物的头部记录一致（生成物含 «protoc vX.Y.Z» 注释），
+      # 否则「重生成无 diff」门禁必然误报。
+      - name: 安装 protoc（libprotoc 26.1 → v5.26.1）
+        uses: arduino/setup-protoc@v3
+        with:
+          version: '26.1'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: 生成物无 diff 门禁（帧常量 + 会话/战斗 DTO/stub 重生成后必须零改动）
+        run: |
+          bash scripts/gen-dto.sh
+          # 整仓口径（与 p4 计划 V.1 一致，比 git diff --exit-code 更严：未跟踪的新产物
+          # 同样算改动；产物落 api/** 与 frame/gen，不在 examples/smoke 下）。
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::重生成产生未入库改动（生成物与上游不同源）"
+            git status --porcelain
+            exit 1
+          fi
       - name: gofmt 检查
         run: |
           out="$(gofmt -l . | grep -v '^third_party/' || true)"
