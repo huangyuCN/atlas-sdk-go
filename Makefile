@@ -9,7 +9,9 @@ update: ## 重新生成 golden vectors（已迁至 atlas 主仓，此处仅校�
 	$(GO) test ./frame -count=1
 
 lint: ## gofmt + go vet + Go doc 注释规范
-	@out="$$(gofmt -l . | grep -v '^third_party/' || true)"; \
+	# 排除 vendored 与 CI 上游检出目录（CI 会把 atlas / atlas-game-layout 检出到工作区内，
+	# 与 ci.yml 的 gofmt 口径保持一致；本仓自身文件仍全量检查）。
+	@out="$$(gofmt -l . | grep -vE '^(third_party|atlas|atlas-game-layout)/' || true)"; \
 	if [ -n "$$out" ]; then echo "$$out"; exit 1; fi
 	$(GO) vet ./...
 	$(GO) run ./scripts/go-comment-lint .
