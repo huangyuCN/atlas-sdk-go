@@ -251,7 +251,7 @@ ATLAS_LAYOUT_DIR=../atlas-game-layout ATLAS_DIR=../atlas bash scripts/gen-dto.sh
 
 | 产物 | 来源 | 用途 |
 |------|------|------|
-| `frame/gen/frame_gen.go` | 逐字节复制框架 `transport/frame/gen/goframe/frame_gen.go` | 帧协议常量（唯一来源；`frame` 包只做转发） |
+| `frame/gen/consts_gen.go`、`frame/gen/codec_gen.go` | 逐字节复制框架 `transport/frame/gen/goframe/{consts_gen,codec_gen}.go` | 帧协议常量与编解码（唯一来源；`frame` 包只做转发） |
 | `api/gateway/v1/**`、`api/battle/v1/**` 等 | 模板 descriptor set（两个 include 根：模板仓 + 框架仓）→ `--go_out`（M 映射到本仓包） | 域 DTO（`proto.Message`，ver=1 protojson / ver=2 protobuf 共用） |
 | `api/*/v1/opclient/*.pb.go` | `--atlas-client_out` + `go_client_package=github.com/huangyuCN/atlas-sdk-go/client` | 强类型客户端 stub 与**协议描述符**（5 会话 op + 3 提取器 + 推送 op） |
 

@@ -20,7 +20,6 @@
 package frame
 
 import (
-	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -29,7 +28,7 @@ import (
 )
 
 // 帧协议常量：唯一来源是框架仓 gen-frame 生成物（scripts/gen-dto.sh 逐字节复制到
-// frame/gen/frame_gen.go），本包只做类型化引用——手写副本会与服务端漂移。
+// frame/gen/consts_gen.go），本包只做类型化引用——手写副本会与服务端漂移。
 const (
 	// HeaderSize 是帧头固定长度（字节）。
 	HeaderSize = goframe.HeaderSize
@@ -74,34 +73,13 @@ const (
 	// 紧随会话槽之后、payload 之前）。客户端重试/重发复用同一 ID；服务端按
 	// atlas.route.v1 注解决定是否注入投递去重键。
 	FlagRequestID uint8 = goframe.FlagRequestID
-	// flagReserved 是未定义的保留位（非零即协议非法）：已定义位的补集，无需手写常量。
-	flagReserved uint8 = ^(FlagSession | FlagRequestID)
 )
 
 // Check 校验帧头合法性；maxBodySize ≤0 时回退绝对上限。
+// 校验语义唯一来源是生成物 goframe.CheckHeader（本方法只做类型化转换与 ErrProtocol 归类）。
 func (h *Header) Check(maxBodySize int) error {
-	if maxBodySize <= 0 {
-		maxBodySize = MaxBodySize
-	}
-	if h.Magic != Magic {
-		return fmt.Errorf("frame: invalid magic: %x: %w", h.Magic, ErrProtocol)
-	}
-	if h.Seq == 0 {
-		return fmt.Errorf("frame: invalid seq: %x: %w", h.Seq, ErrProtocol)
-	}
-	if h.Type != MsgTypeRequest && h.Type != MsgTypeResponse && h.Type != MsgTypeNotify {
-		return fmt.Errorf("frame: invalid type: %x: %w", h.Type, ErrProtocol)
-	}
-	// 版本白名单：ver=1（protojson）/ ver=2（protobuf 二进制）；其余拒绝（前向
-	// 版本协商位留给未来扩展，未知版本即协议非法）。
-	if h.Version != Version && h.Version != Version2 {
-		return fmt.Errorf("frame: invalid version: %x: %w", h.Version, ErrProtocol)
-	}
-	if h.Flags&flagReserved != 0 {
-		return fmt.Errorf("frame: invalid flags: %x: %w", h.Flags, ErrProtocol)
-	}
-	if uint64(h.Length) > uint64(maxBodySize) {
-		return fmt.Errorf("frame: body too large: %d > %d: %w", h.Length, maxBodySize, ErrProtocol)
+	if err := goframe.CheckHeader(toGen(*h), maxBodySize); err != nil {
+		return wrapProtocol(err)
 	}
 	return nil
 }
@@ -124,7 +102,7 @@ func Write(w io.Writer, h Header, body []byte, maxBodySize int) error {
 	h.Length = uint32(len(body))
 
 	var buf [HeaderSize]byte
-	encodeHeaderInto(buf[:], h)
+	goframe.PutHeader(buf[:], toGen(h))
 
 	if len(body) > 0 {
 		if bufs, ok := writevBuffers(w, buf[:], body); ok {
@@ -168,23 +146,17 @@ func Read(r io.Reader, maxBodySize int) (Header, []byte, error) {
 }
 
 // readHeader 读取并校验帧头（长度校验先于任何 body 分配，防恶意大包撑内存）。
+// 解析与校验转发生成物 goframe.DecodeHeader（唯一实现），失败按 ErrProtocol 归类。
 func readHeader(r io.Reader, maxBodySize int) (Header, error) {
 	var buf [HeaderSize]byte
 	if _, err := io.ReadFull(r, buf[:]); err != nil {
 		return Header{}, err
 	}
-	h := Header{
-		Magic:   binary.BigEndian.Uint32(buf[0:4]),
-		Version: buf[4],
-		Type:    MsgType(buf[5]),
-		Flags:   buf[6],
-		Seq:     binary.BigEndian.Uint32(buf[8:12]),
-		Length:  binary.BigEndian.Uint32(buf[12:16]),
+	h, err := goframe.DecodeHeader(buf[:], maxBodySize)
+	if err != nil {
+		return Header{}, wrapProtocol(err)
 	}
-	if err := h.Check(maxBodySize); err != nil {
-		return Header{}, err
-	}
-	return h, nil
+	return fromGen(h), nil
 }
 
 // Versioned 是序列化器的可选扩展接口（载荷编码版本声明，规范 §3.1 载荷编码

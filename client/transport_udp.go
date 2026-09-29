@@ -51,7 +51,9 @@ func (t *udpTransport) ReadFrame(maxBodySize int) (frame.Header, []byte, error) 
 		if err != nil {
 			return frame.Header{}, nil, err
 		}
-		h, body, derr := frame.Decode(t.readBuf[:n], maxBodySize)
+		// 一个数据报就是一条完整帧：按消息边界口径解码（尾随字节即协议错误；
+		// 与 WS/TCP/KCP 通道及 TS/C# 实现同一口径）。
+		h, body, derr := frame.DecodeMessage(t.readBuf[:n], maxBodySize)
 		if derr != nil {
 			continue // 坏数据报：静默丢弃
 		}

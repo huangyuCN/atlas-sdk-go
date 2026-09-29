@@ -8,7 +8,7 @@ import (
 )
 
 // body 布局段的解析/封装上限：取值唯一来源是框架仓 gen-frame 生成物
-// （frame/gen/frame_gen.go 的 MaxOperationLen / MaxSessionLen / MaxRequestIDLen，
+// （frame/gen/consts_gen.go 的 MaxOperationLen / MaxSessionLen / MaxRequestIDLen，
 // 由 scripts/gen-dto.sh 逐字节复制），本包只做类型化引用——手写副本会与服务端漂移。
 const (
 	// MaxOperationLen 是 operation 名的独立上限（防垃圾字符串耗内存）。

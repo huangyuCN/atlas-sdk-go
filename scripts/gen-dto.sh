@@ -2,7 +2,7 @@
 # gen-dto：从上游生成物刷新本仓的「协议事实」，单一来源、零手写副本。
 #
 # 输入（只读消费，协议不在本仓定义）：
-#   - 框架仓帧协议生成物：$ATLAS_DIR/transport/frame/gen/goframe/frame_gen.go
+#   - 框架仓帧协议生成物：$ATLAS_DIR/transport/frame/gen/goframe/{consts,codec}_gen.go
 #   - 模板仓会话/战斗协议 descriptor set：$ATLAS_LAYOUT_DIR/api/gateway/v1/session.proto
 #     与 $ATLAS_LAYOUT_DIR/api/battle/v1/battle_service.proto（examples 冒烟的战斗
 #     绑定探针需要权威 DTO）。两者都导入框架仓的 api/atlas/v1/route.proto、后者还导入
@@ -10,7 +10,7 @@
 #     框架仓两个 include 根。
 #
 # 输出（全部入库；CI 有「重生成无 diff」门禁）：
-#   1. frame/gen/frame_gen.go                      帧协议常量与编解码（逐字节复制生成物）
+#   1. frame/gen/{consts,codec}_gen.go             帧协议常量与编解码（逐字节复制生成物）
 #   2. api/gateway/v1/session.pb.go                会话 DTO（模板描述符 → 本仓包）
 #   3. api/gateway/v1/opclient/session.pb.go       会话 op stub + 协议描述符（op/提取器/推送 op）
 #   4. api/battle/v1/{battle_service,battle}.pb.go 战斗 DTO（冒烟战斗探针）
@@ -45,8 +45,10 @@ trap 'rm -rf "$TMPDIR_GEN"' EXIT
 
 # 1) 帧协议常量与编解码：框架生成物逐字节复制到仓内固定路径（frame 包只做引用）。
 mkdir -p frame/gen
-cp "$ATLAS_DIR/transport/frame/gen/goframe/frame_gen.go" frame/gen/frame_gen.go
-echo "帧协议生成物 → frame/gen/frame_gen.go"
+rm -f frame/gen/frame_gen.go
+cp "$ATLAS_DIR/transport/frame/gen/goframe/consts_gen.go" frame/gen/consts_gen.go
+cp "$ATLAS_DIR/transport/frame/gen/goframe/codec_gen.go" frame/gen/codec_gen.go
+echo "帧协议生成物 → frame/gen/{consts,codec}_gen.go"
 
 # 2) 插件：protoc-gen-go 一律从本仓 go.mod 锁定的 protobuf 模块构建——生成物头部会
 #    记录插件版本，PATH 上的版本（如 v1.36.10）会让「重生成无 diff」门禁误报；

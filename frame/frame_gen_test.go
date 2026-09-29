@@ -1,5 +1,5 @@
-// 帧常量单源断言（A.2）：frame 包的协议常量必须取自 gen-frame 生成物
-// （frame/gen/frame_gen.go，由 scripts/gen-dto.sh 从框架仓逐字节复制），
+// 帧常量单源断言（A.2）：frame 包的协议常量与编解码必须取自 gen-frame 生成物
+// （frame/gen/{consts,codec}_gen.go，由 scripts/gen-dto.sh 从框架仓逐字节复制），
 // 手写副本归零——魔数字面量不得再出现在 frame.go。
 package frame
 

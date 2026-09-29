@@ -67,7 +67,9 @@ func (t *wsTransport) ReadFrame(maxBodySize int) (frame.Header, []byte, error) {
 		}
 		return frame.Header{}, nil, err
 	}
-	return frame.Decode(msg, maxBodySize)
+	// WS 是消息边界传输体（一条消息 = 一个完整帧）：用 DecodeMessage 口径，
+	// bodyLen 与消息长度必须恰好相等，否则按失步处理（datagram 口径的 Decode 允许尾随字节）。
+	return frame.DecodeMessage(msg, maxBodySize)
 }
 
 // WriteFrame 编码整帧并以单条二进制消息发送（WS 无粘包：一条消息 = 一个完整帧）。
