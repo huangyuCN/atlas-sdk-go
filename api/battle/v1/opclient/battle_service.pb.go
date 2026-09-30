@@ -77,7 +77,9 @@ func BattleServiceExpiresAt(msg any) int64 {
 var BattleServicePushOps = struct {
 	FrameBroadcast  string
 	BattleEndNotify string
+	PlayerOutNotify string
 }{
 	FrameBroadcast:  "/battle.v1.FrameBroadcast",
 	BattleEndNotify: "/battle.v1.BattleEndNotify",
+	PlayerOutNotify: "/battle.v1.PlayerOutNotify",
 }
