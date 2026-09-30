@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/huangyuCN/atlas-sdk-go/frame"
+	"github.com/huangyuCN/atlas-sdk-go/internal/kcpcfg"
 	kcpgo "github.com/xtaci/kcp-go/v5"
 )
 
@@ -246,7 +247,7 @@ func TestKCPLargeFrameFragmentation(t *testing.T) {
 
 	// 3.5×MTU 的 payload：KCP 内部按 MSS 分片、接收侧重组，
 	// 帧层应完整透明——双向各一次。
-	big := make([]byte, kcpMTU*3+kcpMTU/2)
+	big := make([]byte, kcpcfg.MTU*3+kcpcfg.MTU/2)
 	for i := range big {
 		big[i] = byte(i % 251)
 	}
@@ -277,7 +278,7 @@ func TestKCPProtocolErrorTerminates(t *testing.T) {
 		if err != nil {
 			return
 		}
-		sess.SetNoDelay(kcpNoDelay, kcpInterval, kcpResend, kcpNC)
+		sess.SetNoDelay(kcpcfg.NoDelay, kcpcfg.Interval, kcpcfg.Resend, kcpcfg.NC)
 		hdr, _, err := frame.Read(sess, frame.MaxBodySize)
 		if err != nil {
 			return

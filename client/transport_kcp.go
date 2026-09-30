@@ -6,25 +6,8 @@ import (
 	"time"
 
 	"github.com/huangyuCN/atlas-sdk-go/frame"
+	"github.com/huangyuCN/atlas-sdk-go/internal/kcpcfg"
 	kcpgo "github.com/xtaci/kcp-go/v5"
-)
-
-// KCP 会话参数（与 atlas 服务端 transport/kcp 默认会话配置同源）：
-// 明文（block=nil）、无 FEC（dataShards=parityShards=0，两端必须一致）；
-// 四元组与窗口/MTU 为服务端 session_config 默认档，两端宜匹配。
-const (
-	kcpNoDelay  = 0    // 关闭极速模式（常规 RTO 退避）
-	kcpInterval = 40   // 内部 flush 定时器间隔（ms）
-	kcpResend   = 0    // 快速重传阈值（0=关闭）
-	kcpNC       = 0    // 启用拥塞控制
-	kcpSndWnd   = 128  // 发送窗口（KCP 包）
-	kcpRcvWnd   = 128  // 接收窗口（KCP 包）
-	kcpMTU      = 1400 // 单包 MTU（字节）
-
-	// kcpWriteTimeout 是单次帧写的兜底超时：kcp-go 死链（对端消失）后 Write 可能
-	// 因发送窗口满而永久阻塞（state 不触发错误、未确认数据不清空），无超时则心跳
-	// 与业务写全部挂起、死链检测失效。对齐服务端 WithWriteTimeout 思路。
-	kcpWriteTimeout = 10 * time.Second
 )
 
 // dialKCP 建立 KCP 传输（kcp-go UDPSession 实现 net.Conn；**消息模式**——kcp-go
@@ -66,12 +49,8 @@ func dialKCP(ctx context.Context, addr string) (channelTransport, error) {
 		return nil, res.err
 	}
 	sess := res.sess
-	// 会话参数对齐服务端默认（session_config.applyTo 同款）。
-	sess.SetNoDelay(kcpNoDelay, kcpInterval, kcpResend, kcpNC)
-	sess.SetWindowSize(kcpSndWnd, kcpRcvWnd)
-	_ = sess.SetMtu(kcpMTU)
-	sess.SetACKNoDelay(true)
-	sess.SetWriteDelay(false)
+	// 会话参数对齐服务端默认（直接/直连两个包共用 internal/kcpcfg，避免副本漂移）。
+	kcpcfg.Apply(sess)
 	return &kcpTransport{sess: sess}, nil
 }
 
@@ -92,7 +71,7 @@ func (t *kcpTransport) WriteFrame(h frame.Header, body []byte, maxBodySize int) 
 	defer t.writeMu.Unlock()
 	// 写超时兜底（评审修复）：死链窗口满时 kcp-go Write 永久阻塞，无超时则
 	// 心跳/业务写全部挂起、死链检测失效。超时错误由上层按网络失败判死链重连。
-	_ = t.sess.SetWriteDeadline(time.Now().Add(kcpWriteTimeout))
+	_ = t.sess.SetWriteDeadline(time.Now().Add(kcpcfg.WriteTimeout))
 	return frame.Write(t.sess, h, body, maxBodySize)
 }
 
