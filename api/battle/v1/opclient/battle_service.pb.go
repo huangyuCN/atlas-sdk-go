@@ -47,15 +47,22 @@ func (c *BattleService) SyncFrames(ctx context.Context, req *v1.SyncFramesReq, o
 	return &out, nil
 }
 
+// Ping 单向调用（returns Empty，无回执）。
+func (c *BattleService) Ping(ctx context.Context, req *v1.PingReq, opts ...client.InvokeOption) error {
+	return c.cli.Invoke(ctx, `/battle.v1.BattleService/Ping`, req, nil, opts...)
+}
+
 // BattleServiceProtocolOps 是 BattleService 的会话 op 名（按 rpc 名索引）。
 var BattleServiceProtocolOps = struct {
 	JoinBattle     string
 	SendFrameInput string
 	SyncFrames     string
+	Ping           string
 }{
 	JoinBattle:     "/battle.v1.BattleService/JoinBattle",
 	SendFrameInput: "/battle.v1.BattleService/SendFrameInput",
 	SyncFrames:     "/battle.v1.BattleService/SyncFrames",
+	Ping:           "/battle.v1.BattleService/Ping",
 }
 
 // BattleServiceToken 从会话消息里取 Token（无该字段的消息返回零值）。

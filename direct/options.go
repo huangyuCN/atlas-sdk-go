@@ -14,6 +14,9 @@ const (
 	defaultBackoffMax = 10 * time.Second
 	// defaultPath 是 WS 升级路径（接入层原样转发升级头，路径须与 battle 帧面一致）。
 	defaultPath = "/"
+	// defaultHeartbeat 是缺省保活探针周期（2s）：必须**严格小于**数据报面空闲读超时
+	//（battle 侧 offline_timeout/3，缺省 15s/3 = 5s），否则静默期仍会被判掉线。
+	defaultHeartbeat = 2 * time.Second
 )
 
 // Option 配置直连会话（Open 的可选项）。
@@ -29,6 +32,7 @@ type options struct {
 	backoffMax       time.Duration // 重连退避封顶
 	autoReconnect    bool          // 断线自动重连（被接入层拒绝/票问题一律不重试）
 	edgeHello        bool          // 是否走接入层 hello 握手段
+	heartbeat        time.Duration // 保活探针周期（<= 0 = 关闭）
 }
 
 // defaultOptions 返回缺省配置。
@@ -41,6 +45,7 @@ func defaultOptions() options {
 		backoffMax:       defaultBackoffMax,
 		autoReconnect:    true,
 		edgeHello:        true,
+		heartbeat:        defaultHeartbeat,
 	}
 }
 
@@ -100,4 +105,12 @@ func WithAutoReconnect(enabled bool) Option {
 // 生产路径必须经接入层，故缺省开启 hello；地址来源仍须是本局推送。
 func WithoutEdgeHello() Option {
 	return func(o *options) { o.edgeHello = false }
+}
+
+// WithHeartbeat 设置直连保活探针周期（battle.v1.BattleService/Ping，Tell 无业务回执）：
+// 无输入期间由会话周期发送，维持帧面活跃（数据报面靠收包刷新空闲读超时，顺带续 NAT 映射）。
+// 缺省 2s，必须严格小于 battle 侧 offline_timeout/3（缺省 15s/3 = 5s）；period <= 0 关闭探针
+// （自管心跳或对照实验用，关闭后静默期会被判掉线）。
+func WithHeartbeat(period time.Duration) Option {
+	return func(o *options) { o.heartbeat = period }
 }

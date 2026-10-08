@@ -2,6 +2,7 @@ package direct
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
@@ -23,6 +24,7 @@ const (
 	stubOpJoin  = "/battle.v1.BattleService/JoinBattle"
 	stubOpInput = "/battle.v1.BattleService/SendFrameInput"
 	stubOpSync  = "/battle.v1.BattleService/SyncFrames"
+	stubOpPing  = "/battle.v1.BattleService/Ping"
 	stubOpFrame = "/battle.v1.FrameBroadcast"
 	stubOpEnd   = "/battle.v1.BattleEndNotify"
 )
@@ -40,6 +42,7 @@ type battleStub struct {
 	problems []string // 服务端视角的违规记录（槽不符/未置位/协议非法）
 	joinErrs []string // 每次 JoinBattle 的业务 reason（空 = 成功）
 	syncLast []uint64 // 每次 SyncFrames 的 last_seen_frame
+	pings    []string // 每次保活探针的 battle_id（按到达顺序）
 	pushed   []uint64 // 已推送的帧号
 	pushSeq  uint32   // 推送帧 seq（服务端推送同样带非 0 seq，0 是协议非法值）
 	closeOn  int      // 指定第几次接入的连接主动断开（0 = 不断开）
@@ -180,9 +183,30 @@ func (s *battleStub) reply(fc frameConn, hdr frame.Header, op string, payload []
 		return nil
 	case stubOpInput:
 		return s.write(fc, hdr, successReply(nil))
+	case stubOpPing:
+		// 保活探针：Tell（服务端不回业务回执，只回帧引擎的空信封）；记录 battle_id 供断言。
+		s.recordPing(payload)
+		return s.write(fc, hdr, successReply(nil))
 	default:
 		return s.write(fc, hdr, errorReply("UNIMPLEMENTED"))
 	}
+}
+
+// recordPing 记录一次保活探针的 battle_id（探针语义只带客体寻址字段）。
+func (s *battleStub) recordPing(payload []byte) {
+	var m map[string]any
+	_ = json.Unmarshal(payload, &m)
+	id, _ := m["battleId"].(string)
+	s.mu.Lock()
+	s.pings = append(s.pings, id)
+	s.mu.Unlock()
+}
+
+// pingBattleIDs 返回服务端桩收到的探针 battle_id 列表。
+func (s *battleStub) pingBattleIDs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.pings...)
 }
 
 // recordSync 解析并记录 SyncFrames 的 last_seen_frame。

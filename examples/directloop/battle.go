@@ -11,16 +11,16 @@ import (
 	"github.com/huangyuCN/atlas-sdk-go/direct"
 )
 
-// battleRound 跑一局直连闭环：建连 → 逐人入局/输入 → 补帧（可选重连）→ 等帧广播。
+// battleRound 跑一局直连闭环：建连 → 逐人入局/输入 → 补帧（可选重连）→（可选静默保活）→ 等帧广播。
 func battleRound(ctx context.Context, o roundOpts, players []*player, plans []direct.Plan) error {
 	sessions, err := openBattleSessions(ctx, o, players, plans)
 	if err != nil {
 		return err
 	}
 	defer closeBattleSessions(sessions)
-	counters := watchFrames(sessions)
+	watch := watchSessions(sessions, players)
 	for i, s := range sessions {
-		if err := joinAndInput(ctx, s, o.frames, byte(i)); err != nil {
+		if err := joinAndInput(ctx, s, o.frames, inputStep(o, i)); err != nil {
 			return fmt.Errorf("%s: %w", players[i].id, err)
 		}
 	}
@@ -30,7 +30,10 @@ func battleRound(ctx context.Context, o roundOpts, players []*player, plans []di
 	if err := maybeReconnect(ctx, o, sessions); err != nil {
 		return err
 	}
-	return waitFrames(ctx, sessions, counters)
+	if o.idleHold > 0 {
+		return holdIdle(ctx, o, sessions, watch, players)
+	}
+	return waitFrames(ctx, sessions, watch)
 }
 
 // openBattleSessions 建立双方直连会话：地址按面取本局推送的 endpoints（生产路径），
@@ -44,7 +47,7 @@ func openBattleSessions(ctx context.Context, o roundOpts, players []*player, pla
 			return nil, fmt.Errorf("%s: %w", players[i].id, err)
 		}
 		plan.Endpoints[o.kind] = addr
-		sess, err := direct.Open(ctx, plan, openOptions(o)...)
+		sess, err := direct.Open(ctx, plan, openOptions(o, i)...)
 		if err != nil {
 			closeBattleSessions(out)
 			return nil, fmt.Errorf("%s 直连（%s 面 %s）失败: %w", players[i].id, o.kind, addr, err)
@@ -69,13 +72,31 @@ func resolveAddr(plan direct.Plan, o roundOpts) (string, error) {
 	return addr, nil
 }
 
-// openOptions 组装建连选项：默认走接入层 hello 握手段（生产路径），-without-edge-hello 才关闭。
-func openOptions(o roundOpts) []direct.Option {
+// openOptions 组装第 i 条会话的建连选项：默认走接入层 hello 握手段（生产路径），
+// -without-edge-hello 才关闭。保活探针缺省交给 SDK（2s）；-no-heartbeat 只关静默方 A（i=0）的
+// 探针——对照组要让「同一局里 B 仍活着」成为参照，两边一起关就分不清保活靠的是心跳还是运气。
+func openOptions(o roundOpts, i int) []direct.Option {
 	opts := []direct.Option{direct.WithTransport(o.kind)}
 	if !o.edgeHello {
 		opts = append(opts, direct.WithoutEdgeHello())
 	}
+	switch {
+	case o.noHeartbeat && i == 0:
+		opts = append(opts, direct.WithHeartbeat(0))
+	case o.heartbeat > 0:
+		opts = append(opts, direct.WithHeartbeat(o.heartbeat))
+	}
 	return opts
+}
+
+// inputStep 返回第 i 名玩家的位移输入：默认按序号（0/1）区分双方输入内容，让竞速分出胜负；
+// 静默验收时段（-idle-hold）一律给 0——模拟器把输入 payload 当位移且**逐帧粘滞**（无新输入即
+// 沿用上一次），非零位移会让先手几帧内到终点提前结算，静默期就无从谈起了。
+func inputStep(o roundOpts, i int) byte {
+	if o.idleHold > 0 {
+		return 0
+	}
+	return byte(i)
 }
 
 // joinAndInput 入局并发送若干帧输入（step 区分双方输入内容，服务端按帧聚合）。
@@ -128,44 +149,80 @@ func maybeReconnect(ctx context.Context, o roundOpts, sessions []*direct.Session
 	return nil
 }
 
-// watchFrames 为每条会话登记帧广播/战斗结束回调，返回帧计数（各会话独立计数）。
-func watchFrames(sessions []*direct.Session) []*atomic.Int64 {
-	counters := make([]*atomic.Int64, len(sessions))
+// sessionWatch 是一条会话的推送观测：帧广播/出局通知/结束通知（帧广播断言与保活验收共用）。
+type sessionWatch struct {
+	playerID string
+
+	frames  atomic.Int64  // 帧广播条数
+	lastID  atomic.Uint64 // 最近一条帧广播的帧号
+	outSelf atomic.Int64  // 针对本人的出局通知条数（>0 = 本人被判出局）
+	ended   atomic.Int64  // 战斗结束通知条数
+	lastOut atomic.Value  // string：最近一条出局通知的文本
+	winner  atomic.Value  // string：胜者玩家 ID
+}
+
+// noteOut 记录一条出局通知（是否针对本人）。
+func (w *sessionWatch) noteOut(n *battlev1.PlayerOutNotify) {
+	if n.GetPlayerId() == w.playerID {
+		w.outSelf.Add(1)
+	}
+	w.lastOut.Store(fmt.Sprintf("玩家=%s 原因=%s", n.GetPlayerId(), n.GetReason()))
+}
+
+// describeOut 返回最近一条出局通知的文本（无则空串）。
+func (w *sessionWatch) describeOut() string {
+	if v, ok := w.lastOut.Load().(string); ok {
+		return v
+	}
+	return ""
+}
+
+// describeEnd 返回战斗结束摘要（无结束通知则空串）。
+func (w *sessionWatch) describeEnd() string {
+	if w.ended.Load() == 0 {
+		return ""
+	}
+	win, _ := w.winner.Load().(string)
+	return fmt.Sprintf("结束通知=%d 胜者=%s", w.ended.Load(), win)
+}
+
+// watchSessions 为每条会话登记帧广播/出局/结束回调，返回观测句柄。
+func watchSessions(sessions []*direct.Session, players []*player) []*sessionWatch {
+	out := make([]*sessionWatch, len(sessions))
 	for i, s := range sessions {
-		counters[i] = &atomic.Int64{}
-		s.OnFrame(func(*battlev1.FrameBroadcast) { counters[i].Add(1) })
+		w := &sessionWatch{playerID: players[i].id}
+		s.OnFrame(func(fb *battlev1.FrameBroadcast) {
+			w.frames.Add(1)
+			if id := fb.GetFrame().GetFrameId(); id > w.lastID.Load() {
+				w.lastID.Store(id)
+			}
+		})
+		s.OnPlayerOut(w.noteOut)
 		s.OnBattleEnd(func(n *battlev1.BattleEndNotify) {
+			w.ended.Add(1)
+			w.winner.Store(n.GetWinnerPlayerId())
 			fmt.Printf("[直连] 战斗结束通知：battle=%s 胜者=%s\n", n.GetBattleId(), n.GetWinnerPlayerId())
 		})
+		out[i] = w
 	}
-	return counters
+	return out
 }
 
 // waitFrames 等双方各收到至少一条帧广播（帧广播经直连通道下发，不再经网关）。
-func waitFrames(ctx context.Context, sessions []*direct.Session, counters []*atomic.Int64) error {
+func waitFrames(ctx context.Context, sessions []*direct.Session, watch []*sessionWatch) error {
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if allPositive(counters) {
-			fmt.Printf("[直连] 帧广播 A=%d B=%d\n", counters[0].Load(), counters[1].Load())
+		if watch[0].frames.Load() > 0 && watch[1].frames.Load() > 0 {
+			fmt.Printf("[直连] 帧广播 A=%d B=%d\n", watch[0].frames.Load(), watch[1].frames.Load())
 			return nil
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	return fmt.Errorf("未收到帧广播（A=%d B=%d，状态 %s/%s）",
-		counters[0].Load(), counters[1].Load(), sessions[0].State(), sessions[1].State())
-}
-
-// allPositive 报告全部计数是否都已大于 0。
-func allPositive(counters []*atomic.Int64) bool {
-	for _, c := range counters {
-		if c.Load() == 0 {
-			return false
-		}
-	}
-	return true
+	return fmt.Errorf("未收到帧广播（A=%d B=%d，状态 %s/%s）", watch[0].frames.Load(), watch[1].frames.Load(),
+		sessions[0].State(), sessions[1].State())
 }
 
 // closeBattleSessions 关闭全部直连会话（幂等）。

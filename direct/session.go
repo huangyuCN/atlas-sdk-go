@@ -75,6 +75,11 @@ type Session struct {
 	joined   atomic.Bool
 	lastSeen atomic.Uint64
 
+	hbSent     atomic.Uint64 // 成功送达的保活探针数
+	hbFailures atomic.Uint64 // 失败的保活探针数（只计数）
+	hbErrMu    sync.Mutex
+	hbErr      error // 探针被明确拒绝的原因（记录后探测停止；nil = 未被拒）
+
 	manual  chan struct{} // 显式 Reconnect 信号（结果经 waiters 投递）
 	closeCh chan struct{}
 	wg      sync.WaitGroup
@@ -121,6 +126,7 @@ func Open(ctx context.Context, plan Plan, opts ...Option) (*Session, error) {
 		return nil, ErrClosed
 	}
 	s.setState(StateConnected)
+	s.startHeartbeat()
 	return s, nil
 }
 
@@ -281,6 +287,21 @@ func (s *Session) OnBattleEnd(fn func(*battlev1.BattleEndNotify)) (off func()) {
 	}
 	return s.OnNotify(battlev1opclient.BattleServicePushOps.BattleEndNotify, func(payload []byte) {
 		var n battlev1.BattleEndNotify
+		if err := protojson.Unmarshal(payload, &n); err != nil {
+			return
+		}
+		fn(&n)
+	})
+}
+
+// OnPlayerOut 订阅出局推送（解析为 *battlev1.PlayerOutNotify 后回调），返回退订函数：
+// 收到即表示该玩家被判出局并移出参战名单（掉线超时等），是保活验收的直接证据。
+func (s *Session) OnPlayerOut(fn func(*battlev1.PlayerOutNotify)) (off func()) {
+	if fn == nil {
+		return func() {}
+	}
+	return s.OnNotify(battlev1opclient.BattleServicePushOps.PlayerOutNotify, func(payload []byte) {
+		var n battlev1.PlayerOutNotify
 		if err := protojson.Unmarshal(payload, &n); err != nil {
 			return
 		}
