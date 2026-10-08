@@ -24,6 +24,9 @@ const (
 	StateReconnecting
 	// StateDisconnected 表示已断开：关闭、等待显式 Reconnect，或已因不可重试错误终止。
 	StateDisconnected
+	// StateEnded 表示**终态**：对局已结束（服务端拒 BATTLE_ENDED 或收到结束通知）——
+	// 停发（发帧/补帧/探针一律被拒），收尾窗口内仍可读推送，Close 之前不可回退。
+	StateEnded
 )
 
 // String 返回状态文本。
@@ -35,6 +38,8 @@ func (s State) String() string {
 		return "reconnecting"
 	case StateDisconnected:
 		return "disconnected"
+	case StateEnded:
+		return "ended"
 	default:
 		return fmt.Sprintf("state(%d)", uint8(s))
 	}
@@ -83,6 +88,8 @@ type Session struct {
 	manual  chan struct{} // 显式 Reconnect 信号（结果经 waiters 投递）
 	closeCh chan struct{}
 	wg      sync.WaitGroup
+
+	end endedState // 终态登记项（对局结束的判定/停发/幂等，见 ended.go）
 }
 
 // newSession 组装会话本体（不含拨号）。
@@ -226,22 +233,25 @@ func (s *Session) Err() error {
 	return s.fatal
 }
 
-// setState 更新连接状态（关闭后不再改写）。
+// setState 更新连接状态：终态不可回退（含 Close 之后），关闭后不再改写成非断开态。
 func (s *Session) setState(st State) {
 	s.genMu.Lock()
 	defer s.genMu.Unlock()
-	if s.closed && st != StateDisconnected {
+	if s.end.flag.Load() && st != StateEnded {
+		return
+	}
+	if s.closed && st != StateDisconnected && st != StateEnded {
 		return
 	}
 	s.state.Store(int32(st))
 }
 
-// setFatal 记录不可重试的终止原因并置断开态。
+// setFatal 记录不可重试的终止原因并置断开态（终态优先，不被降级）。
 func (s *Session) setFatal(err error) {
 	s.genMu.Lock()
 	s.fatal = err
-	s.state.Store(int32(StateDisconnected))
 	s.genMu.Unlock()
+	s.setState(StateDisconnected)
 }
 
 // currentGen 返回当前代连接快照。
@@ -281,6 +291,8 @@ func (s *Session) OnFrame(fn func(*battlev1.FrameBroadcast)) (off func()) {
 }
 
 // OnBattleEnd 订阅战斗结束推送（解析为 *battlev1.BattleEndNotify 后回调），返回退订函数。
+// 同一局结束通知会被服务端**有界补投**（载荷逐字一致），这里保证回调恰好一次（按会话去重，
+// 补投只计数见 EndStats）；注册晚于首投的订阅者不会补放回调，用 EndNotify() 取结果。
 func (s *Session) OnBattleEnd(fn func(*battlev1.BattleEndNotify)) (off func()) {
 	if fn == nil {
 		return func() {}
@@ -325,6 +337,8 @@ func (s *Session) unsubscribe(op, key string) {
 }
 
 // dispatchNotify 分发推送：先推进补帧基准（帧广播），再以独立 goroutine 交各订阅者。
+// 结束通知另做幂等收口：服务端结算结果会**有界补投**（首投 + 关闭前重投 + 迟到/重连补投），
+// 只有首投分发回调，补投只计数——回调与事件因此恰好一次。
 func (s *Session) dispatchNotify(body []byte) {
 	op, payload, err := frame.ParseRequestBody(body)
 	if err != nil {
@@ -332,6 +346,9 @@ func (s *Session) dispatchNotify(body []byte) {
 	}
 	if op == battlev1opclient.BattleServicePushOps.FrameBroadcast {
 		s.trackFrame(payload)
+	}
+	if op == battlev1opclient.BattleServicePushOps.BattleEndNotify && !s.noteEndNotify(payload) {
+		return // 补投（或载荷非法）：不进终态、不重放回调
 	}
 	for _, fn := range s.handlersOf(op) {
 		go safeCall(fn, payload)

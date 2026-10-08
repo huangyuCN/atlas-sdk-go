@@ -36,6 +36,7 @@ type fakeConn struct {
 	payloads [][]byte // 与 ops 同序的载荷副本
 	failNext int      // > 0：接下来 n 次写失败（模拟发送失败）
 	reason   string   // 非空：以该业务 reason 拒绝（模拟 op 未注册/被拒）
+	script   []string // 按序消费的回执 reason（优先于 reason；空串 = 成功信封）
 	silent   bool     // true：只收不回（模拟回执丢失）
 	in       chan fakeFrame
 	closed   chan struct{}
@@ -62,6 +63,10 @@ func (c *fakeConn) WriteFrame(h frame.Header, body []byte, _ int) error {
 		c.failNext--
 	}
 	reason, silent := c.reason, c.silent
+	if len(c.script) > 0 { // 回执脚本优先：按序为本次请求指定 reason（空串 = 成功信封）
+		reason = c.script[0]
+		c.script = c.script[1:]
+	}
 	c.mu.Unlock()
 	if fail {
 		return errors.New("假传输：写失败")
@@ -100,6 +105,23 @@ func (c *fakeConn) ReadFrame(int) (frame.Header, []byte, error) {
 func (c *fakeConn) Close() error {
 	c.once.Do(func() { close(c.closed) })
 	return nil
+}
+
+// replyNext 为紧接着的第 n 次写出指定回执 reason（按序消费；空串 = 成功信封）。
+func (c *fakeConn) replyNext(reasons ...string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.script = append(c.script, reasons...)
+}
+
+// isClosed 报告假传输是否已被关闭（终态收尾窗口的断言用）。
+func (c *fakeConn) isClosed() bool {
+	select {
+	case <-c.closed:
+		return true
+	default:
+		return false
+	}
 }
 
 // count 返回已写出的指定 op 次数。

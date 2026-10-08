@@ -21,6 +21,11 @@
 //	go run ./examples/directloop -gateway 10.10.9.36:9001 -transports kcp,udp,ws -idle-hold 8s
 //	go run ./examples/directloop -gateway 10.10.9.36:9001 -transports kcp,udp \
 //	  -idle-hold 8s -no-heartbeat -idle-drop
+//
+// 结算收尾验收：-await-end 20s 让对局跑到自然结束，断言「结束后不再发帧/心跳，且结束结果只回调
+// 一次」（服务端结算结果会有界补投，回调必须恰好一次；终态下发送返回 direct.ErrBattleEnded）。
+//
+//	go run ./examples/directloop -gateway 10.10.9.36:9001 -transports kcp,udp,ws -await-end 20s
 package main
 
 import (
@@ -49,6 +54,7 @@ type roundOpts struct {
 	expectDrop  bool          // 对照组：断言 A 在静默期被判掉线（配 -no-heartbeat）
 	heartbeat   time.Duration // 心跳周期覆盖（0 = SDK 缺省 2s）
 	noHeartbeat bool          // 关闭心跳（对照组）
+	awaitEnd    time.Duration // > 0：等对局自然结束并断言收尾语义（结算验收，见 end.go）
 }
 
 // main 解析参数并逐面跑闭环，任一面失败即以非 0 退出。
@@ -69,6 +75,8 @@ func main() {
 		idleDrop  = flag.Bool("idle-drop", false, "保活对照组：断言 A 在静默期被判掉线（配 -no-heartbeat）")
 		heartbeat = flag.Duration("heartbeat", 0, "保活探针周期覆盖（0 = SDK 缺省 2s）")
 		noBeat    = flag.Bool("no-heartbeat", false, "关闭 A（静默方）的保活探针；B 保留缺省探针作同局参照")
+		awaitEnd  = flag.Duration("await-end", 0,
+			"结算收尾验收：等对局自然结束并断言「结束后停发 + 结果只回调一次」（如 20s；0 = 关闭）")
 	)
 	flag.Parse()
 
@@ -87,6 +95,7 @@ func main() {
 			gateway: *gateway, kind: kind, addr: overrides[kind], edgeHello: !*noHello,
 			ruleset: *ruleset, frames: *frames, reconnect: *reconnect, timeout: *timeout,
 			idleHold: *idleHold, expectDrop: *idleDrop, heartbeat: *heartbeat, noHeartbeat: *noBeat,
+			awaitEnd: *awaitEnd,
 		}
 		if err := runRound(opts); err != nil {
 			fmt.Printf("闭环失败（%s 面）: %v\n", kind, err)

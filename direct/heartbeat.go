@@ -42,7 +42,7 @@ func (s *Session) startHeartbeat() {
 	go s.heartbeatLoop()
 }
 
-// heartbeatLoop 周期发探针，直到会话关闭、被明确拒绝或本会话不再有活跃连接。
+// heartbeatLoop 周期发探针，直到会话关闭、进入终态（对局已结束）、被明确拒绝或本会话不再有活跃连接。
 func (s *Session) heartbeatLoop() {
 	defer s.wg.Done()
 	ticker := time.NewTicker(s.opt.heartbeat)
@@ -52,6 +52,9 @@ func (s *Session) heartbeatLoop() {
 		case <-s.closeCh:
 			return
 		case <-ticker.C:
+		}
+		if s.Ended() {
+			return // 终态：停发（写线另有终态双检兜底，这里顺带收掉 goroutine）
 		}
 		if s.State() != StateConnected {
 			continue // 重连中不发：探针失败无信息量，保活资格由重连成功后恢复

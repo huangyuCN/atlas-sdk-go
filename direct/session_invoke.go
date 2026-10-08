@@ -44,8 +44,12 @@ func (s *Session) SyncFrames(ctx context.Context, req *battlev1.SyncFramesReq) (
 }
 
 // Invoke 发一条战斗帧请求并等回执：请求帧逐帧置位会话槽（base64url 票密文），三面统一。
-// 未连接/重连中返回 *client.NetworkError（可重试语义），业务拒绝返回 *client.BusinessError。
+// 终态（对局已结束）返回 ErrBattleEnded 且不写线；未连接/重连中返回 *client.NetworkError
+// （可重试语义），业务拒绝返回 *client.BusinessError。
 func (s *Session) Invoke(ctx context.Context, op string, req, resp any) error {
+	if s.Ended() {
+		return s.endedErr(op)
+	}
 	if st := s.State(); st != StateConnected {
 		return client.NewNetworkError(fmt.Errorf("direct: 当前状态 %s，拒绝发送 %s", st, op))
 	}
@@ -97,7 +101,11 @@ func (s *Session) newInflight() (uint32, chan invokeResult) {
 }
 
 // writeRequest 组装并写出请求帧：body = op || 会话槽 || 载荷，帧头置位 FlagSession。
+// 终态双检（进锁前 + 持写锁后）：终态置位后不再有新的字节上线——已在写锁内的那一次写不回滚。
 func (s *Session) writeRequest(g *generation, seq uint32, op string, payload []byte) error {
+	if s.Ended() {
+		return s.endedErr(op)
+	}
 	body, err := frame.BuildRequestBodyWithSession(op, TicketSlot(s.plan.Ticket), "", payload)
 	if err != nil {
 		return client.NewProtocolError(err)
@@ -107,6 +115,9 @@ func (s *Session) writeRequest(g *generation, seq uint32, op string, payload []b
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if s.Ended() {
+		return s.endedErr(op)
+	}
 	if err := g.tr.WriteFrame(hdr, body, frame.MaxBodySize); err != nil {
 		return client.NewNetworkError(fmt.Errorf("direct: 写帧失败（%s）: %w", op, err))
 	}
@@ -160,7 +171,7 @@ func (s *Session) result(op string, r invokeResult, resp any) error {
 	case r.err != nil:
 		return r.err
 	case r.st != nil:
-		return wrapBusiness(op, r.st)
+		return s.wrapBusiness(op, r.st)
 	default:
 		if resp != nil && len(r.data) > 0 {
 			if err := s.serial.Unmarshal(r.data, resp); err != nil {
@@ -171,9 +182,10 @@ func (s *Session) result(op string, r invokeResult, resp any) error {
 	}
 }
 
-// wrapBusiness 还原业务拒绝为 *client.BusinessError；票据类 reason 再包上可判定哨兵，
-// 供上层据此回业务链路重新匹配取新票（不重连）。
-func wrapBusiness(op string, st *frame.Status) error {
+// wrapBusiness 还原业务拒绝为 *client.BusinessError；票据类与结束类 reason 再包上可判定哨兵：
+// 票据类供上层回业务链路重新匹配取新票（不重连），结束类让会话进终态并停止发送。
+// 这里是**所有 op 业务拒绝的唯一收口**（业务帧、探针、重连重放都经 result 走到这里）。
+func (s *Session) wrapBusiness(op string, st *frame.Status) error {
 	err := &client.BusinessError{
 		Code: st.Code, Reason: st.Reason, Message: st.Message, Metadata: st.Metadata, Class: st.Class,
 	}
@@ -182,6 +194,10 @@ func wrapBusiness(op string, st *frame.Status) error {
 		return fmt.Errorf("direct: %s: %w: %w", op, ErrTicketExpired, err)
 	case reasonTicketInvalid:
 		return fmt.Errorf("direct: %s: %w: %w", op, ErrTicketInvalid, err)
+	case reasonBattleEnded:
+		ended := fmt.Errorf("direct: %s: %w: %w", op, ErrBattleEnded, err)
+		s.markEnded(ended) // 终态：停发、幂等，收尾窗口内仍收推送
+		return ended
 	default:
 		return err
 	}

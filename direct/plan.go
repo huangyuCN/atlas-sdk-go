@@ -47,6 +47,9 @@ var (
 	ErrTicketExpired = errors.New("direct: 战斗票据已过期")
 	// ErrTicketInvalid 表示 battle 侧判定票据非法（reason BATTLE_TICKET_INVALID）。
 	ErrTicketInvalid = errors.New("direct: 战斗票据非法")
+	// ErrBattleEnded 表示本局已结束（reason BATTLE_ENDED 的业务拒绝，或收到结束通知）：
+	// 会话进入终态并停止发送，继续重试没有意义；结算结果见 EndNotify/OnBattleEnd。
+	ErrBattleEnded = errors.New("direct: 对局已结束")
 	// ErrClosed 表示会话已关闭。
 	ErrClosed = errors.New("direct: 会话已关闭")
 )
@@ -57,6 +60,9 @@ const (
 	reasonTicketExpired = "BATTLE_TICKET_EXPIRED"
 	// reasonTicketInvalid 是 battle 侧票据非法 reason（api/error/v1 的枚举名）。
 	reasonTicketInvalid = "BATTLE_TICKET_INVALID"
+	// reasonBattleEnded 是 battle 侧「该对局已结束」reason（api/error/v1 的枚举名，biz_code 3003）：
+	// 已结束对局的迟到帧 op 一律以它稳定拒绝，客户端据此停止发送（不是重试到超时）。
+	reasonBattleEnded = "BATTLE_ENDED"
 )
 
 // String 返回传输面短名（ws/kcp/udp；日志与选项口径）。

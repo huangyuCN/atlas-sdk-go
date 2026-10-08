@@ -17,6 +17,8 @@ const (
 	// defaultHeartbeat 是缺省保活探针周期（2s）：必须**严格小于**数据报面空闲读超时
 	//（battle 侧 offline_timeout/3，缺省 15s/3 = 5s），否则静默期仍会被判掉线。
 	defaultHeartbeat = 2 * time.Second
+	// defaultEndLinger 是缺省的终态收尾窗口（2s，取值依据见 WithEndLinger）。
+	defaultEndLinger = 2 * time.Second
 )
 
 // Option 配置直连会话（Open 的可选项）。
@@ -33,6 +35,7 @@ type options struct {
 	autoReconnect    bool          // 断线自动重连（被接入层拒绝/票问题一律不重试）
 	edgeHello        bool          // 是否走接入层 hello 握手段
 	heartbeat        time.Duration // 保活探针周期（<= 0 = 关闭）
+	endLinger        time.Duration // 终态收尾窗口（<= 0 = 进入终态即关连接）
 }
 
 // defaultOptions 返回缺省配置。
@@ -46,6 +49,7 @@ func defaultOptions() options {
 		autoReconnect:    true,
 		edgeHello:        true,
 		heartbeat:        defaultHeartbeat,
+		endLinger:        defaultEndLinger,
 	}
 }
 
@@ -113,4 +117,17 @@ func WithoutEdgeHello() Option {
 // （自管心跳或对照实验用，关闭后静默期会被判掉线）。
 func WithHeartbeat(period time.Duration) Option {
 	return func(o *options) { o.heartbeat = period }
+}
+
+// WithEndLinger 设置终态收尾窗口：进入终态（收到结束通知，或任一 op 被 BATTLE_ENDED 拒绝）后，
+// 会话在窗口内**仍然可读**——结算结果会被服务端有界补投（首投 + 关闭前 2 次重投 + 迟到/重连
+// 补投，每局每人上限 5 次），尾帧也可能还在路上；窗口到期由**客户端**关闭连接，因为数据报面
+// （KCP/UDP）没有关闭握手，对端关闭不产生 EOF，只能客户端兜底收连接。
+//
+// 缺省 2s 的依据（与 TS/C# SDK 同一口径）：首投与 CloseBattle 前的 2 次重投都发生在结算后
+// 约 1 个 RTT 内，2s 已覆盖这段尺度并留出抖动余量；又远小于服务端结束留档 TTL（票据有效期 +
+// 掉线窗口，缺省 120s + 15s = 135s——窗口只需覆盖「结果送到手」这一段，不必让 socket 与
+// goroutine 多挂）。d <= 0 表示不等窗口：进入终态即关连接（负值按 0 处理）。
+func WithEndLinger(d time.Duration) Option {
+	return func(o *options) { o.endLinger = max(d, 0) }
 }

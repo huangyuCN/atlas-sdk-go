@@ -11,8 +11,12 @@ import (
 )
 
 // Reconnect 显式重连：重新 hello（含升级 query 票）、重放 JoinBattle 与 SyncFrames 补帧。
-// 被接入层拒绝与票据失效返回不可重试错误（会话随即终止，不再自动重试）。
+// 终态（对局已结束）返回 ErrBattleEnded（重连只会被稳定拒绝）；被接入层拒绝与票据失效返回
+// 不可重试错误（会话随即终止，不再自动重试）。
 func (s *Session) Reconnect(ctx context.Context) error {
+	if s.Ended() {
+		return s.endedErr("Reconnect")
+	}
 	if err := s.Err(); err != nil {
 		return err // 已因不可重试错误终止：重连无意义
 	}
@@ -57,6 +61,9 @@ func (s *Session) supervise(g *generation) {
 		if !ok {
 			return
 		}
+		if s.Ended() {
+			return // 终态：不重连（对局已结束，重连只会被稳定拒绝）
+		}
 		if !manual && !s.opt.autoReconnect {
 			s.setState(StateDisconnected)
 			if !s.waitManual() {
@@ -66,6 +73,10 @@ func (s *Session) supervise(g *generation) {
 		s.setState(StateReconnecting)
 		if err := s.reconnect(); err != nil {
 			if errors.Is(err, ErrClosed) {
+				return
+			}
+			if s.Ended() {
+				s.finishWaiters(err) // 重连补帧期间对局结束：按终态收尾，不算异常终止
 				return
 			}
 			s.setFatal(err)

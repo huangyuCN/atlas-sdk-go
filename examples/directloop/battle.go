@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -11,7 +12,7 @@ import (
 	"github.com/huangyuCN/atlas-sdk-go/direct"
 )
 
-// battleRound 跑一局直连闭环：建连 → 逐人入局/输入 → 补帧（可选重连）→（可选静默保活）→ 等帧广播。
+// battleRound 跑一局直连闭环：建连 → 逐人入局/输入 → 补帧（可选重连）→（可选静默保活/结算收尾）→ 等帧广播。
 func battleRound(ctx context.Context, o roundOpts, players []*player, plans []direct.Plan) error {
 	sessions, err := openBattleSessions(ctx, o, players, plans)
 	if err != nil {
@@ -19,21 +20,48 @@ func battleRound(ctx context.Context, o roundOpts, players []*player, plans []di
 	}
 	defer closeBattleSessions(sessions)
 	watch := watchSessions(sessions, players)
-	for i, s := range sessions {
-		if err := joinAndInput(ctx, s, o.frames, inputStep(o, i)); err != nil {
-			return fmt.Errorf("%s: %w", players[i].id, err)
-		}
-	}
-	if err := syncAll(ctx, sessions); err != nil {
-		return err
-	}
-	if err := maybeReconnect(ctx, o, sessions); err != nil {
+	if err := sendRound(ctx, o, sessions, players); err != nil {
 		return err
 	}
 	if o.idleHold > 0 {
 		return holdIdle(ctx, o, sessions, watch, players)
 	}
+	if o.awaitEnd > 0 {
+		return awaitEnd(ctx, o, sessions, watch)
+	}
 	return waitFrames(ctx, sessions, watch)
+}
+
+// sendRound 入局 + 发帧 + 补帧 +（可选）重连。-await-end 打开时把 BATTLE_ENDED 视为**正常收尾**
+// （对局已结束：停发并转入收尾断言）；缺省路径行为不变，错误照旧上报。
+func sendRound(ctx context.Context, o roundOpts, sessions []*direct.Session, players []*player) error {
+	for i, s := range sessions {
+		if err := joinAndInput(ctx, s, o.frames, inputStep(o, i)); err != nil {
+			if endedAsStop(o, err) {
+				return nil
+			}
+			return fmt.Errorf("%s: %w", players[i].id, err)
+		}
+	}
+	if err := syncAll(ctx, sessions); err != nil {
+		if endedAsStop(o, err) {
+			return nil
+		}
+		return err
+	}
+	if err := maybeReconnect(ctx, o, sessions); err != nil {
+		if endedAsStop(o, err) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// endedAsStop 报告该错误在收尾验收模式下是否算「正常收尾」：对局已结束，服务端对迟到帧 op
+// 一律以 BATTLE_ENDED 稳定拒绝，客户端据此停发而不是当成故障。
+func endedAsStop(o roundOpts, err error) bool {
+	return o.awaitEnd > 0 && errors.Is(err, direct.ErrBattleEnded)
 }
 
 // openBattleSessions 建立双方直连会话：地址按面取本局推送的 endpoints（生产路径），
@@ -184,6 +212,12 @@ func (w *sessionWatch) describeEnd() string {
 	}
 	win, _ := w.winner.Load().(string)
 	return fmt.Sprintf("结束通知=%d 胜者=%s", w.ended.Load(), win)
+}
+
+// winnerText 返回结束通知里的胜者（未收到通知则空串）。
+func (w *sessionWatch) winnerText() string {
+	v, _ := w.winner.Load().(string)
+	return v
 }
 
 // watchSessions 为每条会话登记帧广播/出局/结束回调，返回观测句柄。
