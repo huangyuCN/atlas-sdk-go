@@ -7,6 +7,28 @@
 > `testdata/golden/`（2026-09-03 迁入主仓，协议单点；本仓 frame 包消费同一份
 > 文件并执行语义断言，向量目录由 ATLAS_GOLDEN_DIR 或同级 atlas 仓默认路径解析）。
 
+## 增量（2026-10-09，v0.7——战斗帧直连阶段 3 发布）
+
+**发布形态**：本仓首次打 semver tag `v0.7.0`（根模块 tag，无子目录前缀），`client.Version`
+同步由 `0.5.0` 升为 `0.7.0`（登录/恢复请求的 `client_version` 上报值）。变更要点与破坏性
+变更见 `CHANGELOG.md`（本批次新建，本仓此前只有 README 的「破坏性变更」段与本文档）。
+
+- **直连落地**（`b012ba4` 会话骨架 → `85578aa` 生成物跟随模板 proto）：成局后客户端凭
+  「接入层地址 + 战斗票据」直连 `direct` 包三面（KCP/UDP/WS）；接入层（主仓 `contrib/edge`）
+  按 `battle_id` 定位属主做 L4 转发。业务 op（登录/会话/匹配）仍走 `client` 通道，
+  网关战斗帧通道退役（`DialKCP`/`DialUDP`/`DialDual` 仅留联调压测）。
+- **保活心跳**（`084fcdf`）：`direct` 周期发 `BattleService/Ping`（缺省 2s，严格小于 battle 侧
+  `offline_timeout/3`）；网络类失败只计数，业务拒绝/协议非法给可判定原因并停止探测。
+- **结束语义收口**（`1876be3`）：终态停发、结束通知幂等（首投去重、补投只计数）、
+  终态后 2s 收尾窗口（`WithEndLinger`）。
+- **评审 P0/P1 修复**（`032f614`）：终态族哨兵归一 + `IsTerminal`；`ended`/`failed` 语义拆分；
+  心跳被拒四分类并按代次恢复；终态时在途请求立即结算；新增 `Stats()` 快照。
+- **发布门禁**：`go test ./... -count=1 -race`、`make lint`（gofmt + vet + comment-lint）、
+  `gofmt -l .` 为空；`scripts/gen-dto.sh` 重生成无 diff（CI 门禁，需上游两仓检出 + protoc）。
+
+**待办**：v0.1–v0.6 无 semver tag，历史版本不可按 tag 引用（能力已含在 v0.7.0 内）；
+后续版本继续「tag 与 `client.Version` 同步」这一版本线约定。
+
 ## 增量（2026-09-07，v0.6——三库官方栈统一）
 
 **决策背景**：Go/TS/C# 三库序列化语义统一为官方 protobuf 栈（DTO 即生成类型、

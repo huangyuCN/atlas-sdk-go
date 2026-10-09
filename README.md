@@ -51,7 +51,7 @@ Atlas 帧协议的 Go 客户端 SDK。用于游戏客户端、机器人与压测
 ## 安装
 
 ```bash
-go get github.com/huangyuCN/atlas-sdk-go
+go get github.com/huangyuCN/atlas-sdk-go@v0.7.0
 ```
 
 要求 Go 1.26+。依赖情况：
@@ -372,7 +372,7 @@ ATLAS_LAYOUT_DIR=../atlas-game-layout ATLAS_DIR=../atlas bash scripts/gen-dto.sh
 
 ## 兼容性
 
-当前代码（含 v0.1–v0.6 全部能力）与 atlas 服务端 `feat/actor` 分支（golden
+当前代码（含 v0.1–v0.7 全部能力）与 atlas 服务端 `feat/actor` 分支（golden
 manifest 锁定 commit `40d8e74`）的帧协议对齐，由 22 个字节级 golden 用例校验
 （向量源在 [atlas](https://github.com/huangyuCN/atlas) 主仓 `testdata/golden/`，
 协议单点；本仓测试消费同一份文件）。服务端协议变更时向量随之更新，保证行为
@@ -416,9 +416,13 @@ go run ./examples/directloop -gateway 10.10.9.36:9001 -transports kcp,udp,ws
 - [x] v0.5：载荷编码 ver=2（protobuf 二进制）打样 + `atlas sdk gen` DTO 生成器
   （Go/TS 后端，随 [atlas CLI](https://github.com/huangyuCN/atlas) 交付，不在本仓）
 - [x] v0.6：三库官方栈统一——默认序列化器改双通道 protojson（见下方「v0.6 破坏性变更」）
+- [x] v0.7：战斗帧直连（阶段 3）——成局后凭票直连接入层（KCP/UDP/WS）+ 保活心跳 +
+  结束语义收口（**破坏性**：老客户端须改走 `direct` 直连，见 [CHANGELOG.md](CHANGELOG.md)）
 
-> v0.x 为功能里程碑编号：v0.1–v0.6 均已交付至 main 分支，尚未发布对应的 Git tag，
-> `go get` 默认安装 main 分支最新提交。
+> v0.x 为功能里程碑编号：v0.1–v0.7 均已交付至 main 分支；**自 v0.7.0 起发布 semver Git tag**
+> （根模块 tag 直接是 `v0.7.0`，无子目录前缀；v0.1–v0.6 无 tag，能力已含在 v0.7.0 内），
+> 消费方按 tag 引用：`go get github.com/huangyuCN/atlas-sdk-go@v0.7.0`。
+> 各版本变更要点与破坏性变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## v0.6 破坏性变更（官方栈统一，2026-09-07）
 
