@@ -12,7 +12,8 @@
 //   - 线上是 Tell（服务端不回业务回执）；这里仍等帧引擎必回的**空信封**，只为把「op 未注册/
 //     被拒」这类可判定失败捞出来。等不到信封不算链路故障，只计一次失败并在下个周期照发。
 //   - 发送失败（写失败/回执未达）只计数，不终止会话：真实断连交由既有重连逻辑处理。
-//   - 被服务端**明确拒绝**（业务拒绝/协议非法）记录为可判定错误并停止探测，不静默重试；
+//   - 被服务端**明确拒绝**（业务拒绝/协议非法）记录为可判定错误并计数，不静默重试；
+//     处置按 reason 分类（见 beat）：终态类入终态并停探针，其余继续探测（协议非法换代后恢复）；
 //     会话本身不因此提前失败。
 
 package direct
@@ -27,23 +28,32 @@ import (
 	"github.com/huangyuCN/atlas-sdk-go/client"
 )
 
-// startHeartbeat 启动保活循环（周期 <= 0 表示关闭，不启 goroutine）；会话已关闭则不启动。
-func (s *Session) startHeartbeat() {
+// startHeartbeat 为**本代连接**启动保活循环（周期 <= 0 表示关闭；会话已关闭则不启动）。
+//
+// 起表时点是**连接就绪**（首连建连成功、每次重连成功）而非 JoinBattle 之后——有意为之，与 TS/C#
+// 同口径：探针只证明「这条连接还活着」（服务端帧面按收包刷新空闲读超时，顺带续 NAT 映射），
+// 不参与对局语义（不改名单/帧号/结算），也不需要先入局；若等入局后才起表，「建连到入局之间」的
+// 静默期（含自动重连重放入局的退避窗口）就没有任何保活证据，数据报面会在这段被误判掉线。
+//
+// 按代启停（本代死亡即停表、换代重新起表）是**功能要求**而非风格：探针若做成「一次失败就永久
+// 退出」的会话级循环，一次协议抖动就会让保活永久失效，客户端静默 >5s 便被服务端按
+// idle = offline_timeout/3 判掉线（把可恢复的协议错误升级成玩家判负）。
+func (s *Session) startHeartbeat(g *generation) {
 	if s.opt.heartbeat <= 0 {
 		return
 	}
 	s.genMu.Lock()
-	if s.closed {
+	if s.closed || s.gen != g {
 		s.genMu.Unlock()
-		return
+		return // 会话已关闭，或本代已被更新的连接取代：不起表（避免两个循环同时探测）
 	}
 	s.wg.Add(1)
 	s.genMu.Unlock()
-	go s.heartbeatLoop()
+	go s.heartbeatLoop(g)
 }
 
-// heartbeatLoop 周期发探针，直到会话关闭、进入终态（对局已结束）、被明确拒绝或本会话不再有活跃连接。
-func (s *Session) heartbeatLoop() {
+// heartbeatLoop 周期发探针，直到会话关闭、本代连接死亡（换代由 startGeneration 重新起表）或进入终态。
+func (s *Session) heartbeatLoop(g *generation) {
 	defer s.wg.Done()
 	ticker := time.NewTicker(s.opt.heartbeat)
 	defer ticker.Stop()
@@ -51,25 +61,53 @@ func (s *Session) heartbeatLoop() {
 		select {
 		case <-s.closeCh:
 			return
+		case <-g.done:
+			return // 本代连接已死：停表（不留悬挂 ticker），由换代后的新循环接管
 		case <-ticker.C:
 		}
-		if s.Ended() {
-			return // 终态：停发（写线另有终态双检兜底，这里顺带收掉 goroutine）
-		}
-		if s.State() != StateConnected {
-			continue // 重连中不发：探针失败无信息量，保活资格由重连成功后恢复
-		}
-		switch err := s.probe(); {
-		case err == nil:
-			s.hbSent.Add(1)
-		case errors.Is(err, ErrClosed):
+		if !s.beat() {
 			return
-		case definiteReject(err) != nil:
-			s.setHeartbeatErr(err)
-			return // 明确拒绝：停止探测，不静默重试
-		default:
-			s.hbFailures.Add(1)
 		}
+	}
+}
+
+// beat 发一拍探针并按拒绝类别处置；返回 false 表示本循环应当退出（只有终态与关闭会退出）。
+//
+// 四类处置（与 TS/C# 同一契约，见 session_heartbeat_reject_test.go）：
+//   - 终态类 reason（BATTLE_ENDED/BATTLE_NOT_FOUND/BATTLE_FULL/FRAME_TARGET_MISMATCH）：终态已在
+//     wrapBusiness 唯一收口置位（BATTLE_ENDED → ended；其余三种 → failed），这里停探针；
+//     远端拒绝入统计（本地结算不算「被拒」，终态原因已由 EndCause/EndReason/Stats 上报）。
+//   - 票类与其它业务拒绝：计数 + 经 HeartbeatErr/Stats 暴露，**继续探测**（不重连、不终态）——
+//     票要上层重取，链路本身未必坏；两类差异只在上层判定（errors.Is 哨兵）。
+//   - 协议非法（版本/包络非法）：计数 + 上报，**继续探测**——本代连接会被读循环拆掉，探针在
+//     重连期静默跳过、换代后自动恢复。这里刻意**不退出循环**：Go 的探针是会话级 goroutine，
+//     退出即永久失效，一次可恢复的协议抖动会升级成「静默 >5s 被判掉线（玩家判负）」。
+//   - 网络类（写失败/回执未达）：只计数，下个周期照发。
+func (s *Session) beat() bool {
+	if s.Terminal() {
+		return false // 终态（ended/failed）：停发（写线另有终态双检兜底，这里顺带收掉 goroutine）
+	}
+	if s.State() != StateConnected {
+		return true // 重连中不发：探针失败无信息量，保活资格由重连成功后恢复
+	}
+	err := s.probe()
+	switch {
+	case err == nil:
+		s.stats.noteHeartbeatSent()
+		return true
+	case errors.Is(err, ErrClosed):
+		return false
+	case s.Terminal():
+		if !isLocalEnded(err) {
+			s.stats.noteHeartbeatReject(err)
+		}
+		return false
+	case isProtocolReject(err), isBusinessReject(err):
+		s.stats.noteHeartbeatReject(err)
+		return true
+	default:
+		s.stats.noteHeartbeatFailure(err)
+		return true
 	}
 }
 
@@ -87,42 +125,33 @@ func (s *Session) probeWindow() time.Duration {
 	return min(s.opt.heartbeat, s.opt.invokeTimeout)
 }
 
-// definiteReject 判定探针失败是否属「服务端明确拒绝」：业务拒绝（op 未注册/被拒/票据类）
-// 与协议非法都不该重试；网络类（写失败/超时）返回 nil（只计数）。
-func definiteReject(err error) error {
+// isBusinessReject 判定错误是否为业务拒绝（*client.BusinessError，含票据类与终态类）。
+func isBusinessReject(err error) bool {
 	var be *client.BusinessError
-	if errors.As(err, &be) {
-		return err
-	}
-	var pe *client.ProtocolError
-	if errors.As(err, &pe) {
-		return err
-	}
-	return nil
+	return errors.As(err, &be)
 }
 
-// setHeartbeatErr 记录探针被明确拒绝的原因（只写一次，探测随之停止）。
-func (s *Session) setHeartbeatErr(err error) {
-	s.hbErrMu.Lock()
-	defer s.hbErrMu.Unlock()
-	if s.hbErr == nil {
-		s.hbErr = err
-	}
+// isProtocolReject 判定错误是否为协议级非法（帧/包络/序列化，不可重试且连接已不可信）。
+func isProtocolReject(err error) bool {
+	var pe *client.ProtocolError
+	return errors.As(err, &pe)
 }
 
 // HeartbeatPeriod 返回本会话的保活探针周期（0 = 未启用）。
 func (s *Session) HeartbeatPeriod() time.Duration { return s.opt.heartbeat }
 
 // HeartbeatSent 返回成功送达的探针数（写出且收到帧引擎的空信封）。
-func (s *Session) HeartbeatSent() uint64 { return s.hbSent.Load() }
+func (s *Session) HeartbeatSent() uint64 { return s.stats.hbSent.Load() }
 
-// HeartbeatFailures 返回失败的探针数（写失败/回执未达；只计数，不影响会话状态）。
-func (s *Session) HeartbeatFailures() uint64 { return s.hbFailures.Load() }
+// HeartbeatFailures 返回网络类探针失败数（写失败/回执未达；只计数，不影响会话状态）。
+// 业务/协议拒绝的计数见 Stats().HeartbeatRejects。
+func (s *Session) HeartbeatFailures() uint64 { return s.stats.hbFailures.Load() }
 
-// HeartbeatErr 返回探针被服务端明确拒绝的原因（如 op 未注册 TRANSPORT_NOT_FOUND）；
-// nil 表示未被拒。被拒即停止探测（不静默重试），会话本身不受影响：真实断连仍由重连逻辑处理。
-func (s *Session) HeartbeatErr() error {
-	s.hbErrMu.Lock()
-	defer s.hbErrMu.Unlock()
-	return s.hbErr
-}
+// HeartbeatErr 返回探针**首个**被拒原因（如 op 未注册 TRANSPORT_NOT_FOUND、票类
+// BATTLE_TICKET_EXPIRED、终态类 BATTLE_ENDED）：nil 表示未被拒。只记首次，后续失败仅计数
+// （Stats().HeartbeatRejects）——「日志只在状态首次变化时打一条」的等价口径。
+//
+// 处置按 reason 分类（见 beat）：终态类已让会话进终态并停探针；票类、其它业务拒绝与协议非法
+// 都只上报并**继续探测**（协议非法只影响当拍，换代后自动恢复）。会话本身不因探针被拒而提前失败，
+// 真实断连仍由重连逻辑处理。
+func (s *Session) HeartbeatErr() error { return s.stats.firstHeartbeatErr() }

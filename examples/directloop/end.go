@@ -32,13 +32,18 @@ func awaitEnd(ctx context.Context, o roundOpts, sessions []*direct.Session, watc
 	return assertHeartbeatFrozen(sessions)
 }
 
-// waitEnded 轮询等双方进入终态（收到结束通知即 Ended()），超时即报错并附现场状态。
+// waitEnded 轮询等双方进入「正常结束」终态（收到结束通知即 Ended()），超时即报错并附现场状态。
+// 若任一方以终态失败收尾（不存在/已满/目标不符：无结算可展示），立即报错——本验收只认正常结束。
 func waitEnded(ctx context.Context, o roundOpts, sessions []*direct.Session) error {
 	deadline := time.Now().Add(o.awaitEnd)
 	lastLog := time.Now()
 	for time.Now().Before(deadline) {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if sessions[0].Failed() || sessions[1].Failed() {
+			return fmt.Errorf("对局以终态失败收尾（无结算可展示）：A=%s/%v B=%s/%v",
+				sessions[0].State(), sessions[0].EndCause(), sessions[1].State(), sessions[1].EndCause())
 		}
 		if sessions[0].Ended() && sessions[1].Ended() {
 			return nil
@@ -52,12 +57,12 @@ func waitEnded(ctx context.Context, o roundOpts, sessions []*direct.Session) err
 	return fmt.Errorf("等 %s 仍未结束（A=%s B=%s）", o.awaitEnd, sessions[0].State(), sessions[1].State())
 }
 
-// printEndState 打印终态现场：状态、首投/补投统计、胜者与触发原因。
+// printEndState 打印终态现场：状态、ended/failed 判定、首投/补投统计、胜者与触发原因。
 func printEndState(sessions []*direct.Session, watch []*sessionWatch) {
 	for i, s := range sessions {
 		st := s.EndStats()
-		fmt.Printf("[收尾] 玩家%d 状态=%s 首投=%v 补投=%d 载荷不一致=%d 胜者=%q 原因=%v\n",
-			i, s.State(), st.First, st.Replays, st.Mismatches, watch[i].winnerText(), s.EndCause())
+		fmt.Printf("[收尾] 玩家%d 状态=%s ended=%v failed=%v 首投=%v 补投=%d 载荷不一致=%d 胜者=%q 原因=%v\n",
+			i, s.State(), s.Ended(), s.Failed(), st.First, st.Replays, st.Mismatches, watch[i].winnerText(), s.EndCause())
 	}
 }
 

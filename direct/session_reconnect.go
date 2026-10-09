@@ -11,10 +11,10 @@ import (
 )
 
 // Reconnect 显式重连：重新 hello（含升级 query 票）、重放 JoinBattle 与 SyncFrames 补帧。
-// 终态（对局已结束）返回 ErrBattleEnded（重连只会被稳定拒绝）；被接入层拒绝与票据失效返回
-// 不可重试错误（会话随即终止，不再自动重试）。
+// 终态（ended/failed）返回对应终态族哨兵的错误（重连只会被稳定拒绝）；被接入层拒绝与票据失效
+// 返回不可重试错误（会话随即终止，不再自动重试）。
 func (s *Session) Reconnect(ctx context.Context) error {
-	if s.Ended() {
+	if s.Terminal() {
 		return s.endedErr("Reconnect")
 	}
 	if err := s.Err(); err != nil {
@@ -61,8 +61,8 @@ func (s *Session) supervise(g *generation) {
 		if !ok {
 			return
 		}
-		if s.Ended() {
-			return // 终态：不重连（对局已结束，重连只会被稳定拒绝）
+		if s.Terminal() {
+			return // 终态（ended/failed）：不重连（重连只会被稳定拒绝）
 		}
 		if !manual && !s.opt.autoReconnect {
 			s.setState(StateDisconnected)
@@ -75,8 +75,8 @@ func (s *Session) supervise(g *generation) {
 			if errors.Is(err, ErrClosed) {
 				return
 			}
-			if s.Ended() {
-				s.finishWaiters(err) // 重连补帧期间对局结束：按终态收尾，不算异常终止
+			if s.Terminal() {
+				s.finishWaiters(err) // 重连补帧期间进入终态：按终态收尾，不算异常终止
 				return
 			}
 			s.setFatal(err)
@@ -116,8 +116,20 @@ func (s *Session) waitManual() bool {
 	}
 }
 
-// reconnect 执行一轮「退避拨号 + 重放入局」直到成功或不可重试失败。
+// reconnect 执行一轮「退避拨号 + 重放入局」直到成功或不可重试失败；轮次结果计入观测快照
+// （ReconnectRounds/ReconnectFailures/LastReconnectErr，见 stats.go）。会话关闭不算失败。
 func (s *Session) reconnect() error {
+	err := s.reconnectRound()
+	if err != nil && !errors.Is(err, ErrClosed) {
+		s.stats.noteReconnectRound(err)
+		return err
+	}
+	s.stats.noteReconnectRound(nil)
+	return err
+}
+
+// reconnectRound 是重连主循环：退避 → 拨号 → 重放入局；可重试错误换下一档退避继续。
+func (s *Session) reconnectRound() error {
 	backoff := s.opt.backoffBase
 	for {
 		if err := sleepInterruptible(backoff, s.closeCh); err != nil {
@@ -146,11 +158,11 @@ func (s *Session) reconnect() error {
 	}
 }
 
-// dialOnce 带握手上限拨号一次（重连路径用；错误按可重试性由调用方分流）。
+// dialOnce 带握手上限拨号一次（重连路径用；错误按可重试性由调用方分流，计数见 dialTracked）。
 func (s *Session) dialOnce() (conn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), s.opt.handshakeTimeout)
 	defer cancel()
-	return dial(ctx, s.kind, s.addr, s.plan.Ticket, s.opt)
+	return s.dialTracked(ctx)
 }
 
 // restore 在新连接上重放入局：JoinBattle + SyncFrames(last_seen_frame) 补帧（仅入局过的会话）。

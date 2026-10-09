@@ -14,7 +14,6 @@ import (
 
 	battlev1 "github.com/huangyuCN/atlas-sdk-go/api/battle/v1"
 	locksteppb "github.com/huangyuCN/atlas-sdk-go/api/lockstep"
-	"github.com/huangyuCN/atlas-sdk-go/client"
 	"github.com/huangyuCN/atlas-sdk-go/frame"
 	"google.golang.org/protobuf/encoding/protojson"
 )
@@ -28,16 +27,24 @@ type fakeFrame struct {
 	body []byte
 }
 
+// fakeStatus 是假传输对一次请求回的业务拒绝（reason 为空 = 成功信封；raw 非空 = 原样回包络）。
+type fakeStatus struct {
+	code   int32       // 状态码（与真实回执同构）
+	reason string      // 业务 reason（空 = 成功信封）
+	class  frame.Class // 错误分类（0 = 未分类）
+	raw    []byte      // 非空：原样回这段 body（构造协议非法回执用）
+}
+
 // fakeConn 是保活单测用的假传输：逐帧记录请求，并按脚本回执/不答/写失败。
 type fakeConn struct {
 	mu       sync.Mutex
-	ops      []string // 写出的请求 op（按到达顺序）
-	slots    []string // 与 ops 同序的会话槽
-	payloads [][]byte // 与 ops 同序的载荷副本
-	failNext int      // > 0：接下来 n 次写失败（模拟发送失败）
-	reason   string   // 非空：以该业务 reason 拒绝（模拟 op 未注册/被拒）
-	script   []string // 按序消费的回执 reason（优先于 reason；空串 = 成功信封）
-	silent   bool     // true：只收不回（模拟回执丢失）
+	ops      []string     // 写出的请求 op（按到达顺序）
+	slots    []string     // 与 ops 同序的会话槽
+	payloads [][]byte     // 与 ops 同序的载荷副本
+	failNext int          // > 0：接下来 n 次写失败（模拟发送失败）
+	sticky   *fakeStatus  // 无脚本时的固定回执（nil = 成功信封）
+	script   []fakeStatus // 按序消费的回执（优先于 sticky；空 reason = 成功信封）
+	silent   bool         // true：只收不回（模拟回执丢失）
 	in       chan fakeFrame
 	closed   chan struct{}
 	once     sync.Once
@@ -62,23 +69,36 @@ func (c *fakeConn) WriteFrame(h frame.Header, body []byte, _ int) error {
 	if fail {
 		c.failNext--
 	}
-	reason, silent := c.reason, c.silent
-	if len(c.script) > 0 { // 回执脚本优先：按序为本次请求指定 reason（空串 = 成功信封）
-		reason = c.script[0]
-		c.script = c.script[1:]
-	}
+	st, reply := c.nextReply()
 	c.mu.Unlock()
 	if fail {
 		return errors.New("假传输：写失败")
 	}
-	if silent {
+	if !reply {
 		return nil
 	}
+	if st.raw != nil { // 协议非法回执：原样回包络（版本/包络校验的负例）
+		return c.push(frame.Header{Type: frame.MsgTypeResponse, Version: h.Version, Seq: h.Seq}, st.raw)
+	}
 	env := successReply(nil)
-	if reason != "" {
-		env = errorReply(reason)
+	if st.reason != "" {
+		env = errorReplyStatus(st.code, st.reason, st.class)
 	}
 	return c.push(frame.Header{Type: frame.MsgTypeResponse, Version: h.Version, Seq: h.Seq}, env)
+}
+
+// nextReply 取本次写出应回的回执（脚本优先、其次固定回执；都不适用则不回执）。
+// 调用方须持有 c.mu。
+func (c *fakeConn) nextReply() (fakeStatus, bool) {
+	if len(c.script) > 0 {
+		st := c.script[0]
+		c.script = c.script[1:]
+		return st, true
+	}
+	if c.sticky != nil {
+		return *c.sticky, true
+	}
+	return fakeStatus{}, !c.silent
 }
 
 // push 把一帧排入待读队列（连接已关闭即失败）。
@@ -111,7 +131,30 @@ func (c *fakeConn) Close() error {
 func (c *fakeConn) replyNext(reasons ...string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.script = append(c.script, reasons...)
+	for _, r := range reasons {
+		c.script = append(c.script, fakeStatus{code: 1, reason: r})
+	}
+}
+
+// replyStatusNext 为接下来的请求按序指定完整回执状态（code/class 可指定，终态类判定用）。
+func (c *fakeConn) replyStatusNext(sts ...fakeStatus) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.script = append(c.script, sts...)
+}
+
+// setSticky 设置固定回执（nil = 成功信封），供用例中途改变服务端行为。
+func (c *fakeConn) setSticky(st *fakeStatus) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sticky = st
+}
+
+// setSilent 设置「只收不回」（回执丢失），供用例中途改变服务端行为。
+func (c *fakeConn) setSilent(v bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.silent = v
 }
 
 // isClosed 报告假传输是否已被关闭（终态收尾窗口的断言用）。
@@ -164,7 +207,6 @@ func newHeartbeatSession(t *testing.T, fc *fakeConn, opts ...Option) *Session {
 		t.Fatal("假传输登记失败：会话已关闭")
 	}
 	s.setState(StateConnected)
-	s.startHeartbeat()
 	t.Cleanup(func() { _ = s.Close() })
 	return s
 }
@@ -300,29 +342,7 @@ func TestHeartbeatToleratesMissingReply(t *testing.T) {
 	}
 }
 
-// TestHeartbeatReportsDefiniteReject ⑤：服务端「op 未注册/被拒」这类明确失败按可判定错误
-// 上报且停止探测（不静默重试），会话本身不受影响。
-func TestHeartbeatReportsDefiniteReject(t *testing.T) {
-	fc := newFakeConn()
-	fc.reason = "TRANSPORT_NOT_FOUND"
-	sess := newHeartbeatSession(t, fc, WithHeartbeat(10*time.Millisecond))
-
-	waitFor(t, 2*time.Second, "记录可判定错误", func() bool { return sess.HeartbeatErr() != nil })
-	var be *client.BusinessError
-	if err := sess.HeartbeatErr(); !errors.As(err, &be) {
-		t.Fatalf("探针错误 = %v, 期望 *client.BusinessError", err)
-	} else if be.Reason != "TRANSPORT_NOT_FOUND" {
-		t.Fatalf("探针错误 reason = %q, 期望 TRANSPORT_NOT_FOUND", be.Reason)
-	}
-	sent := fc.count(stubOpPing)
-	time.Sleep(150 * time.Millisecond) // 15 个周期：明确拒绝后不得再重试
-	if got := fc.count(stubOpPing); got != sent {
-		t.Fatalf("被明确拒绝后仍在重试：%d → %d", sent, got)
-	}
-	if sess.State() != StateConnected || sess.Err() != nil {
-		t.Fatalf("心跳被拒不应终止会话：state=%s err=%v", sess.State(), sess.Err())
-	}
-}
+// 心跳被拒的分类处置（终态类/票类/其它/协议）见 session_heartbeat_reject_test.go。
 
 // TestHeartbeatOverWSStubWithInput ⑥（真帧协议桩）：探针经真实连接发出、逐帧带票槽，
 // 且与业务帧互不干扰（入局/输入/补帧各成功一次）。

@@ -24,9 +24,13 @@ const (
 	StateReconnecting
 	// StateDisconnected 表示已断开：关闭、等待显式 Reconnect，或已因不可重试错误终止。
 	StateDisconnected
-	// StateEnded 表示**终态**：对局已结束（服务端拒 BATTLE_ENDED 或收到结束通知）——
-	// 停发（发帧/补帧/探针一律被拒），收尾窗口内仍可读推送，Close 之前不可回退。
+	// StateEnded 表示**正常结束**终态：对局已结束（服务端拒 BATTLE_ENDED 或收到结束通知）——
+	// 有结算可展示，停发（发帧/补帧/探针一律被拒），收尾窗口内仍可读推送，Close 之前不可回退。
 	StateEnded
+	// StateFailed 表示**终态失败**：无结算可展示的终态拒绝（对局不存在/已满/请求目标不符）——
+	// 与 StateEnded 同样停发、不重连、不可回退，但连接立即回收（没有结算要等），
+	// 上层据此回匹配链路重新开局，而不是去取一份不存在的结算。
+	StateFailed
 )
 
 // String 返回状态文本。
@@ -40,6 +44,8 @@ func (s State) String() string {
 		return "disconnected"
 	case StateEnded:
 		return "ended"
+	case StateFailed:
+		return "failed"
 	default:
 		return fmt.Sprintf("state(%d)", uint8(s))
 	}
@@ -80,10 +86,7 @@ type Session struct {
 	joined   atomic.Bool
 	lastSeen atomic.Uint64
 
-	hbSent     atomic.Uint64 // 成功送达的保活探针数
-	hbFailures atomic.Uint64 // 失败的保活探针数（只计数）
-	hbErrMu    sync.Mutex
-	hbErr      error // 探针被明确拒绝的原因（记录后探测停止；nil = 未被拒）
+	stats sessionStats // 观测快照累加器（重连/握手/心跳，见 stats.go）
 
 	manual  chan struct{} // 显式 Reconnect 信号（结果经 waiters 投递）
 	closeCh chan struct{}
@@ -125,7 +128,7 @@ func Open(ctx context.Context, plan Plan, opts ...Option) (*Session, error) {
 		return nil, err
 	}
 	s := newSession(plan, kind, addr, o)
-	tr, err := dial(ctx, kind, addr, plan.Ticket, o)
+	tr, err := s.dialTracked(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -133,11 +136,18 @@ func Open(ctx context.Context, plan Plan, opts ...Option) (*Session, error) {
 		return nil, ErrClosed
 	}
 	s.setState(StateConnected)
-	s.startHeartbeat()
 	return s, nil
 }
 
-// startGeneration 登记新一代连接并启动读循环与监管 goroutine；会话已关闭返回 false（并关掉连接）。
+// dialTracked 记录一次握手尝试与结果（首连与每次重连拨号共用同一计数口径，见 stats.go）。
+func (s *Session) dialTracked(ctx context.Context) (conn, error) {
+	tr, err := dial(ctx, s.kind, s.addr, s.plan.Ticket, s.opt)
+	s.stats.noteHandshake(err)
+	return tr, err
+}
+
+// startGeneration 登记新一代连接并启动读循环、监管与**本代保活循环**（每代都重新起表，
+// 首连与每次重连成功同一条路径）；会话已关闭返回 false（并关掉连接）。
 func (s *Session) startGeneration(tr conn) bool {
 	s.genMu.Lock()
 	if s.closed {
@@ -149,8 +159,10 @@ func (s *Session) startGeneration(tr conn) bool {
 	s.gen = g
 	s.wg.Add(2)
 	s.genMu.Unlock()
+	s.stats.noteConnect() // 连接代次计数（首连 + 每次重连成功）
 	go s.readLoop(g)
 	go s.supervise(g)
+	s.startHeartbeat(g) // 每代（含重连成功）重新起表：保活不因本代内的一次失败永久失效
 	return true
 }
 
@@ -237,10 +249,10 @@ func (s *Session) Err() error {
 func (s *Session) setState(st State) {
 	s.genMu.Lock()
 	defer s.genMu.Unlock()
-	if s.end.flag.Load() && st != StateEnded {
-		return
+	if s.end.flag.Load() && st != StateEnded && st != StateFailed {
+		return // 终态不可回退（ended/failed 都不被降级）
 	}
-	if s.closed && st != StateDisconnected && st != StateEnded {
+	if s.closed && st != StateDisconnected && st != StateEnded && st != StateFailed {
 		return
 	}
 	s.state.Store(int32(st))

@@ -63,18 +63,14 @@ func TestEndedStopsWireOnBusinessReject(t *testing.T) {
 	defer cancel()
 
 	joinOnce(t, sess, testBattleID)
-	fc.replyNext(reasonBattleEnded)
+	fc.replyStatusNext(fakeStatus{code: 409, reason: reasonBattleEnded, class: frame.ClassBusiness})
 	assertBusinessEnded(t, sess.SendFrameInput(ctx, &battlev1.FrameInputReq{BattleId: testBattleID}), stubOpInput)
 
-	if !sess.Ended() {
-		t.Fatal("收到 BATTLE_ENDED 后 Ended() = false, 期望 true")
-	}
-	if got := sess.State(); got != StateEnded {
-		t.Fatalf("状态 = %s, 期望 ended", got)
-	}
 	if cause := sess.EndCause(); cause == nil {
 		t.Fatal("终态未记录触发原因")
 	}
+	// BATTLE_ENDED 是「正常结束」：ended（有结算可展示），不是终态失败。
+	assertEndedState(t, sess, ErrBattleEnded, reasonBattleEnded, codeBattleEnded)
 	ops, _, _ := fc.snapshot()
 	time.Sleep(200 * time.Millisecond) // 20 个心跳周期：终态后必须一次都不再写线
 	assertNoWireWrites(t, fc, len(ops))
@@ -84,7 +80,7 @@ func TestEndedStopsWireOnBusinessReject(t *testing.T) {
 // 停发——「任一 op 被拒都停」不因 op 不同而分叉（三个 op 同一收口）。
 func TestEndedStopsWireOnHeartbeatReject(t *testing.T) {
 	fc := newFakeConn()
-	fc.reason = reasonBattleEnded
+	fc.sticky = &fakeStatus{code: 409, reason: reasonBattleEnded, class: frame.ClassBusiness}
 	sess := newHeartbeatSession(t, fc, WithHeartbeat(10*time.Millisecond))
 
 	waitFor(t, 2*time.Second, "探针被拒后进入终态", sess.Ended)
@@ -373,7 +369,6 @@ func newSessionAt(t *testing.T, fc *fakeConn, addr string, opts ...Option) *Sess
 		t.Fatal("假传输登记失败：会话已关闭")
 	}
 	s.setState(StateConnected)
-	s.startHeartbeat()
 	t.Cleanup(func() { _ = s.Close() })
 	return s
 }

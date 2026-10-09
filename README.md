@@ -14,15 +14,23 @@ Atlas 帧协议的 Go 客户端 SDK。用于游戏客户端、机器人与压测
 |------|---------|---------|
 | TCP | 业务通道（登录 / 会话 / 匹配） | `Dial` |
 | WebSocket | 浏览器形态的单通道业务+战斗 | `DialWS` |
-| KCP | 战斗通道（可靠 UDP，低延迟） | `DialKCP` |
-| UDP | 战斗通道（低延迟，尽力而为） | `DialUDP` |
-| TCP/WS + KCP/UDP 组合 | dual 形态：业务 + 战斗双通道 | `DialDual` |
+| KCP | 战斗帧旧通道（阶段 3 起改走 `direct` 直连；保留联调/压测） | `DialKCP` |
+| UDP | 战斗帧旧通道（阶段 3 起改走 `direct` 直连；保留联调/压测） | `DialUDP` |
+| TCP/WS + KCP/UDP 组合 | dual 形态：业务 + 战斗双通道（旧形态，同上） | `DialDual` |
+
+> **阶段 3 起战斗帧改走直连**：成局后客户端凭「接入层地址 + 战斗票据」直连接入层
+> （KCP/UDP/WS 三面，见「战斗直连」一节），战斗帧不再经过网关。上表的 KCP/UDP 通道与
+> `DialDual` 保留给旧形态、联调与压测；生产路径的业务 op（登录/会话/匹配）仍走 `client` 通道。
 
 ## 特性
 
 - **四通道矩阵**：TCP（流式分帧）、WebSocket（一条消息 = 一个完整帧）、KCP（kcp-go
   可靠 UDP，会话参数与服务端基线对齐）、UDP（一报一帧，单数据报上限 64KiB 含帧头，
   坏数据报静默丢弃）。KCP/UDP 无连接关闭通知，死链由传输心跳发现。
+- **战斗直连（阶段 3，`direct` 包）**：成局推送给「战斗票据 + 三面接入层地址」，
+  按面直连接入层，逐帧带票跑战斗 op（入局/输入/补帧），带保活探针、断线重连重放、
+  **终态语义**（对局结束/不存在/满员/目标不符：可判定哨兵 + 停发 + 2s 收尾窗口）与
+  `Stats()` 观测快照。
 - **双通道编排（dual 形态）**：业务 + 战斗通道各自独立连接、心跳、重连与请求排队；
   业务重登成功后自动触发战斗通道重新绑定（Join 语义）。
 - **请求-响应匹配**：`seq` 单调递增 + 按连接代次隔离匹配，超时取消、迟到响应静默
@@ -153,6 +161,99 @@ if err := c.Channel(client.KindBattle).Invoke(ctx, "/battle.v1.Battle/Join", req
 KCP / UDP：`client.DialKCP("127.0.0.1:9003")` / `client.DialUDP("127.0.0.1:9004")`。
 完整的可运行示例见 [examples/smoke](examples/smoke/)。
 
+### 战斗直连（阶段 3：KCP/UDP/WS 直连接入层）
+
+阶段 3 起**战斗帧不再经过网关**：成局后客户端凭「接入层地址 + 战斗票据」直连接入层
+（KCP/UDP/WS 三面），接入层按 `battle_id` 定位战斗属主节点并做 L4 转发；业务 op
+（登录/会话/匹配）仍走上面的 `client` 通道。完整闭环示例见
+[examples/directloop](examples/directloop/)。
+
+**票据与地址的唯一来源是本局成局推送**（不读本地配置、不猜端口）：
+
+```go
+// 收到成局推送（Notify 帧，op = direct.PushOpMatchStarted）后解析直连计划：
+plan, err := direct.PlanFromPush(op, payload) // 等价于 direct.PlanFromNotify(payload)
+// plan.Ticket    ← 推送里的 battle_ticket（AEAD 密文；接入层与 battle 共持密钥验票）
+// plan.Endpoints ← 推送里的 endpoints[]：{transport, address} 各面接入层地址（可只下发部分面）
+
+sess, err := direct.Open(ctx, plan, direct.WithTransport(direct.TransportKCP))
+if err != nil {
+	// 缺面 / 缺票 / 被接入层拒绝：见下方错误表；不重试、不猜端口
+}
+defer sess.Close()
+
+sess.OnFrame(func(fb *battlev1.FrameBroadcast) { /* 帧广播 */ })
+sess.OnBattleEnd(func(n *battlev1.BattleEndNotify) { /* 结算（回调恰一次） */ })
+_, err = sess.JoinBattle(ctx, &battlev1.JoinBattleReq{BattleId: plan.BattleID})
+err = sess.SendFrameInput(ctx, &battlev1.FrameInputReq{BattleId: plan.BattleID, Input: in})
+```
+
+**三面地址选择**：`direct.WithTransport(direct.TransportWS|TransportKCP|TransportUDP)`
+显式指定；不指定则按 **ws → kcp → udp** 取本局推送里第一个存在的面。所指定的面本局未下发
+即返回 `direct.ErrTransportNotFound`——**不猜端口、不静默换面**（换面等于换一条链路，
+必须由调用方决定）。
+
+**票据来源与重取**：`battle_ticket` 随业务链路的成局推送下发，SDK **不自动重取**
+（取票要回匹配/业务链路）。票据被 battle 侧拒绝时返回可判定哨兵
+`direct.ErrTicketExpired` / `direct.ErrTicketInvalid`（业务拒绝原文仍可用 `errors.As` 取到），
+由上层重新匹配取新票——**不重连**（同一张票重连只会再被拒）。
+
+**保活心跳**：缺省 2s 发一次 `battle.v1.BattleService/Ping`（Tell，服务端不回业务回执）。
+数据报面（KCP/UDP）靠收包刷新帧面空闲读超时（battle 侧缺省 `offline_timeout/3` = 5s），
+静默会被判掉线、NAT 映射也会失效，故周期必须**严格小于**该阈值（`WithHeartbeat` 可调，
+`<=0` 关闭）。心跳在**连接就绪**时起表（早于 `JoinBattle`，与 TS/C# 同口径）——探针只证明
+链路活着，不参与对局语义；被拒的处置见下。
+
+**断线重连**：缺省自动重连（退避 ×2 封顶），重连成功后自动重放 `JoinBattle` +
+`SyncFrames(last_seen_frame)` 补断点；被接入层拒绝（`direct.ErrRejected`）与票据失效**不重试**。
+
+**结束语义（终态）**：对局结束 / 对局不存在 / 入局被拒 / 请求目标不符时，会话进入**终态**
+（`Terminal()` 为真）：一切上发（业务帧 + 探针）被拒并返回终态族哨兵，不再重连。终态分两种，
+**「有没有结算可展示」是分界线**（跨 SDK 同一裁定）：
+
+- **正常结束 `ended`**（`Ended()` 为真、`State() == direct.StateEnded`）：收到结束通知或
+  `BATTLE_ENDED` 拒绝——有结算可展示；收尾窗口（缺省 **2s**，`WithEndLinger` 可调）内**仍可读**
+  推送（结算结果会被服务端有界补投），窗口到期由客户端关连接（数据报面没有关闭握手）。
+- **终态失败 `failed`**（`Failed()` 为真、`State() == direct.StateFailed`）：对局不存在 / 已满 /
+  请求目标不符——**无结算可展示**，没有结果要等，故置终态即回收连接（不等 2s 窗口）；
+  上层据此**回匹配链路重新开局**，而不是去取一份不存在的结算。
+  **2s 收尾窗口只服务 `ended` 族**：`failed` 族没有结算可等，留窗口只会白占连接（勿"补上"）。
+
+| 终态族哨兵（`errors.Is` 判定） | reason / code | 语义 | 终态 |
+|---|---|---|---|
+| `direct.ErrBattleEnded` | `BATTLE_ENDED` / 409（3003） | 对局已结束（结束通知，或迟到帧 op 被稳定拒绝） | `ended` |
+| `direct.ErrBattleNotFound` | `BATTLE_NOT_FOUND` / 404（3001） | 对局不存在 | `failed` |
+| `direct.ErrBattleFull` | `BATTLE_FULL` / 409（3002） | 入局被拒（对局已满） | `failed` |
+| `direct.ErrFrameTargetMismatch` | `FRAME_TARGET_MISMATCH` / 403 | 票面对局与请求正文目标不一致 | `failed` |
+
+四条都**不可重试、终态化并上报**：错误链上保留 `*client.BusinessError`
+（`errors.As` 取 code/reason/metadata，`Class` 恒为 business），`IsTerminal(err)` 一处判定整个族，
+`EndCause()`/`EndReason()` 给同一份上报；进入终态时**在途请求立即以终态 Status 结算**
+（不等回执也不等超时，metadata 标 `x-atlas-sdk-local-settled=true`，与真实回执同构），
+调用方一处判定即可收尾。
+
+**观测**：`Stats()` 返回只读快照（重连/握手/心跳的计数与最近错误，零依赖）；
+`HeartbeatErr()` 给探针**首个**被拒原因（只记一次，后续仅计数）。心跳被拒按 reason 分类处置：
+终态类 → 入终态并停探针；票类（`ErrTicketExpired`/`ErrTicketInvalid`）→ 不终态、上报
+「需重新取票」并继续探测；其它业务拒绝 → 计数 + 暴露、继续探测；协议非法 → 计数 + 上报、
+**继续探测**（只影响当拍，换代后自动恢复——探针停了就永久失效，静默会被判掉线）。
+
+**直连面载荷编码固定 ver=1（protojson）**：`direct` 不暴露序列化器插槽，请求帧恒按 ver=1
+发出，响应帧版本按 ver=1 严格校验（不符即协议级失败，连接断开后按重连策略处理）——服务端帧
+引擎按请求版本原样回显，版本不符只可能是拨错了帧面或协议缺陷；与 TS（按序列化器推导校验）、
+C#（`FrameGen.Version` 校验）同一口径，不做「猜编码再解码」的容忍。
+
+| 直连 Option | 默认 | 说明 |
+|---|---|---|
+| `direct.WithTransport(t)` | ws → kcp → udp 取首个下发面 | 显式指定接入层面 |
+| `direct.WithHeartbeat(d)` | 2s | 保活探针周期（`<=0` 关闭）；须 < 服务端 `offline_timeout/3` |
+| `direct.WithEndLinger(d)` | 2s | 终态收尾窗口（`<=0` = 进入终态即关连接） |
+| `direct.WithInvokeTimeout(d)` | 10s | 单次战斗 op 超时 |
+| `direct.WithHandshakeTimeout(d)` | 3s | 握手段超时（WS 升级 / hello 等 flow-id） |
+| `direct.WithReconnectBackoff(base, max)` | 500ms / 10s | 重连退避（×2 封顶） |
+| `direct.WithAutoReconnect(b)` | true | 断线自动重连开关 |
+| `direct.WithoutEdgeHello()` | — | 关闭接入层 hello（直连 battle 帧端口，仅联调/闭环验证用） |
+
 ## 错误处理
 
 `Invoke` 返回的错误分四类，按类型决定处理策略：
@@ -172,6 +273,13 @@ if errors.As(err, &be) {
 	// 业务分支：be.Reason / be.Code / be.Metadata
 }
 ```
+
+直连会话（`direct`）的错误同样是这四类，另有三组可判定哨兵：**终态族**
+（`ErrBattleEnded` / `ErrBattleNotFound` / `ErrBattleFull` / `ErrFrameTargetMismatch`：
+不可重试、终态化并上报）、**票据类**（`ErrTicketExpired` / `ErrTicketInvalid`：回业务链路
+重新取票，不重连）、**接入层拒绝**（`ErrRejected`：无应用层回执即断开，不重试）；
+计划解析类为 `ErrNotifyNoTicket` / `ErrNotifyNoEndpoint` / `ErrTransportNotFound`。
+详见「战斗直连」一节。
 
 ## 配置项
 
@@ -270,6 +378,11 @@ manifest 锁定 commit `40d8e74`）的帧协议对齐，由 22 个字节级 gold
 协议单点；本仓测试消费同一份文件）。服务端协议变更时向量随之更新，保证行为
 变更可查。
 
+直连面（`direct`）的载荷编码**固定 ver=1（protojson）**：请求帧恒按 ver=1 发出，响应帧
+版本按 ver=1 严格校验（不符即协议级失败）。依据与服务端帧引擎「按请求版本原样回显」的
+行为一致，也与 TS/C# 直连会话同口径；直连不提供 ver=2 插槽，将来支持时改
+`dispatchResponse` 一处即可（详见「战斗直连」一节）。
+
 ## 开发
 
 ```bash
@@ -284,6 +397,15 @@ make lint     # gofmt + go vet
 
 可运行冒烟示例：`examples/smoke`（支持 `-transport tcp|ws|kcp|udp` 与 `-dual` 形态，
 可对接真实网关验证注册/登录/心跳/重连流程）。
+
+战斗直连闭环示例：`examples/directloop`（注册/登录 → 匹配 → 按成局推送直连三面
+→ 入局/发帧/补帧 → 结算收尾）：
+
+```bash
+go run ./examples/directloop -gateway 127.0.0.1:9001 -transports kcp,udp,ws
+# 跨机（接入层与 battle 部署在服务器上）：
+go run ./examples/directloop -gateway 10.10.9.36:9001 -transports kcp,udp,ws
+```
 
 ## 路线图
 

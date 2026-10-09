@@ -47,6 +47,7 @@ type battleStub struct {
 	pushSeq  uint32   // 推送帧 seq（服务端推送同样带非 0 seq，0 是协议非法值）
 	closeOn  int      // 指定第几次接入的连接主动断开（0 = 不断开）
 	closeIn  int      // 该连接处理多少个请求后断开（模拟拆流）
+	poison   bool     // 置位后对探针回协议非法包络（模拟服务端 framing 抖动/编码缺陷）
 }
 
 // newBattleStub 构造桩（ticket 为票密文，桩据此算出期望的帧槽取值）。
@@ -57,6 +58,21 @@ func newBattleStub(ticket []byte) *battleStub {
 // planFor 构造只含指定传输面的直连计划。
 func planFor(t Transport, addr string, ticket []byte) Plan {
 	return Plan{MatchID: "m-1", BattleID: "b-1", Ticket: ticket, Endpoints: map[Transport]string{t: addr}}
+}
+
+// setPoisonPing 置位后对保活探针回一条**协议非法**的空信封（DecodeReply 必失败）：
+// 用于验证「协议非法只影响当拍、换代后探测自动恢复」。
+func (s *battleStub) setPoisonPing(v bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.poison = v
+}
+
+// poisonPing 取当前是否对探针投毒（回执构造用）。
+func (s *battleStub) poisonPing() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.poison
 }
 
 // setJoinError 让 JoinBattle 回指定 reason 的业务错误。
@@ -186,6 +202,9 @@ func (s *battleStub) reply(fc frameConn, hdr frame.Header, op string, payload []
 	case stubOpPing:
 		// 保活探针：Tell（服务端不回业务回执，只回帧引擎的空信封）；记录 battle_id 供断言。
 		s.recordPing(payload)
+		if s.poisonPing() {
+			return s.write(fc, hdr, []byte{0x09}) // 协议非法包络（kind=9）：客户端必判协议级失败
+		}
 		return s.write(fc, hdr, successReply(nil))
 	default:
 		return s.write(fc, hdr, errorReply("UNIMPLEMENTED"))
@@ -254,9 +273,13 @@ func successReply(data []byte) []byte {
 	return out
 }
 
-// errorReply 构造业务错误回执包络：[0x01][statusLen u32][Status][dataLen u32][data]。
-func errorReply(reason string) []byte {
-	st := encodeStatus(1, reason, "桩拒绝")
+// errorReply 构造业务错误回执包络（code=1、未分类；多数用例只关心 reason）。
+func errorReply(reason string) []byte { return errorReplyStatus(1, reason, frame.ClassUnspecified) }
+
+// errorReplyStatus 构造带状态码与错误分类的业务错误回执包络：
+// [0x01][statusLen u32][Status][dataLen u32][data]（终态类 reason 的 code/class 判定用）。
+func errorReplyStatus(code int32, reason string, class frame.Class) []byte {
+	st := encodeStatus(code, reason, "桩拒绝", class)
 	out := make([]byte, 1+4+len(st)+4)
 	out[0] = 1
 	binary.BigEndian.PutUint32(out[1:5], uint32(len(st)))
@@ -264,17 +287,22 @@ func errorReply(reason string) []byte {
 	return out
 }
 
-// encodeStatus 手写编码 atlas errors.Status（code=1 varint / reason=2 / message=3）。
-func encodeStatus(code int32, reason, message string) []byte {
+// encodeStatus 手写编码 atlas errors.Status（code=1 varint / reason=2 / message=3 /
+// class=5 varint；class 为未分类时省略字段，与 protojson/protobuf 的零值省略同形）。
+func encodeStatus(code int32, reason, message string, class frame.Class) []byte {
 	var out []byte
 	out = append(out, 0x08) // field 1, varint
-	out = append(out, byte(code))
+	out = binary.AppendUvarint(out, uint64(code))
 	out = append(out, 0x12) // field 2, bytes
 	out = append(out, byte(len(reason)))
 	out = append(out, reason...)
 	out = append(out, 0x1a) // field 3, bytes
 	out = append(out, byte(len(message)))
 	out = append(out, message...)
+	if class != frame.ClassUnspecified {
+		out = append(out, 0x28) // field 5, varint
+		out = binary.AppendUvarint(out, uint64(class))
+	}
 	return out
 }
 
