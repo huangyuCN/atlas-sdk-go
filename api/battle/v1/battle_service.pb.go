@@ -895,7 +895,7 @@ const file_api_battle_v1_battle_service_proto_rawDesc = "" +
 	"\x12EDGE_TRANSPORT_UDP\x10\x03*[\n" +
 	"\x0fPlayerOutReason\x12!\n" +
 	"\x1dPLAYER_OUT_REASON_UNSPECIFIED\x10\x00\x12%\n" +
-	"!PLAYER_OUT_REASON_OFFLINE_TIMEOUT\x10\x012\xa0\x04\n" +
+	"!PLAYER_OUT_REASON_OFFLINE_TIMEOUT\x10\x012\xee\x04\n" +
 	"\rBattleService\x12B\n" +
 	"\n" +
 	"JoinBattle\x12\x18.battle.v1.JoinBattleReq\x1a\x1a.battle.v1.JoinBattleReply\x12B\n" +
@@ -903,7 +903,8 @@ const file_api_battle_v1_battle_service_proto_rawDesc = "" +
 	"\n" +
 	"SyncFrames\x12\x18.battle.v1.SyncFramesReq\x1a\x1a.battle.v1.SyncFramesReply\x122\n" +
 	"\x04Ping\x12\x12.battle.v1.PingReq\x1a\x16.google.protobuf.Empty\x12N\n" +
-	"\x06Create\x12\x1e.battle.v1.CreateBattleRequest\x1a\x1c.battle.v1.CreateBattleReply\"\x06\xd2\xd5\"\x02\b\x02\x12D\n" +
+	"\x06Create\x12\x1e.battle.v1.CreateBattleRequest\x1a\x1c.battle.v1.CreateBattleReply\"\x06\xd2\xd5\"\x02\b\x02\x12L\n" +
+	"\x05Admit\x12\x19.battle.v1.AdmitBattleReq\x1a .battle.v1.IssueEntryTicketReply\"\x06\xd2\xd5\"\x02\b\x02\x12D\n" +
 	"\bGetState\x12\x16.battle.v1.GetStateReq\x1a\x18.battle.v1.GetStateReply\"\x06\xd2\xd5\"\x02\b\x02\x12\\\n" +
 	"\x10IssueEntryTicket\x12\x1e.battle.v1.IssueEntryTicketReq\x1a .battle.v1.IssueEntryTicketReply\"\x06\xd2\xd5\"\x02\b\x02\x1a\x1b\xca\xd5\"\x17\n" +
 	"\x06battle\x10\x01\x18\x02\"\tbattle_idB?Z=github.com/huangyuCN/atlas-game-layout/api/battle/v1;battlev1b\x06proto3"
@@ -945,10 +946,11 @@ var file_api_battle_v1_battle_service_proto_goTypes = []any{
 	(*lockstep.FrameInputs)(nil),   // 19: atlas.game.lockstep.FrameInputs
 	(*lockstep.LockstepFrame)(nil), // 20: atlas.game.lockstep.LockstepFrame
 	(*CreateBattleRequest)(nil),    // 21: battle.v1.CreateBattleRequest
-	(*GetStateReq)(nil),            // 22: battle.v1.GetStateReq
-	(*emptypb.Empty)(nil),          // 23: google.protobuf.Empty
-	(*CreateBattleReply)(nil),      // 24: battle.v1.CreateBattleReply
-	(*GetStateReply)(nil),          // 25: battle.v1.GetStateReply
+	(*AdmitBattleReq)(nil),         // 22: battle.v1.AdmitBattleReq
+	(*GetStateReq)(nil),            // 23: battle.v1.GetStateReq
+	(*emptypb.Empty)(nil),          // 24: google.protobuf.Empty
+	(*CreateBattleReply)(nil),      // 25: battle.v1.CreateBattleReply
+	(*GetStateReply)(nil),          // 26: battle.v1.GetStateReply
 }
 var file_api_battle_v1_battle_service_proto_depIdxs = []int32{
 	16, // 0: battle.v1.JoinBattleReply.meta:type_name -> atlas.game.lockstep.SessionMeta
@@ -966,17 +968,19 @@ var file_api_battle_v1_battle_service_proto_depIdxs = []int32{
 	6,  // 12: battle.v1.BattleService.SyncFrames:input_type -> battle.v1.SyncFramesReq
 	8,  // 13: battle.v1.BattleService.Ping:input_type -> battle.v1.PingReq
 	21, // 14: battle.v1.BattleService.Create:input_type -> battle.v1.CreateBattleRequest
-	22, // 15: battle.v1.BattleService.GetState:input_type -> battle.v1.GetStateReq
-	9,  // 16: battle.v1.BattleService.IssueEntryTicket:input_type -> battle.v1.IssueEntryTicketReq
-	3,  // 17: battle.v1.BattleService.JoinBattle:output_type -> battle.v1.JoinBattleReply
-	23, // 18: battle.v1.BattleService.SendFrameInput:output_type -> google.protobuf.Empty
-	7,  // 19: battle.v1.BattleService.SyncFrames:output_type -> battle.v1.SyncFramesReply
-	23, // 20: battle.v1.BattleService.Ping:output_type -> google.protobuf.Empty
-	24, // 21: battle.v1.BattleService.Create:output_type -> battle.v1.CreateBattleReply
-	25, // 22: battle.v1.BattleService.GetState:output_type -> battle.v1.GetStateReply
-	12, // 23: battle.v1.BattleService.IssueEntryTicket:output_type -> battle.v1.IssueEntryTicketReply
-	17, // [17:24] is the sub-list for method output_type
-	10, // [10:17] is the sub-list for method input_type
+	22, // 15: battle.v1.BattleService.Admit:input_type -> battle.v1.AdmitBattleReq
+	23, // 16: battle.v1.BattleService.GetState:input_type -> battle.v1.GetStateReq
+	9,  // 17: battle.v1.BattleService.IssueEntryTicket:input_type -> battle.v1.IssueEntryTicketReq
+	3,  // 18: battle.v1.BattleService.JoinBattle:output_type -> battle.v1.JoinBattleReply
+	24, // 19: battle.v1.BattleService.SendFrameInput:output_type -> google.protobuf.Empty
+	7,  // 20: battle.v1.BattleService.SyncFrames:output_type -> battle.v1.SyncFramesReply
+	24, // 21: battle.v1.BattleService.Ping:output_type -> google.protobuf.Empty
+	25, // 22: battle.v1.BattleService.Create:output_type -> battle.v1.CreateBattleReply
+	12, // 23: battle.v1.BattleService.Admit:output_type -> battle.v1.IssueEntryTicketReply
+	26, // 24: battle.v1.BattleService.GetState:output_type -> battle.v1.GetStateReply
+	12, // 25: battle.v1.BattleService.IssueEntryTicket:output_type -> battle.v1.IssueEntryTicketReply
+	18, // [18:26] is the sub-list for method output_type
+	10, // [10:18] is the sub-list for method input_type
 	10, // [10:10] is the sub-list for extension type_name
 	10, // [10:10] is the sub-list for extension extendee
 	0,  // [0:10] is the sub-list for field type_name

@@ -31,6 +31,26 @@ var (
 	ErrHelloTooLong = errors.New("edge: hello 段超长")
 )
 
+// HelloRejectUnavailable 是数据报面 hello 阶段的「暂不可用」快速回执（单字节 0x00）。
+//
+// 用途：解析失败 / 后端拨号失败时，接入层除了拒绝计数，还回这一个字节，让客户端**立即**
+// 按百毫秒级重试，而不是等满读超时再重拨（诊断 §6 修法 2：一次瞬时失败在 UDP 面被放大成
+// 3s 惩罚 + 重拨风暴，129 次真实失败因此计成 4907 次拒绝、建流窗口拖到 36s）。
+//
+// 与 flow-id 的关系：回执只有 1 字节，flow-id 是 8 字节，接收侧按**数据报长度**即可区分，
+// 既不占用 flow-id 取值空间，也不改 hello / flow-id 的任何既有格式。
+// 客户端兼容性：按长度校验 flow-id 的实现（含三 SDK）会把它当作「被拒绝」处理，
+// 行为与改造前的读超时一致，故无需改动；只是失败发现得更快。
+const HelloRejectUnavailable byte = 0x00
+
+// rejectUnavailablePacket 是可直接写出的回执字节（包级共享，hello 失败路径复用，不每包分配）。
+var rejectUnavailablePacket = []byte{HelloRejectUnavailable}
+
+// IsHelloRejectUnavailable 报告一个数据报是否为「暂不可用」快速回执。
+func IsHelloRejectUnavailable(datagram []byte) bool {
+	return len(datagram) == 1 && datagram[0] == HelloRejectUnavailable
+}
+
 // EncodeHello 把票据密文编码为 hello 段（客户端/SDK 与测试用，服务端只解不编）。
 func EncodeHello(ticketRaw []byte) []byte {
 	out := make([]byte, 0, HelloHeaderLen+len(ticketRaw))
