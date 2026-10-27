@@ -41,10 +41,12 @@ type fakeConn struct {
 	ops      []string     // 写出的请求 op（按到达顺序）
 	slots    []string     // 与 ops 同序的会话槽
 	payloads [][]byte     // 与 ops 同序的载荷副本
+	vers     []uint8      // 与 ops 同序的请求帧头版本（出站版本断言用）
 	failNext int          // > 0：接下来 n 次写失败（模拟发送失败）
 	sticky   *fakeStatus  // 无脚本时的固定回执（nil = 成功信封）
 	script   []fakeStatus // 按序消费的回执（优先于 sticky；空 reason = 成功信封）
 	silent   bool         // true：只收不回（模拟回执丢失）
+	replyVer uint8        // 非 0：回执使用该帧头版本（0 = 回显请求版本，模拟版本失配/未知版本）
 	in       chan fakeFrame
 	closed   chan struct{}
 	once     sync.Once
@@ -65,9 +67,14 @@ func (c *fakeConn) WriteFrame(h frame.Header, body []byte, _ int) error {
 	c.ops = append(c.ops, op)
 	c.slots = append(c.slots, slot)
 	c.payloads = append(c.payloads, append([]byte(nil), payload...))
+	c.vers = append(c.vers, h.Version)
 	fail := c.failNext > 0
 	if fail {
 		c.failNext--
+	}
+	replyVer := h.Version
+	if c.replyVer != 0 {
+		replyVer = c.replyVer // 版本失配/未知版本的负例：回执版本与请求不一致
 	}
 	st, reply := c.nextReply()
 	c.mu.Unlock()
@@ -78,13 +85,13 @@ func (c *fakeConn) WriteFrame(h frame.Header, body []byte, _ int) error {
 		return nil
 	}
 	if st.raw != nil { // 协议非法回执：原样回包络（版本/包络校验的负例）
-		return c.push(frame.Header{Type: frame.MsgTypeResponse, Version: h.Version, Seq: h.Seq}, st.raw)
+		return c.push(frame.Header{Type: frame.MsgTypeResponse, Version: replyVer, Seq: h.Seq}, st.raw)
 	}
 	env := successReply(nil)
 	if st.reason != "" {
 		env = errorReplyStatus(st.code, st.reason, st.class)
 	}
-	return c.push(frame.Header{Type: frame.MsgTypeResponse, Version: h.Version, Seq: h.Seq}, env)
+	return c.push(frame.Header{Type: frame.MsgTypeResponse, Version: replyVer, Seq: h.Seq}, env)
 }
 
 // nextReply 取本次写出应回的回执（脚本优先、其次固定回执；都不适用则不回执）。
@@ -157,6 +164,20 @@ func (c *fakeConn) setSilent(v bool) {
 	c.silent = v
 }
 
+// setReplyVersion 让后续回执使用指定帧头版本（0 = 回显请求版本）：版本白名单/失配负例用。
+func (c *fakeConn) setReplyVersion(v uint8) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.replyVer = v
+}
+
+// requestVersions 返回已写出请求的帧头版本（与 ops 同序）：出站载荷编码版本断言用。
+func (c *fakeConn) requestVersions() []uint8 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]uint8(nil), c.vers...)
+}
+
 // isClosed 报告假传输是否已被关闭（终态收尾窗口的断言用）。
 func (c *fakeConn) isClosed() bool {
 	select {
@@ -202,7 +223,10 @@ func newHeartbeatSession(t *testing.T, fc *fakeConn, opts ...Option) *Session {
 		BattleID: testBattleID, Ticket: testTicket,
 		Endpoints: map[Transport]string{TransportWS: "127.0.0.1:1"},
 	}
-	s := newSession(plan, TransportWS, "127.0.0.1:1", o)
+	s, err := newSession(plan, TransportWS, "127.0.0.1:1", o)
+	if err != nil {
+		t.Fatalf("假传输会话组装失败: %v", err)
+	}
 	if !s.startGeneration(fc) {
 		t.Fatal("假传输登记失败：会话已关闭")
 	}

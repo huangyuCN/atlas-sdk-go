@@ -6,11 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	battlev1 "github.com/huangyuCN/atlas-sdk-go/api/battle/v1"
-	battlev1opclient "github.com/huangyuCN/atlas-sdk-go/api/battle/v1/opclient"
 	"github.com/huangyuCN/atlas-sdk-go/client"
 	"github.com/huangyuCN/atlas-sdk-go/frame"
-	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // State 是直连会话的连接状态。
@@ -63,11 +60,11 @@ type generation struct {
 //
 // 并发安全：Invoke/Reconnect/Close 可并发调用；推送回调在独立 goroutine 执行（panic 被 recover）。
 type Session struct {
-	plan   Plan
-	kind   Transport
-	addr   string
-	opt    options
-	serial client.Serializer
+	plan Plan
+	kind Transport
+	addr string
+	opt  options
+	ver  uint8 // 出站载荷编码版本（由序列化器推导，白名单 {1,2}）
 
 	genMu   sync.Mutex
 	gen     *generation
@@ -81,7 +78,7 @@ type Session struct {
 	state    atomic.Int32
 
 	notifyMu sync.Mutex
-	handlers map[string]map[string]func([]byte) // op → 订阅键 → handler
+	handlers map[string]map[string]pushHandler // op → 订阅键 → 订阅者（带载荷编码版本）
 
 	joined   atomic.Bool
 	lastSeen atomic.Uint64
@@ -95,25 +92,30 @@ type Session struct {
 	end endedState // 终态登记项（对局结束的判定/停发/幂等，见 ended.go）
 }
 
-// newSession 组装会话本体（不含拨号）。
-func newSession(plan Plan, kind Transport, addr string, o options) *Session {
+// newSession 组装会话本体（不含拨号）：出站载荷编码版本由序列化器推导，白名单外的声明在此报错。
+func newSession(plan Plan, kind Transport, addr string, o options) (*Session, error) {
+	ver, err := payloadVersion(o.serial)
+	if err != nil {
+		return nil, err
+	}
 	s := &Session{
 		plan:     plan,
 		kind:     kind,
 		addr:     addr,
 		opt:      o,
-		serial:   client.ProtoJSONSerializer{},
-		handlers: make(map[string]map[string]func([]byte)),
+		ver:      ver,
+		handlers: make(map[string]map[string]pushHandler),
 		manual:   make(chan struct{}, 8),
 		closeCh:  make(chan struct{}),
 	}
 	s.state.Store(int32(StateDisconnected))
-	return s
+	return s, nil
 }
 
 // Open 按计划建立战斗直连会话：选面 → 建连（经接入层时先 hello）→ 启动读循环与重连监管。
 //
 // 计划缺票返回 ErrNotifyNoTicket，所指定的面未下发返回 ErrTransportNotFound（不猜端口）；
+// 序列化器声明的载荷编码版本不在白名单 {1,2} 返回 ErrPayloadVersion（拨号前把关）；
 // 被接入层拒绝返回 ErrRejected（无回执、连接被断，不重试），网络故障返回 *client.NetworkError。
 func Open(ctx context.Context, plan Plan, opts ...Option) (*Session, error) {
 	if len(plan.Ticket) == 0 {
@@ -127,7 +129,10 @@ func Open(ctx context.Context, plan Plan, opts ...Option) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := newSession(plan, kind, addr, o)
+	s, err := newSession(plan, kind, addr, o)
+	if err != nil {
+		return nil, err
+	}
 	tr, err := s.dialTracked(ctx)
 	if err != nil {
 		return nil, err
@@ -190,7 +195,7 @@ func (s *Session) dispatch(hdr frame.Header, body []byte) error {
 	case frame.MsgTypeResponse:
 		return s.dispatchResponse(hdr, body)
 	case frame.MsgTypeNotify:
-		s.dispatchNotify(body)
+		s.dispatchNotify(hdr.Version, body)
 		return nil
 	default:
 		return client.NewProtocolError(fmt.Errorf("direct: 非法帧类型 %d", hdr.Type))
@@ -271,126 +276,4 @@ func (s *Session) currentGen() *generation {
 	s.genMu.Lock()
 	defer s.genMu.Unlock()
 	return s.gen
-}
-
-// OnNotify 订阅指定 op 的推送（载荷为帧头编码的原始字节），返回退订函数。
-func (s *Session) OnNotify(op string, fn func([]byte)) (off func()) {
-	if fn == nil || op == "" {
-		return func() {}
-	}
-	key := fmt.Sprintf("fn:%d", handlerSeq.Add(1))
-	s.notifyMu.Lock()
-	if s.handlers[op] == nil {
-		s.handlers[op] = make(map[string]func([]byte))
-	}
-	s.handlers[op][key] = fn
-	s.notifyMu.Unlock()
-	return func() { s.unsubscribe(op, key) }
-}
-
-// OnFrame 订阅帧广播推送（解析为 *battlev1.FrameBroadcast 后回调），返回退订函数。
-func (s *Session) OnFrame(fn func(*battlev1.FrameBroadcast)) (off func()) {
-	if fn == nil {
-		return func() {}
-	}
-	return s.OnNotify(battlev1opclient.BattleServicePushOps.FrameBroadcast, func(payload []byte) {
-		var fb battlev1.FrameBroadcast
-		if err := protojson.Unmarshal(payload, &fb); err != nil {
-			return
-		}
-		fn(&fb)
-	})
-}
-
-// OnBattleEnd 订阅战斗结束推送（解析为 *battlev1.BattleEndNotify 后回调），返回退订函数。
-// 同一局结束通知会被服务端**有界补投**（载荷逐字一致），这里保证回调恰好一次（按会话去重，
-// 补投只计数见 EndStats）；注册晚于首投的订阅者不会补放回调，用 EndNotify() 取结果。
-func (s *Session) OnBattleEnd(fn func(*battlev1.BattleEndNotify)) (off func()) {
-	if fn == nil {
-		return func() {}
-	}
-	return s.OnNotify(battlev1opclient.BattleServicePushOps.BattleEndNotify, func(payload []byte) {
-		var n battlev1.BattleEndNotify
-		if err := protojson.Unmarshal(payload, &n); err != nil {
-			return
-		}
-		fn(&n)
-	})
-}
-
-// OnPlayerOut 订阅出局推送（解析为 *battlev1.PlayerOutNotify 后回调），返回退订函数：
-// 收到即表示该玩家被判出局并移出参战名单（掉线超时等），是保活验收的直接证据。
-func (s *Session) OnPlayerOut(fn func(*battlev1.PlayerOutNotify)) (off func()) {
-	if fn == nil {
-		return func() {}
-	}
-	return s.OnNotify(battlev1opclient.BattleServicePushOps.PlayerOutNotify, func(payload []byte) {
-		var n battlev1.PlayerOutNotify
-		if err := protojson.Unmarshal(payload, &n); err != nil {
-			return
-		}
-		fn(&n)
-	})
-}
-
-// handlerSeq 为推送订阅生成稳定去重键（同一函数重复订阅不叠加）。
-var handlerSeq atomic.Uint64
-
-// unsubscribe 退订并清理空表。
-func (s *Session) unsubscribe(op, key string) {
-	s.notifyMu.Lock()
-	defer s.notifyMu.Unlock()
-	if set, ok := s.handlers[op]; ok {
-		delete(set, key)
-		if len(set) == 0 {
-			delete(s.handlers, op)
-		}
-	}
-}
-
-// dispatchNotify 分发推送：先推进补帧基准（帧广播），再以独立 goroutine 交各订阅者。
-// 结束通知另做幂等收口：服务端结算结果会**有界补投**（首投 + 关闭前重投 + 迟到/重连补投），
-// 只有首投分发回调，补投只计数——回调与事件因此恰好一次。
-func (s *Session) dispatchNotify(body []byte) {
-	op, payload, err := frame.ParseRequestBody(body)
-	if err != nil {
-		return
-	}
-	if op == battlev1opclient.BattleServicePushOps.FrameBroadcast {
-		s.trackFrame(payload)
-	}
-	if op == battlev1opclient.BattleServicePushOps.BattleEndNotify && !s.noteEndNotify(payload) {
-		return // 补投（或载荷非法）：不进终态、不重放回调
-	}
-	for _, fn := range s.handlersOf(op) {
-		go safeCall(fn, payload)
-	}
-}
-
-// handlersOf 取某 op 的订阅者快照。
-func (s *Session) handlersOf(op string) []func([]byte) {
-	s.notifyMu.Lock()
-	defer s.notifyMu.Unlock()
-	out := make([]func([]byte), 0, len(s.handlers[op]))
-	for _, fn := range s.handlers[op] {
-		out = append(out, fn)
-	}
-	return out
-}
-
-// safeCall 带 panic 保护的订阅者调用（单个回调异常不影响其他分发）。
-func safeCall(fn func([]byte), payload []byte) {
-	defer func() { _ = recover() }()
-	fn(payload)
-}
-
-// trackFrame 解析帧广播并推进补帧基准（重连 SyncFrames 用它取 last_seen_frame）。
-func (s *Session) trackFrame(payload []byte) {
-	var fb battlev1.FrameBroadcast
-	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(payload, &fb); err != nil {
-		return
-	}
-	if id := fb.GetFrame().GetFrameId(); id > s.lastSeen.Load() {
-		s.lastSeen.Store(id)
-	}
 }

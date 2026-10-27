@@ -48,6 +48,8 @@ type battleStub struct {
 	closeOn  int      // 指定第几次接入的连接主动断开（0 = 不断开）
 	closeIn  int      // 该连接处理多少个请求后断开（模拟拆流）
 	poison   bool     // 置位后对探针回协议非法包络（模拟服务端 framing 抖动/编码缺陷）
+	pushVer  uint8    // 帧广播的帧头版本（0 = 由帧编码层补齐为 ver=1）
+	pushBody []byte   // 帧广播的原始载荷（nil = 按帧号生成 protojson 载荷）
 }
 
 // newBattleStub 构造桩（ticket 为票密文，桩据此算出期望的帧槽取值）。
@@ -237,19 +239,24 @@ func (s *battleStub) recordSync(payload []byte) uint64 {
 	return last
 }
 
-// pushFrame 推一条帧广播（帧号非 0），并记录已推帧号。
+// pushFrame 推一条帧广播（帧号非 0），并记录已推帧号；`setPushFrame` 注入过版本/载荷时按注入值
+// 原样推送（ver=2 二进制载荷用例），否则按帧号生成 protojson 载荷、版本交由帧编码层补齐为 1。
 func (s *battleStub) pushFrame(fc frameConn, frameID uint64) {
 	payload := []byte(fmt.Sprintf(`{"battleId":"b-1","frame":{"frameId":%d,"inputs":[]}}`, frameID))
+	s.mu.Lock()
+	ver := s.pushVer
+	if s.pushBody != nil {
+		payload = append([]byte(nil), s.pushBody...)
+	}
+	s.pushSeq++
+	seq := s.pushSeq
+	s.mu.Unlock()
 	body, err := frame.BuildRequestBody(stubOpFrame, payload)
 	if err != nil {
 		s.problem("帧广播 body 封装失败: %v", err)
 		return
 	}
-	s.mu.Lock()
-	s.pushSeq++
-	seq := s.pushSeq
-	s.mu.Unlock()
-	hdr := frame.Header{Type: frame.MsgTypeNotify, Seq: seq}
+	hdr := frame.Header{Type: frame.MsgTypeNotify, Version: ver, Seq: seq}
 	if err := fc.WriteFrame(hdr, body, frame.MaxBodySize); err != nil {
 		s.problem("帧广播写失败: %v", err)
 		return
@@ -257,6 +264,13 @@ func (s *battleStub) pushFrame(fc frameConn, frameID uint64) {
 	s.mu.Lock()
 	s.pushed = append(s.pushed, frameID)
 	s.mu.Unlock()
+}
+
+// setPushFrame 让补帧回执后的帧广播改用指定帧头版本与原始载荷（ver=2 二进制推送用例）。
+func (s *battleStub) setPushFrame(ver uint8, payload []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pushVer, s.pushBody = ver, append([]byte(nil), payload...)
 }
 
 // write 按请求 seq 回一条响应帧。

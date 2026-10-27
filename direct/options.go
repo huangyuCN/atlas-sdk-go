@@ -1,6 +1,10 @@
 package direct
 
-import "time"
+import (
+	"time"
+
+	"github.com/huangyuCN/atlas-sdk-go/client"
+)
 
 // 直连会话缺省参数。
 const (
@@ -26,16 +30,18 @@ type Option func(*options)
 
 // options 是一次直连会话的生效配置。
 type options struct {
-	transport        Transport     // 显式指定的面（0 = 按 ws → kcp → udp 取计划里第一个存在的面）
-	path             string        // WS 升级路径
-	invokeTimeout    time.Duration // 单次请求超时
-	handshakeTimeout time.Duration // 握手段超时
-	backoffBase      time.Duration // 重连退避起步
-	backoffMax       time.Duration // 重连退避封顶
-	autoReconnect    bool          // 断线自动重连（被接入层拒绝/票问题一律不重试）
-	edgeHello        bool          // 是否走接入层 hello 握手段
-	heartbeat        time.Duration // 保活探针周期（<= 0 = 关闭）
-	endLinger        time.Duration // 终态收尾窗口（<= 0 = 进入终态即关连接）
+	transport        Transport         // 显式指定的面（0 = 按 ws → kcp → udp 取计划里第一个存在的面）
+	path             string            // WS 升级路径
+	invokeTimeout    time.Duration     // 单次请求超时
+	handshakeTimeout time.Duration     // 握手段超时
+	backoffBase      time.Duration     // 重连退避起步
+	backoffMax       time.Duration     // 重连退避封顶
+	autoReconnect    bool              // 断线自动重连（被接入层拒绝/票问题一律不重试）
+	edgeHello        bool              // 是否走接入层 hello 握手段
+	heartbeat        time.Duration     // 保活探针周期（<= 0 = 关闭）
+	endLinger        time.Duration     // 终态收尾窗口（<= 0 = 进入终态即关连接）
+	frameNumber      FrameNumberFunc   // ver≠1 的帧号提取钩子（nil = 不推进补帧基准）
+	serial           client.Serializer // 载荷序列化器（缺省 protojson = ver=1；ver=2 用 contrib/protobuf）
 }
 
 // defaultOptions 返回缺省配置。
@@ -50,6 +56,7 @@ func defaultOptions() options {
 		edgeHello:        true,
 		heartbeat:        defaultHeartbeat,
 		endLinger:        defaultEndLinger,
+		serial:           client.ProtoJSONSerializer{},
 	}
 }
 
@@ -130,4 +137,32 @@ func WithHeartbeat(period time.Duration) Option {
 // goroutine 多挂）。d <= 0 表示不等窗口：进入终态即关连接（负值按 0 处理）。
 func WithEndLinger(d time.Duration) Option {
 	return func(o *options) { o.endLinger = max(d, 0) }
+}
+
+// FrameNumberFunc 是帧号提取钩子：从一帧 FrameBroadcast 的载荷里取帧号（重连补帧的
+// last_seen_frame 基准）。ver=2 的 protobuf 二进制载荷非自描述，SDK 不猜编码，须由调用方用
+// 游戏侧生成包注入；返回 ok=false 表示本帧取不到帧号（不推进基准，也不报错）。
+type FrameNumberFunc func(payload []byte) (uint64, bool)
+
+// WithSerializer 设置载荷序列化器：缺省 client.ProtoJSONSerializer（ver=1 protojson，调试开关），
+// ver=2 用 contrib/protobuf（DTO 须是 protoc 生成类型）。请求帧头版本由序列化器推导（实现
+// frame.Versioned 者用声明值，未实现者 ver=1），响应帧头版本必须与之一致；声明的版本不在
+// 白名单 {1,2} 时 Open 直接报错（ErrPayloadVersion，不拨号、不猜编码）。
+func WithSerializer(s client.Serializer) Option {
+	return func(o *options) {
+		if s != nil {
+			o.serial = s
+		}
+	}
+}
+
+// WithFrameNumberFunc 注入帧号提取钩子：ver=1 恒走内建 protojson 解析（注入后 ver=1 行为也
+// 不变），ver=2 未注入钩子时补帧基准**不推进、也不报错**——与 TS/C# 同一口径：二进制载荷
+// 非自描述，猜编码会带来静默错帧，宁可让上层显式注入，也不能因此断链。
+func WithFrameNumberFunc(fn FrameNumberFunc) Option {
+	return func(o *options) {
+		if fn != nil {
+			o.frameNumber = fn
+		}
+	}
 }

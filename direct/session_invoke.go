@@ -80,7 +80,7 @@ func (s *Session) marshal(req any) ([]byte, error) {
 	if req == nil {
 		return nil, nil
 	}
-	payload, err := s.serial.Marshal(req)
+	payload, err := s.opt.serial.Marshal(req)
 	if err != nil {
 		return nil, client.NewProtocolError(fmt.Errorf("direct: 序列化 %T 失败: %w", req, err))
 	}
@@ -110,8 +110,9 @@ func (s *Session) writeRequest(g *generation, seq uint32, op string, payload []b
 	if err != nil {
 		return client.NewProtocolError(err)
 	}
+	// 请求帧头版本 = 本会话的载荷编码版本（ver=1 protojson 调试路径 / ver=2 protobuf 二进制）。
 	hdr := frame.Header{
-		Type: frame.MsgTypeRequest, Version: frame.Version, Seq: seq, Flags: frame.FlagSession,
+		Type: frame.MsgTypeRequest, Version: s.ver, Seq: seq, Flags: frame.FlagSession,
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -174,7 +175,7 @@ func (s *Session) result(op string, r invokeResult, resp any) error {
 		return s.wrapBusiness(op, r.st)
 	default:
 		if resp != nil && len(r.data) > 0 {
-			if err := s.serial.Unmarshal(r.data, resp); err != nil {
+			if err := s.opt.serial.Unmarshal(r.data, resp); err != nil {
 				return client.NewProtocolError(fmt.Errorf("direct: 反序列化 %s 回执失败: %w", op, err))
 			}
 		}
@@ -205,16 +206,19 @@ func (s *Session) wrapBusiness(op string, st *frame.Status) error {
 	return err
 }
 
-// dispatchResponse 按 seq 匹配回执；迟到回执静默丢弃，版本不符/包络非法为协议级致命错误。
+// dispatchResponse 按 seq 匹配回执；迟到回执静默丢弃，版本非法/包络非法为协议级致命错误。
 //
-// 响应帧版本按 frame.Version（ver=1 protojson）严格校验的依据：直连会话的载荷编码**固定**
-// ver=1——本包不暴露序列化器插槽（唯一编码器是 ProtoJSONSerializer），请求帧恒按 ver=1 发出，
-// 服务端帧引擎按请求版本原样回显，故回执版本不符只可能是对端不是本会话所拨的帧面或协议缺陷，
-// 属于不可重试的协议级失败（fail fast，不做「猜编码再解码」的容忍）。与 TS（按序列化器推导的
-// ver 校验）与 C#（FrameGen.Version 硬编码校验）同一口径；将来若支持 ver=2 直连，改这里一处即可。
+// 版本校验（规范 §3.1 载荷编码协商）：请求帧头按本会话的载荷编码（ver=1 protojson 调试路径 /
+// ver=2 protobuf 二进制）发出，服务端按规范回显请求版本 ⇒ 回执版本必须落在白名单 {1,2} 内且与
+// 本会话一致；未知版本（如 3）与版本失配都是明确的对端/协议缺陷，属不可重试的协议级失败
+// （fail fast，不做「猜编码再解码」的容忍）。与 TS（按序列化器推导的 ver 校验）、C#
+// （FrameGen.Version 校验）与 client 通道同一口径。
 func (s *Session) dispatchResponse(hdr frame.Header, body []byte) error {
-	if hdr.Version != frame.Version {
-		return client.NewProtocolError(fmt.Errorf("direct: 响应帧 version %d, 期望 %d", hdr.Version, frame.Version))
+	if !supportedVersion(hdr.Version) {
+		return client.NewProtocolError(fmt.Errorf("direct: 响应帧版本 %d 不在载荷编码白名单 {1,2}", hdr.Version))
+	}
+	if hdr.Version != s.ver {
+		return client.NewProtocolError(fmt.Errorf("direct: 响应帧 version %d 与载荷编码 %d 不一致", hdr.Version, s.ver))
 	}
 	data, st, err := frame.DecodeReply(body)
 	if err != nil {

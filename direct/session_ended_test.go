@@ -129,7 +129,8 @@ func errOfSync(_ *battlev1.SyncFramesReply, err error) error { return err }
 // errOfJoin 把 JoinBattle 的两返回值收敛成一个错误（用例里只关心错误）。
 func errOfJoin(_ *battlev1.JoinBattleReply, err error) error { return err }
 
-// pushFrameNotify 以 Notify 帧推一条帧广播（终态窗口内「仍可读」的探针）。
+// pushFrameNotify 以 Notify 帧推一条帧广播（终态窗口内「仍可读」的探针）；帧头版本按缺省 ver=1
+// 声明（真实服务端编码帧时补齐为 1，内存桩不编码帧头，故这里显式给出）。
 func pushFrameNotify(t *testing.T, fc *fakeConn, frameID uint64) {
 	t.Helper()
 	payload := []byte(fmt.Sprintf(`{"battleId":%q,"frame":{"frameId":%d,"inputs":[]}}`, testBattleID, frameID))
@@ -137,7 +138,7 @@ func pushFrameNotify(t *testing.T, fc *fakeConn, frameID uint64) {
 	if err != nil {
 		t.Fatalf("帧广播 body 封装失败: %v", err)
 	}
-	if err := fc.push(frame.Header{Type: frame.MsgTypeNotify, Seq: 2}, body); err != nil {
+	if err := fc.push(frame.Header{Type: frame.MsgTypeNotify, Version: frame.Version, Seq: 2}, body); err != nil {
 		t.Fatalf("帧广播推入失败: %v", err)
 	}
 }
@@ -364,7 +365,10 @@ func newSessionAt(t *testing.T, fc *fakeConn, addr string, opts ...Option) *Sess
 		BattleID: testBattleID, Ticket: testTicket,
 		Endpoints: map[Transport]string{TransportWS: addr},
 	}
-	s := newSession(plan, TransportWS, addr, o)
+	s, err := newSession(plan, TransportWS, addr, o)
+	if err != nil {
+		t.Fatalf("假传输会话组装失败: %v", err)
+	}
 	if !s.startGeneration(fc) {
 		t.Fatal("假传输登记失败：会话已关闭")
 	}
