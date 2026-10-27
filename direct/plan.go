@@ -1,6 +1,7 @@
 // Package direct 实现战斗帧直连会话（阶段 3）：客户端从成局推送取「本局票据 + 接入层各面地址」，
 // 按传输面直连接入层（WS 走升级 query、KCP/UDP 走 hello 段 + flow-id），逐帧在帧会话槽携带票据
-// 跑战斗 op（JoinBattle / SendFrameInput / SyncFrames），断线后重新 hello 并重放入局与补帧。
+// 收发业务 op（op 与消息由游戏协议包给出，本包不持游戏域消息），断线后重新 hello 并按
+// WithReplay 的步骤重放入局与补帧。
 //
 // 地址的唯一来源是**本局推送**（不读本地配置）；缺面即明确报错、不猜端口、不静默换面。
 package direct

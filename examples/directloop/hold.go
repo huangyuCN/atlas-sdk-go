@@ -9,11 +9,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
-	battlev1 "github.com/huangyuCN/atlas-sdk-go/api/battle/v1"
-	locksteppb "github.com/huangyuCN/atlas-sdk-go/api/lockstep"
 	"github.com/huangyuCN/atlas-sdk-go/direct"
 )
 
@@ -99,7 +98,7 @@ func printHoldReport(sessions []*direct.Session, watch []*sessionWatch, rep hold
 }
 
 // assertAlive 断言保活组：A 未被判出局、静默期仍在下行、状态未离开 connected，且静默后仍能
-// 继续发输入与补帧（SyncFrames 被受理 = 仍在参战名单——被判出局者会被 battle 明确拒绝）。
+// 继续发输入与补帧（补帧被受理 = 仍在参战名单——被判出局者会被 battle 明确拒绝）。
 func assertAlive(ctx context.Context, sessions []*direct.Session, watch []*sessionWatch, rep holdReport) error {
 	if n := watch[0].outSelf.Load(); n > 0 {
 		return fmt.Errorf("保活断言失败：A 被判出局（通知 %d 条：%s）", n, watch[0].describeOut())
@@ -145,15 +144,14 @@ func postHoldResume(ctx context.Context, a *direct.Session) error {
 		return fmt.Errorf("保活断言失败：A 静默后状态 %s，无法继续发送", a.State())
 	}
 	frame := a.LastSeenFrame() + 1
-	req := &battlev1.FrameInputReq{BattleId: a.BattleID(), Input: &locksteppb.LockstepInput{FrameId: frame}}
-	if err := a.SendFrameInput(ctx, req); err != nil {
+	if err := a.Invoke(ctx, direct.OpSendFrameInput, frameInputPayload(a.BattleID(), frame, 0), nil); err != nil {
 		return fmt.Errorf("保活断言失败：A 静默后发输入失败: %w", err)
 	}
-	reply, err := a.SyncFrames(ctx, &battlev1.SyncFramesReq{BattleId: a.BattleID(), LastSeenFrame: a.LastSeenFrame()})
-	if err != nil {
+	var reply json.RawMessage
+	payload := syncPayload(a.BattleID(), a.LastSeenFrame())
+	if err := a.Invoke(ctx, direct.OpSyncFrames, payload, &reply); err != nil {
 		return fmt.Errorf("保活断言失败：A 静默后补帧被拒（可能已被移出名单）: %w", err)
 	}
-	fmt.Printf("[保活] 断言③通过：A 静默后继续发输入（帧=%d）+ SyncFrames ok（当前帧=%d 补帧组=%d）\n",
-		frame, reply.GetCurrentFrame(), len(reply.GetMissed()))
+	fmt.Printf("[保活] 断言③通过：A 静默后继续发输入（帧=%d）+ 补帧 ok（回执=%s）\n", frame, reply)
 	return nil
 }

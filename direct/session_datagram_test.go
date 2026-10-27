@@ -6,9 +6,6 @@ import (
 	"errors"
 	"testing"
 	"time"
-
-	battlev1 "github.com/huangyuCN/atlas-sdk-go/api/battle/v1"
-	locksteppb "github.com/huangyuCN/atlas-sdk-go/api/lockstep"
 )
 
 // TestOpenUDPHelloFlowIDAndSlot 验证 UDP 面直连：
@@ -17,11 +14,7 @@ func TestOpenUDPHelloFlowIDAndSlot(t *testing.T) {
 	stub := newBattleStub(testTicket)
 	addr, srv := startUDPStub(t, testTicket, stub)
 
-	sess, err := Open(context.Background(), planFor(TransportUDP, addr, testTicket))
-	if err != nil {
-		t.Fatalf("Open 失败: %v", err)
-	}
-	defer func() { _ = sess.Close() }()
+	sess := openTest(t, planFor(TransportUDP, addr, testTicket))
 	if sess.Transport() != TransportUDP {
 		t.Fatalf("实际传输面 = %s, 期望 udp", sess.Transport())
 	}
@@ -29,19 +22,20 @@ func TestOpenUDPHelloFlowIDAndSlot(t *testing.T) {
 		t.Fatalf("首包 hello = % x, 期望（手写字面量）% x", got, want)
 	}
 	pushed := make(chan uint64, 4)
-	sess.OnFrame(func(fb *battlev1.FrameBroadcast) { pushed <- fb.GetFrame().GetFrameId() })
+	sess.OnPush(stubOpFrame, func(payload []byte, _ uint8) {
+		if id, ok := jsonFrameNumber(payload); ok {
+			pushed <- id
+		}
+	})
 
 	joinOnce(t, sess, "b-1")
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	err = sess.SendFrameInput(ctx, &battlev1.FrameInputReq{
-		BattleId: "b-1", Input: &locksteppb.LockstepInput{FrameId: 1, Payload: []byte{0x07}},
-	})
-	if err != nil {
-		t.Fatalf("SendFrameInput 失败: %v", err)
+	if err := sendFrameInput(ctx, sess, "b-1"); err != nil {
+		t.Fatalf("发帧失败: %v", err)
 	}
-	if _, err := sess.SyncFrames(ctx, &battlev1.SyncFramesReq{BattleId: "b-1", LastSeenFrame: 0}); err != nil {
-		t.Fatalf("SyncFrames 失败: %v", err)
+	if err := syncFrames(ctx, sess); err != nil {
+		t.Fatalf("补帧失败: %v", err)
 	}
 	waitPushedFrame(t, pushed, 1)
 	assertWireOK(t, stub, 1, []string{stubOpJoin, stubOpInput, stubOpSync})
@@ -74,11 +68,7 @@ func TestOpenKCPHelloFlowIDAndSlot(t *testing.T) {
 	stub := newBattleStub(testTicket)
 	addr, srv := startKCPStub(t, testTicket, stub)
 
-	sess, err := Open(context.Background(), planFor(TransportKCP, addr, testTicket))
-	if err != nil {
-		t.Fatalf("Open 失败: %v", err)
-	}
-	defer func() { _ = sess.Close() }()
+	sess := openTest(t, planFor(TransportKCP, addr, testTicket))
 	if sess.Transport() != TransportKCP {
 		t.Fatalf("实际传输面 = %s, 期望 kcp", sess.Transport())
 	}
@@ -86,13 +76,17 @@ func TestOpenKCPHelloFlowIDAndSlot(t *testing.T) {
 		t.Fatalf("hello 段 = % x, 期望（手写字面量）% x", got, want)
 	}
 	pushed := make(chan uint64, 4)
-	sess.OnFrame(func(fb *battlev1.FrameBroadcast) { pushed <- fb.GetFrame().GetFrameId() })
+	sess.OnPush(stubOpFrame, func(payload []byte, _ uint8) {
+		if id, ok := jsonFrameNumber(payload); ok {
+			pushed <- id
+		}
+	})
 
 	joinOnce(t, sess, "b-1")
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if _, err := sess.SyncFrames(ctx, &battlev1.SyncFramesReq{BattleId: "b-1", LastSeenFrame: 0}); err != nil {
-		t.Fatalf("SyncFrames 失败: %v", err)
+	if err := syncFrames(ctx, sess); err != nil {
+		t.Fatalf("补帧失败: %v", err)
 	}
 	waitPushedFrame(t, pushed, 1)
 	assertWireOK(t, stub, 1, []string{stubOpJoin, stubOpSync})

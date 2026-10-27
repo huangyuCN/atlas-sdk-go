@@ -2,9 +2,10 @@
 // 连接真实 gateway 服务端，执行 注册 → 登录 → 业务心跳 → 传输心跳保活，
 // 并演练断线自动重连（-reconnect-after 触发等待，由外层脚本重启服务端）。
 //
-// 协议素材全部取自本仓生成物（scripts/gen-dto.sh 产出）：op 名与凭据提取来自模板仓
-// 生成的会话 stub（api/gateway/v1/opclient），会话状态机经 client.WithSessionProtocol
-// 接入；战斗绑定走生成的战斗 stub（api/battle/v1/opclient）。冒烟内不写字面量契约。
+// 契约素材取自本仓生成物（scripts/gen-dto.sh 产出）：op 名与凭据提取来自模板仓生成的会话
+// stub（api/gateway/v1/opclient），会话状态机经 client.WithSessionProtocol 接入。
+// 战斗绑定探针是**游戏域** op（其消息与 op 常量已迁出 SDK，由游戏协议包提供）：探针这里用
+// 字面量 op + 契约消息 lockstep.LockstepInput 作载荷，只验证「按所选编码发出 + 业务拒绝还原」。
 //
 // 形态（TCP / WS / KCP / UDP 单通道 + dual 组合）：
 //
@@ -25,8 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	battlev1 "github.com/huangyuCN/atlas-sdk-go/api/battle/v1"
-	battlev1opclient "github.com/huangyuCN/atlas-sdk-go/api/battle/v1/opclient"
+	locksteppb "github.com/huangyuCN/atlas-sdk-go/api/lockstep"
 	"github.com/huangyuCN/atlas-sdk-go/client"
 )
 
@@ -208,11 +208,13 @@ func probeAlive(c *client.Client) bool {
 	return errors.As(err, &be)
 }
 
-// joinBattle 战斗绑定探针：走生成的战斗 stub（op 来自生成描述符）；invoker 由调用方按
-// 形态给定（单通道 = 默认业务通道；dual = 战斗通道视图）。
+// probeBattleOp 是战斗绑定探针的 op 名（游戏域 op；SDK 不再内置，真实项目取协议包的常量）。
+const probeBattleOp = "/battle.v1.BattleService/JoinBattle"
+
+// joinBattle 战斗绑定探针：op 用游戏域字面量、载荷用契约消息（三种编码都能编码）；
+// invoker 由调用方按形态给定（单通道 = 默认业务通道；dual = 战斗通道视图）。
 func joinBattle(ctx context.Context, invoker client.Invoker) error {
-	_, err := battlev1opclient.NewBattleService(invoker).JoinBattle(ctx, &battlev1.JoinBattleReq{BattleId: "smoke-b1"})
-	return err
+	return invoker.Invoke(ctx, probeBattleOp, &locksteppb.LockstepInput{FrameId: 1}, nil)
 }
 
 // dualRun 是 dual 冒烟运行态：通道、会话与两个重连钩子的共享状态。

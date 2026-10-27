@@ -6,16 +6,14 @@ package direct
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"runtime"
 	"sync"
 	"testing"
 	"time"
 
-	battlev1 "github.com/huangyuCN/atlas-sdk-go/api/battle/v1"
-	locksteppb "github.com/huangyuCN/atlas-sdk-go/api/lockstep"
 	"github.com/huangyuCN/atlas-sdk-go/frame"
-	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // testBattleID 是心跳单测的计划战斗标识（探针载荷断言用，与桩里的 b-1 区分开）。
@@ -213,10 +211,11 @@ func (c *fakeConn) snapshot() (ops, slots []string, payloads [][]byte) {
 }
 
 // newHeartbeatSession 用假传输组装一个已连接会话（绕过拨号与接入层，仅供心跳单测）。
+// 探针与重放按生产口径由「游戏侧」提供（测试侧替身见 testops_test.go）。
 func newHeartbeatSession(t *testing.T, fc *fakeConn, opts ...Option) *Session {
 	t.Helper()
 	o := defaultOptions()
-	for _, opt := range opts {
+	for _, opt := range append([]Option{withTestProbe(testBattleID), withTestReplay(testBattleID)}, opts...) {
 		opt(&o)
 	}
 	plan := Plan{
@@ -235,7 +234,7 @@ func newHeartbeatSession(t *testing.T, fc *fakeConn, opts ...Option) *Session {
 	return s
 }
 
-// assertPingPayloads 断言全部探针载荷都是 PingReq 且 battle_id 正确、逐帧带票槽。
+// assertPingPayloads 断言全部探针载荷都只带本局对局标识（PingReq 的等价形态）、逐帧带票槽。
 func assertPingPayloads(t *testing.T, fc *fakeConn) {
 	t.Helper()
 	ops, slots, payloads := fc.snapshot()
@@ -246,12 +245,12 @@ func assertPingPayloads(t *testing.T, fc *fakeConn) {
 		if op != stubOpPing {
 			t.Fatalf("第 %d 帧 op = %q, 期望 %q（静默期只该发探针）", i, op, stubOpPing)
 		}
-		var req battlev1.PingReq
-		if err := protojson.Unmarshal(payloads[i], &req); err != nil {
+		var req testJoinReq
+		if err := json.Unmarshal(payloads[i], &req); err != nil {
 			t.Fatalf("第 %d 帧探针载荷解析失败: %v", i, err)
 		}
-		if req.GetBattleId() != testBattleID {
-			t.Fatalf("第 %d 帧探针 battle_id = %q, 期望 %q", i, req.GetBattleId(), testBattleID)
+		if req.BattleID != testBattleID {
+			t.Fatalf("第 %d 帧探针 battle_id = %q, 期望 %q", i, req.BattleID, testBattleID)
 		}
 		if slots[i] != TicketSlot(testTicket) {
 			t.Fatalf("第 %d 帧槽 = %q, 期望 %q", i, slots[i], TicketSlot(testTicket))
@@ -344,7 +343,7 @@ func TestHeartbeatToleratesSendFailure(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if _, err := sess.JoinBattle(ctx, &battlev1.JoinBattleReq{BattleId: testBattleID}); err != nil {
+	if err := invokeJoin(ctx, sess, testBattleID); err != nil {
 		t.Fatalf("心跳失败后业务帧不可用: %v", err)
 	}
 }
@@ -373,24 +372,16 @@ func TestHeartbeatToleratesMissingReply(t *testing.T) {
 func TestHeartbeatOverWSStubWithInput(t *testing.T) {
 	stub := newBattleStub(testTicket)
 	srv := startWSStub(t, testTicket, stub)
-	sess, err := Open(context.Background(), planFor(TransportWS, srv.addr, testTicket),
-		WithHeartbeat(20*time.Millisecond))
-	if err != nil {
-		t.Fatalf("Open 失败: %v", err)
-	}
-	defer func() { _ = sess.Close() }()
+	sess := openTest(t, planFor(TransportWS, srv.addr, testTicket), WithHeartbeat(20*time.Millisecond))
 
 	joinOnce(t, sess, "b-1")
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	err = sess.SendFrameInput(ctx, &battlev1.FrameInputReq{
-		BattleId: "b-1", Input: &locksteppb.LockstepInput{FrameId: 1, Payload: []byte{1}},
-	})
-	if err != nil {
-		t.Fatalf("SendFrameInput 失败: %v", err)
+	if err := sendFrameInput(ctx, sess, "b-1"); err != nil {
+		t.Fatalf("发帧失败: %v", err)
 	}
-	if _, err := sess.SyncFrames(ctx, &battlev1.SyncFramesReq{BattleId: "b-1", LastSeenFrame: 0}); err != nil {
-		t.Fatalf("SyncFrames 失败: %v", err)
+	if err := syncFrames(ctx, sess); err != nil {
+		t.Fatalf("补帧失败: %v", err)
 	}
 
 	waitFor(t, 3*time.Second, "服务端收到多次探针", func() bool { return len(stub.pingBattleIDs()) >= 3 })

@@ -1,13 +1,13 @@
 // 载荷编码版本（ver）透传与放行：直连会话把帧头的 `version` 原样交给调用方，SDK **不解游戏
-// 消息**（ver=2 的 protobuf 二进制由游戏侧的生成包解码）。本文件钉死四件事：
+// 消息**（ver=2 的 protobuf 二进制由游戏侧协议包解码）。本文件钉死四件事：
 //
 //  1. 推送分发带版本：OnPush / OnFrameRaw 拿到 (原始载荷, 帧头版本)；(payload, version) 原样透传，
 //     不按 protojson 预解（旧实现 ver=2 会解析失败后静默丢弃）。
-//  2. 帧号提取可注入：ver=1 恒走内建 protojson；ver=2 用 WithFrameNumberFunc 注入的钩子推进补帧
-//     基准，未注入时**不推进也不报错**（与 TS/C# 同口径：二进制非自描述，不猜编码）。
+//  2. 帧号提取可注入：帧号由 WithFrameNumberFunc 注入的钩子提取（ver=1/ver=2 同口径——SDK 不持
+//     游戏消息类型，也就不再内建 protojson 解析），未注入时**不推进也不报错**（与 TS/C# 同口径）。
 //  3. 放行 ver=2：出站版本由序列化器推导（缺省 ver=1 不变），回执版本只接受白名单 {1,2} 且必须
 //     与本会话一致，未知版本（如 3）是明确的协议级错误。
-//  4. 兼容：OnNotify / OnFrame 等旧回调照旧工作（ver=1 行为逐字节不变）。
+//  4. 兼容：OnNotify 等旧回调照旧工作（ver=1 行为逐字节不变）。
 
 package direct
 
@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	battlev1 "github.com/huangyuCN/atlas-sdk-go/api/battle/v1"
+	locksteppb "github.com/huangyuCN/atlas-sdk-go/api/lockstep"
 	"github.com/huangyuCN/atlas-sdk-go/client"
 	pbserializer "github.com/huangyuCN/atlas-sdk-go/contrib/protobuf"
 	"github.com/huangyuCN/atlas-sdk-go/frame"
@@ -81,7 +81,7 @@ func secondByteFrameNumber(payload []byte) (uint64, bool) {
 }
 
 // TestFrameNumberHookAdvancesVer2Baseline ③：注入 FrameNumberFunc 后 ver=2 帧广播的补帧基准
-// 按钩子推进（二进制载荷非自描述，帧号由调用方按游戏侧生成包提取）。
+// 按钩子推进（二进制载荷非自描述，帧号由调用方按游戏侧协议包提取）。
 func TestFrameNumberHookAdvancesVer2Baseline(t *testing.T) {
 	fc := newFakeConn()
 	sess := newHeartbeatSession(t, fc, WithHeartbeat(0), WithFrameNumberFunc(secondByteFrameNumber))
@@ -90,10 +90,10 @@ func TestFrameNumberHookAdvancesVer2Baseline(t *testing.T) {
 	waitFor(t, 2*time.Second, "ver=2 补帧基准推进", func() bool { return sess.LastSeenFrame() == 9 })
 }
 
-// TestVer2PushWithoutHookKeepsBaseline ③b（降级口径）：未注入帧号钩子时 ver=2 帧广播**不推进**
-// 补帧基准、也**不报错**（连接与分发都不受影响）；随后 ver=1 的帧广播照常推进——降级只影响
-// ver=2 的帧号提取，不影响会话可用性（与 TS/C# 同口径）。
-func TestVer2PushWithoutHookKeepsBaseline(t *testing.T) {
+// TestPushWithoutHookKeepsBaseline ③b（降级口径）：未注入帧号钩子时帧广播**不推进**补帧基准、
+// 也**不报错**（连接与分发都不受影响）——ver=1 与 ver=2 同一口径：SDK 不持游戏消息、不猜编码，
+// 宁可让上层显式注入，也不能静默错帧。
+func TestPushWithoutHookKeepsBaseline(t *testing.T) {
 	fc := newFakeConn()
 	sess := newHeartbeatSession(t, fc, WithHeartbeat(0))
 	versions := make(chan uint8, 4)
@@ -115,8 +115,12 @@ func TestVer2PushWithoutHookKeepsBaseline(t *testing.T) {
 		t.Fatalf("未注入钩子不得让会话失败：state=%s err=%v", sess.State(), sess.Err())
 	}
 
+	// ver=1（protojson）同样不推进：帧广播的字段布局属游戏协议，SDK 不再内建解析。
 	pushBroadcastVersion(t, fc, frame.Version, []byte(`{"battleId":"b-1","frame":{"frameId":3}}`))
-	waitFor(t, 2*time.Second, "ver=1 帧广播照常推进", func() bool { return sess.LastSeenFrame() == 3 })
+	time.Sleep(50 * time.Millisecond) // 分发是异步的：留出窗口再断言基准未推进
+	if got := sess.LastSeenFrame(); got != 0 {
+		t.Fatalf("未注入钩子时 ver=1 也不应推进补帧基准，得到 %d", got)
+	}
 }
 
 // TestUnknownResponseVersionIsProtocolError ④：回执版本不在载荷编码白名单（如 3）→ 明确的协议级
@@ -129,7 +133,7 @@ func TestUnknownResponseVersionIsProtocolError(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	err := sess.SendFrameInput(ctx, &battlev1.FrameInputReq{BattleId: testBattleID})
+	err := sendFrameInput(ctx, sess, testBattleID)
 	if !errors.Is(err, client.ErrProtocol) {
 		t.Fatalf("错误 = %v, 期望 errors.Is(err, client.ErrProtocol)（版本非法属协议级失败）", err)
 	}
@@ -147,7 +151,7 @@ func TestResponseVersionMismatchIsProtocolError(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	err := sess.SendFrameInput(ctx, &battlev1.FrameInputReq{BattleId: testBattleID})
+	err := sendFrameInput(ctx, sess, testBattleID)
 	if !errors.Is(err, client.ErrProtocol) {
 		t.Fatalf("错误 = %v, 期望 errors.Is(err, client.ErrProtocol)", err)
 	}
@@ -157,22 +161,22 @@ func TestResponseVersionMismatchIsProtocolError(t *testing.T) {
 }
 
 // TestVer2RequestAndResponseAccepted ③'：换成 ver=2 序列化器后，请求帧头版本为 2、载荷是 protobuf
-// 二进制（手写字面量 `0x0a 票长 battle_id`），且 ver=2 的回执被接受——请求/响应不再被「只认
-// ver=1」拒绝。ver=1 调试路径仍是缺省（见 TestDefaultSessionKeepsVer1Wire）。
+// 二进制（用契约消息 `LockstepInput{frame_id:1}` = 字面量 `0x08 0x01`），且 ver=2 的回执被接受——
+// 请求/响应不再被「只认 ver=1」拒绝。ver=1 调试路径仍是缺省（见 TestDefaultSessionKeepsVer1Wire）。
 func TestVer2RequestAndResponseAccepted(t *testing.T) {
 	fc := newFakeConn()
 	sess := newHeartbeatSession(t, fc, WithHeartbeat(0), WithSerializer(pbserializer.Serializer{}))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if err := sess.SendFrameInput(ctx, &battlev1.FrameInputReq{BattleId: testBattleID}); err != nil {
+	if err := sess.Invoke(ctx, stubOpInput, &locksteppb.LockstepInput{FrameId: 1}, nil); err != nil {
 		t.Fatalf("ver=2 发帧失败: %v", err)
 	}
 	if versions := fc.requestVersions(); len(versions) != 1 || versions[0] != frame.Version2 {
 		t.Fatalf("请求帧头版本 = %v, 期望 [%d]（出站版本由序列化器推导）", versions, frame.Version2)
 	}
 	_, _, payloads := fc.snapshot()
-	want := append([]byte{0x0a, byte(len(testBattleID))}, testBattleID...)
+	want := []byte{0x08, 0x01}
 	if len(payloads) != 1 || !bytes.Equal(payloads[0], want) {
 		t.Fatalf("请求载荷 = % x, 期望 protobuf 字面量 % x", payloads, want)
 	}
@@ -204,14 +208,14 @@ func TestOpenRejectsUnknownSerializerVersion(t *testing.T) {
 }
 
 // TestDefaultSessionKeepsVer1Wire ①：缺省会话的出站帧头版本仍是 ver=1、载荷仍是逐字节的
-// protojson——ver=1（调试路径）的出站行为不变。
+// protojson 等价形态——ver=1（调试路径）的出站行为不变（只是 DTO 改由游戏侧提供）。
 func TestDefaultSessionKeepsVer1Wire(t *testing.T) {
 	fc := newFakeConn()
 	sess := newHeartbeatSession(t, fc, WithHeartbeat(0))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if err := sess.SendFrameInput(ctx, &battlev1.FrameInputReq{BattleId: testBattleID}); err != nil {
+	if err := sess.Invoke(ctx, stubOpInput, testJoinReq{BattleID: testBattleID}, nil); err != nil {
 		t.Fatalf("缺省会话发帧失败: %v", err)
 	}
 	if versions := fc.requestVersions(); len(versions) != 1 || versions[0] != frame.Version {
@@ -223,16 +227,14 @@ func TestDefaultSessionKeepsVer1Wire(t *testing.T) {
 	}
 }
 
-// TestLegacyPushCallbacksKeepWorking ⑤：旧回调 OnNotify（原始字节）与 OnFrame（解析
-// FrameBroadcast）照旧工作，新的 OnPush 同时拿到 version=1——推送分发对旧调用方完全兼容。
+// TestLegacyPushCallbacksKeepWorking ⑤：旧回调 OnNotify（原始字节）照旧工作，新 OnPush 同时拿到
+// version=1（推送分发对旧调用方完全兼容），且注入的帧号钩子推进补帧基准。
 func TestLegacyPushCallbacksKeepWorking(t *testing.T) {
 	fc := newFakeConn()
-	sess := newHeartbeatSession(t, fc, WithHeartbeat(0))
+	sess := newHeartbeatSession(t, fc, WithHeartbeat(0), WithFrameNumberFunc(jsonFrameNumber))
 
 	notified := make(chan []byte, 4)
 	sess.OnNotify(stubOpFrame, func(payload []byte) { notified <- append([]byte(nil), payload...) })
-	parsed := make(chan uint64, 4)
-	sess.OnFrame(func(fb *battlev1.FrameBroadcast) { parsed <- fb.GetFrame().GetFrameId() })
 	versioned := make(chan uint8, 4)
 	sess.OnPush(stubOpFrame, func(_ []byte, version uint8) { versioned <- version })
 
@@ -247,14 +249,6 @@ func TestLegacyPushCallbacksKeepWorking(t *testing.T) {
 		t.Fatal("旧 OnNotify 回调未触发（ver=1 行为不得改变）")
 	}
 	select {
-	case id := <-parsed:
-		if id != 3 {
-			t.Fatalf("旧 OnFrame 解析帧号 = %d, 期望 3", id)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("旧 OnFrame 回调未触发（ver=1 行为不得改变）")
-	}
-	select {
 	case version := <-versioned:
 		if version != frame.Version {
 			t.Fatalf("OnPush 版本 = %d, 期望 %d", version, frame.Version)
@@ -262,7 +256,7 @@ func TestLegacyPushCallbacksKeepWorking(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("OnPush 回调未触发")
 	}
-	waitFor(t, 2*time.Second, "ver=1 补帧基准推进", func() bool { return sess.LastSeenFrame() == 3 })
+	waitFor(t, 2*time.Second, "ver=1 补帧基准推进（钩子）", func() bool { return sess.LastSeenFrame() == 3 })
 }
 
 // TestWSVer2FramePush ②'（真传输端到端）：ver=2 的帧广播经 WS 面到达（帧层白名单放行 ver=2）→
@@ -273,21 +267,16 @@ func TestWSVer2FramePush(t *testing.T) {
 	binaryPayload := []byte{0x08, 9}
 	stub.setPushFrame(frame.Version2, binaryPayload)
 
-	sess, err := Open(context.Background(), planFor(TransportWS, srv.addr, testTicket),
+	sess := openTest(t, planFor(TransportWS, srv.addr, testTicket),
 		WithHeartbeat(0), WithFrameNumberFunc(secondByteFrameNumber))
-	if err != nil {
-		t.Fatalf("Open 失败: %v", err)
-	}
-	defer func() { _ = sess.Close() }()
-
 	got := make(chan frameObserved, 4)
 	sess.OnFrameRaw(func(payload []byte, version uint8) {
 		got <- frameObserved{payload: append([]byte(nil), payload...), version: version}
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if _, err := sess.SyncFrames(ctx, &battlev1.SyncFramesReq{BattleId: "b-1", LastSeenFrame: 0}); err != nil {
-		t.Fatalf("SyncFrames 失败: %v", err)
+	if err := syncFrames(ctx, sess); err != nil {
+		t.Fatalf("补帧失败: %v", err)
 	}
 	select {
 	case observed := <-got:

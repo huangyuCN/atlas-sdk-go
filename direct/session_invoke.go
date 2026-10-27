@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"time"
 
-	battlev1 "github.com/huangyuCN/atlas-sdk-go/api/battle/v1"
-	battlev1opclient "github.com/huangyuCN/atlas-sdk-go/api/battle/v1/opclient"
 	"github.com/huangyuCN/atlas-sdk-go/client"
 	"github.com/huangyuCN/atlas-sdk-go/frame"
 )
@@ -19,31 +17,9 @@ type invokeResult struct {
 	err  error
 }
 
-// JoinBattle 直连入局（重连时由会话自动重放；票据失效返回可判定的 ErrTicketExpired/ErrTicketInvalid）。
-func (s *Session) JoinBattle(ctx context.Context, req *battlev1.JoinBattleReq) (*battlev1.JoinBattleReply, error) {
-	var out battlev1.JoinBattleReply
-	if err := s.Invoke(ctx, battlev1opclient.BattleServiceProtocolOps.JoinBattle, req, &out); err != nil {
-		return nil, err
-	}
-	s.joined.Store(true)
-	return &out, nil
-}
-
-// SendFrameInput 发送一帧输入（服务端回空成功包络；业务拒绝仍返回错误）。
-func (s *Session) SendFrameInput(ctx context.Context, req *battlev1.FrameInputReq) error {
-	return s.Invoke(ctx, battlev1opclient.BattleServiceProtocolOps.SendFrameInput, req, nil)
-}
-
-// SyncFrames 从 last_seen_frame 补帧（重连后由会话自动重放补断点）。
-func (s *Session) SyncFrames(ctx context.Context, req *battlev1.SyncFramesReq) (*battlev1.SyncFramesReply, error) {
-	var out battlev1.SyncFramesReply
-	if err := s.Invoke(ctx, battlev1opclient.BattleServiceProtocolOps.SyncFrames, req, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
-// Invoke 发一条战斗帧请求并等回执：请求帧逐帧置位会话槽（base64url 票密文），三面统一。
+// Invoke 发一条业务 op 并等回执：请求帧逐帧置位会话槽（base64url 票密文），三面统一。
+// op 与 req/resp 由调用方给出（通常来自游戏协议包的生成 DTO 与 op 常量）：SDK 只做编码、
+// 写线、匹配回执与错误归一，**不持有任何游戏域消息类型**；req 由本会话序列化器编码。
 // 终态（ended/failed）返回终态族哨兵对应的错误且不写线（见 terminal.go）；未连接/重连中返回
 // *client.NetworkError（可重试语义），业务拒绝返回 *client.BusinessError。
 func (s *Session) Invoke(ctx context.Context, op string, req, resp any) error {

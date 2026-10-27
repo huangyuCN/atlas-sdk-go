@@ -15,7 +15,6 @@
 package direct
 
 import (
-	"context"
 	"errors"
 	"testing"
 	"time"
@@ -123,13 +122,9 @@ func TestHeartbeatProtocolRejectRecoversAfterReconnect(t *testing.T) {
 	srv := startWSStub(t, testTicket, stub)
 	stub.setPoisonPing(true) // 服务端 framing 抖动：探针回执协议非法
 
-	sess, err := Open(context.Background(), planFor(TransportWS, srv.addr, testTicket),
+	sess := openTest(t, planFor(TransportWS, srv.addr, testTicket),
 		WithHeartbeat(20*time.Millisecond),
 		WithReconnectBackoff(20*time.Millisecond, 100*time.Millisecond))
-	if err != nil {
-		t.Fatalf("Open 失败: %v", err)
-	}
-	defer func() { _ = sess.Close() }()
 
 	waitFor(t, 3*time.Second, "协议非法计数可见", func() bool { return sess.Stats().HeartbeatRejects >= 1 })
 	if err := sess.HeartbeatErr(); !errors.Is(err, client.ErrProtocol) {

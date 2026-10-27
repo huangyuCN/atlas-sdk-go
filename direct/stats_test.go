@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	battlev1 "github.com/huangyuCN/atlas-sdk-go/api/battle/v1"
 	"github.com/huangyuCN/atlas-sdk-go/client"
 	"github.com/huangyuCN/atlas-sdk-go/frame"
 )
@@ -54,16 +53,12 @@ func TestStatsHeartbeatCounters(t *testing.T) {
 }
 
 // TestStatsCountsSuccessfulReconnect ④b：成功重连的计数（连接代次、轮次、握手尝试）与
-// 「失败计数保持 0」；显式重连同样走重放（JoinBattle/SyncFrames）路径。
+// 「失败计数保持 0」；显式重连同样走 WithReplay 的重放路径。
 func TestStatsCountsSuccessfulReconnect(t *testing.T) {
 	stub := newBattleStub(testTicket)
 	srv := startWSStub(t, testTicket, stub)
 
-	sess, err := Open(context.Background(), planFor(TransportWS, srv.addr, testTicket), WithAutoReconnect(false))
-	if err != nil {
-		t.Fatalf("Open 失败: %v", err)
-	}
-	defer func() { _ = sess.Close() }()
+	sess := openTest(t, planFor(TransportWS, srv.addr, testTicket), WithAutoReconnect(false))
 	joinOnce(t, sess, "b-1")
 	if st := sess.Stats(); st.Connects != 1 || st.HandshakeAttempts != 1 || st.HandshakeFailures != 0 {
 		t.Fatalf("首连后快照 = %+v, 期望 connects=1 handshakes=1/0", st)
@@ -72,7 +67,7 @@ func TestStatsCountsSuccessfulReconnect(t *testing.T) {
 	stub.setCloseAfter(1, 1) // 本连接第 1 个请求回执后服务端断开
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	_, _ = sess.SyncFrames(ctx, &battlev1.SyncFramesReq{BattleId: "b-1"}) // 触发断流
+	_ = syncFrames(ctx, sess) // 触发断流
 	if err := sess.Reconnect(ctx); err != nil {
 		t.Fatalf("Reconnect 失败: %v", err)
 	}
@@ -94,19 +89,15 @@ func TestStatsCountsReconnectFailure(t *testing.T) {
 	stub := newBattleStub(testTicket)
 	srv := startWSStub(t, testTicket, stub)
 
-	sess, err := Open(context.Background(), planFor(TransportWS, srv.addr, testTicket),
+	sess := openTest(t, planFor(TransportWS, srv.addr, testTicket),
 		WithReconnectBackoff(20*time.Millisecond, 50*time.Millisecond))
-	if err != nil {
-		t.Fatalf("Open 失败: %v", err)
-	}
-	defer func() { _ = sess.Close() }()
 	joinOnce(t, sess, "b-1")
 
 	srv.reject.Store(true) // 之后一律拒绝升级（接入层拒绝语义：无回执直接断开）
 	stub.setCloseAfter(1, 1)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	_, _ = sess.SyncFrames(ctx, &battlev1.SyncFramesReq{BattleId: "b-1"})
+	_ = syncFrames(ctx, sess)
 
 	waitFor(t, 3*time.Second, "重连失败计数", func() bool { return sess.Stats().ReconnectFailures >= 1 })
 	st := sess.Stats()

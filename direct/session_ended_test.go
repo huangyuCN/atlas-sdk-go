@@ -1,11 +1,15 @@
 // 对局结束（终态）单测：服务端以 reason BATTLE_ENDED 拒绝任一 op、以及结束通知的重复补投，
 // 都必须让直连会话进入**可判定终态**并停发；断言全部落在假传输的写出记录上（零写入 = 停发的
 // 直接证据），不依赖真实网络与接入层。
+//
+// 结束通知的载荷在本文件里手写为 protojson 等价字节（游戏域消息已迁出 SDK）：SDK 只留档与
+// 去重、不解析，字段级语义（胜者等）由游戏侧协议包解码——用例按同一口径自己解。
 
 package direct
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -14,11 +18,8 @@ import (
 	"testing"
 	"time"
 
-	battlev1 "github.com/huangyuCN/atlas-sdk-go/api/battle/v1"
-	battlev1opclient "github.com/huangyuCN/atlas-sdk-go/api/battle/v1/opclient"
 	"github.com/huangyuCN/atlas-sdk-go/client"
 	"github.com/huangyuCN/atlas-sdk-go/frame"
-	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // assertNoWireWrites 断言假传输此后没有任何新的写出（终态「停发」的直接证据）。
@@ -64,7 +65,7 @@ func TestEndedStopsWireOnBusinessReject(t *testing.T) {
 
 	joinOnce(t, sess, testBattleID)
 	fc.replyStatusNext(fakeStatus{code: 409, reason: reasonBattleEnded, class: frame.ClassBusiness})
-	assertBusinessEnded(t, sess.SendFrameInput(ctx, &battlev1.FrameInputReq{BattleId: testBattleID}), stubOpInput)
+	assertBusinessEnded(t, sendFrameInput(ctx, sess, testBattleID), stubOpInput)
 
 	if cause := sess.EndCause(); cause == nil {
 		t.Fatal("终态未记录触发原因")
@@ -105,16 +106,16 @@ func TestEndedRejectsFurtherSends(t *testing.T) {
 	defer cancel()
 
 	fc.replyNext(reasonBattleEnded)
-	assertBusinessEnded(t, sess.SendFrameInput(ctx, &battlev1.FrameInputReq{BattleId: testBattleID}), stubOpInput)
+	assertBusinessEnded(t, sendFrameInput(ctx, sess, testBattleID), stubOpInput)
 	ops, _, _ := fc.snapshot()
 
 	calls := []struct {
 		what string
 		err  error
 	}{
-		{"SendFrameInput", sess.SendFrameInput(ctx, &battlev1.FrameInputReq{BattleId: testBattleID})},
-		{"SyncFrames", errOfSync(sess.SyncFrames(ctx, &battlev1.SyncFramesReq{BattleId: testBattleID}))},
-		{"JoinBattle", errOfJoin(sess.JoinBattle(ctx, &battlev1.JoinBattleReq{BattleId: testBattleID}))},
+		{"SendFrameInput", sendFrameInput(ctx, sess, testBattleID)},
+		{"SyncFrames", syncFrames(ctx, sess)},
+		{"JoinBattle", invokeJoin(ctx, sess, testBattleID)},
 		{"Reconnect", sess.Reconnect(ctx)},
 	}
 	for _, c := range calls {
@@ -122,12 +123,6 @@ func TestEndedRejectsFurtherSends(t *testing.T) {
 	}
 	assertNoWireWrites(t, fc, len(ops))
 }
-
-// errOfSync 把 SyncFrames 的两返回值收敛成一个错误（用例里只关心错误）。
-func errOfSync(_ *battlev1.SyncFramesReply, err error) error { return err }
-
-// errOfJoin 把 JoinBattle 的两返回值收敛成一个错误（用例里只关心错误）。
-func errOfJoin(_ *battlev1.JoinBattleReply, err error) error { return err }
 
 // pushFrameNotify 以 Notify 帧推一条帧广播（终态窗口内「仍可读」的探针）；帧头版本按缺省 ver=1
 // 声明（真实服务端编码帧时补齐为 1，内存桩不编码帧头，故这里显式给出）。
@@ -143,20 +138,26 @@ func pushFrameNotify(t *testing.T, fc *fakeConn, frameID uint64) {
 	}
 }
 
-// endNotifyPayload 生成一条结束通知的 protojson 载荷（battle_id 固定为本会话对局）。
+// endNotifyPayload 生成一条结束通知的 protojson 等价载荷（battle_id 固定为本会话对局）。
+// 形态与生成物逐字节一致：`{"battleId":"...","winnerPlayerId":"..."}`（零值省略）。
 func endNotifyPayload(t *testing.T, winner string) []byte {
 	t.Helper()
-	payload, err := protojson.Marshal(&battlev1.BattleEndNotify{BattleId: testBattleID, WinnerPlayerId: winner})
-	if err != nil {
-		t.Fatalf("结束通知载荷序列化失败: %v", err)
+	return []byte(fmt.Sprintf(`{"battleId":%q,"winnerPlayerId":%q}`, testBattleID, winner))
+}
+
+// endWinner 从结束通知载荷里取胜者（测试侧解码，等价于游戏侧用协议包解码）。
+func endWinner(payload []byte) string {
+	var v struct {
+		WinnerPlayerID string `json:"winnerPlayerId"`
 	}
-	return payload
+	_ = json.Unmarshal(payload, &v)
+	return v.WinnerPlayerID
 }
 
 // pushEndNotifyPayload 以 Notify 帧把结束通知载荷推给会话（服务端补投 = 同一载荷多次投递）。
 func pushEndNotifyPayload(t *testing.T, fc *fakeConn, payload []byte) {
 	t.Helper()
-	body, err := frame.BuildRequestBody(battlev1opclient.BattleServicePushOps.BattleEndNotify, payload)
+	body, err := frame.BuildRequestBody(stubOpEnd, payload)
 	if err != nil {
 		t.Fatalf("结束通知 body 封装失败: %v", err)
 	}
@@ -169,9 +170,9 @@ func pushEndNotifyPayload(t *testing.T, fc *fakeConn, payload []byte) {
 func watchEnd(sess *Session) (count func() int64, winner func() string) {
 	var calls atomic.Int64
 	var last atomic.Value
-	sess.OnBattleEnd(func(n *battlev1.BattleEndNotify) {
+	sess.OnPush(stubOpEnd, func(payload []byte, _ uint8) {
 		calls.Add(1)
-		last.Store(n.GetWinnerPlayerId())
+		last.Store(endWinner(payload))
 	})
 	return calls.Load, func() string {
 		if v, ok := last.Load().(string); ok {
@@ -206,8 +207,8 @@ func TestEndNotifyFiresCallbackOnce(t *testing.T) {
 	if !sess.Ended() || sess.State() != StateEnded {
 		t.Fatalf("收到结束通知后 ended=%v 状态=%s, 期望 true/ended", sess.Ended(), sess.State())
 	}
-	if n := sess.EndNotify(); n == nil || n.GetWinnerPlayerId() != "p-1" {
-		t.Fatalf("EndNotify = %v, 期望首条通知（胜者 p-1）", n)
+	if raw := sess.EndNotifyPayload(); endWinner(raw) != "p-1" {
+		t.Fatalf("EndNotifyPayload = %q, 期望首条通知（胜者 p-1）", raw)
 	}
 }
 
@@ -230,8 +231,8 @@ func TestEndNotifyMismatchKeepsFirst(t *testing.T) {
 	if got := winner(); got != "p-1" {
 		t.Fatalf("回调胜者 = %q, 期望首投的 p-1（首次为准）", got)
 	}
-	if n := sess.EndNotify(); n.GetWinnerPlayerId() != "p-1" {
-		t.Fatalf("EndNotify 胜者 = %q, 期望首投的 p-1（补投不覆盖）", n.GetWinnerPlayerId())
+	if got := endWinner(sess.EndNotifyPayload()); got != "p-1" {
+		t.Fatalf("EndNotifyPayload 胜者 = %q, 期望首投的 p-1（补投不覆盖）", got)
 	}
 }
 
@@ -245,7 +246,7 @@ func TestEndNotifyAfterRejectStillFires(t *testing.T) {
 	defer cancel()
 
 	fc.replyNext(reasonBattleEnded)
-	assertBusinessEnded(t, sess.SendFrameInput(ctx, &battlev1.FrameInputReq{BattleId: testBattleID}), stubOpInput)
+	assertBusinessEnded(t, sendFrameInput(ctx, sess, testBattleID), stubOpInput)
 	if !sess.Ended() {
 		t.Fatal("被 BATTLE_ENDED 拒绝后未进入终态")
 	}
@@ -266,9 +267,10 @@ func TestEndNotifyAfterRejectStillFires(t *testing.T) {
 func TestEndLingerKeepsReadingThenReleases(t *testing.T) {
 	base := runtime.NumGoroutine()
 	fc := newFakeConn()
-	sess := newHeartbeatSession(t, fc, WithHeartbeat(0), WithEndLinger(300*time.Millisecond))
+	sess := newHeartbeatSession(t, fc, WithHeartbeat(0), WithEndLinger(300*time.Millisecond),
+		WithFrameNumberFunc(jsonFrameNumber))
 	frames := atomic.Int64{}
-	sess.OnFrame(func(*battlev1.FrameBroadcast) { frames.Add(1) })
+	sess.OnPush(stubOpFrame, func([]byte, uint8) { frames.Add(1) })
 
 	pushEndNotifyPayload(t, fc, endNotifyPayload(t, "p-1"))
 	waitFor(t, 2*time.Second, "进入终态", sess.Ended)

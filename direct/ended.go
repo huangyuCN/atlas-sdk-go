@@ -6,17 +6,14 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	battlev1 "github.com/huangyuCN/atlas-sdk-go/api/battle/v1"
-	"google.golang.org/protobuf/encoding/protojson"
-	"google.golang.org/protobuf/proto"
 )
 
 // 终态（对局结束）语义，四条边界一次说清：
 //
-//  1. 触发：任一 op（SendFrameInput/SyncFrames/Ping/JoinBattle）收到 reason
-//     BATTLE_ENDED 的业务拒绝，或收到 BattleEndNotify 推送。两者同一收口——服务端对已结束
-//     对局的迟到帧 op 一律稳定拒绝（identity 在投递前判「已留档」），客户端不必分辨来源。
+//  1. 触发：任一 op 收到 reason BATTLE_ENDED 的业务拒绝，或收到战斗结束通知推送。两者同一
+//     收口——服务端对已结束对局的迟到帧 op 一律稳定拒绝（identity 在投递前判「已留档」），
+//     客户端不必分辨来源。结束通知按 op 认（OpBattleEndNotify），载荷原样留档、不解析
+//     （消息类型属游戏协议包，SDK 不持有）。
 //  2. 停发：终态下一切写线（发帧、补帧、探针）被拒并返回可判定的 ErrBattleEnded。判定位点
 //     在写锁内（writeRequest 双检），故终态置位后不会有新的字节上线。
 //  3. 仍可读：读循环不受终态影响，收尾窗口内继续分发推送——结算通知可能被有界补投
@@ -32,8 +29,7 @@ type endedState struct {
 	mu      sync.Mutex
 	reason  string // 触发 reason（终态族之一，见 terminal.go；本地结算合成 Status 的依据）
 	cause   error  // 触发原因（终态业务拒绝原文，或结束通知合成的描述）
-	notify  *battlev1.BattleEndNotify
-	raw     []byte // 首条结束通知的原始载荷（逐字比对基准）
+	raw     []byte // 首条结束通知的原始载荷（逐字比对基准；不解析，归游戏协议包解码）
 	noticed bool   // 结束通知是否已回调（幂等去重标志）
 	replays uint64 // 首投之后的补投条数
 	differs uint64 // 载荷与首投不逐字一致的条数（异常观测）
@@ -71,16 +67,16 @@ func (s *Session) EndReason() string {
 	return s.end.reason
 }
 
-// EndNotify 返回首条战斗结束通知的副本（未收到通知返回 nil）。迟到的订阅者用它在注册回调
-// 之前取结果：回调只随首投触发一次，补投不重放。
-func (s *Session) EndNotify() *battlev1.BattleEndNotify {
+// EndNotifyPayload 返回首条战斗结束通知的**原始载荷**副本（未收到通知返回 nil）。
+// 迟到的订阅者用它在注册回调之前取结果：回调只随首投触发一次，补投不重放。
+// 载荷按帧头版本编码（ver=1 protojson / ver=2 protobuf），由游戏侧协议包解码——SDK 不预解。
+func (s *Session) EndNotifyPayload() []byte {
 	s.end.mu.Lock()
 	defer s.end.mu.Unlock()
-	if s.end.notify == nil {
+	if s.end.raw == nil {
 		return nil
 	}
-	cloned, _ := proto.Clone(s.end.notify).(*battlev1.BattleEndNotify)
-	return cloned
+	return append([]byte(nil), s.end.raw...)
 }
 
 // EndStats 汇总结束通知的投递观测（首投一次 + 服务端有界补投）。
@@ -135,15 +131,17 @@ func (s *Session) markEnded(reason string, cause error) bool {
 
 // noteEndNotify 登记一条结束通知并进入终态；返回 true 表示这是首投（应触发回调）。
 // 补投只更新计数：回调不重放（幂等），载荷不一致时首次为准（不覆盖首条、不改写回调载荷）。
+//
+// 载荷只按字节留档、**不解析**（BattleEndNotify 属游戏协议包）：空载荷不进终态、不回调
+// （不臆造结束语义，由游戏侧解码时兜底）。
 func (s *Session) noteEndNotify(payload []byte) bool {
-	var n battlev1.BattleEndNotify
-	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(payload, &n); err != nil {
-		return false // 载荷非法：不进终态、不回调（由协议层兜底，不臆造结束语义）
+	if len(payload) == 0 {
+		return false
 	}
 	s.end.mu.Lock()
 	first := !s.end.noticed
 	if first {
-		s.end.noticed, s.end.notify, s.end.raw = true, &n, append([]byte(nil), payload...)
+		s.end.noticed, s.end.raw = true, append([]byte(nil), payload...)
 	} else {
 		s.end.replays++
 		if !bytes.Equal(s.end.raw, payload) {
@@ -152,15 +150,16 @@ func (s *Session) noteEndNotify(payload []byte) bool {
 	}
 	s.end.mu.Unlock()
 
-	s.markEnded(reasonBattleEnded, notifyCause(&n))
+	s.markEnded(reasonBattleEnded, s.notifyCause())
 	return first
 }
 
 // notifyCause 组装「结束通知」触发的终态原因：包终态哨兵并带本地业务形态，
 // 让 EndCause() 与业务拒绝路径的上报口径完全同形（errors.Is + errors.As 都可判定）。
-func notifyCause(n *battlev1.BattleEndNotify) error {
+// 载荷里的对局/胜者字段属游戏消息，SDK 不解；对局标识取会话自身的计划（本局推送的权威来源）。
+func (s *Session) notifyCause() error {
 	be := terminalBusinessError(terminalStatus(reasonBattleEnded))
-	return fmt.Errorf("%w: battle=%s 胜者=%s（%w）", ErrBattleEnded, n.GetBattleId(), n.GetWinnerPlayerId(), be)
+	return fmt.Errorf("%w: battle=%s（%w）", ErrBattleEnded, s.plan.BattleID, be)
 }
 
 // endedErr 返回终态下拒绝发送的错误：包终态哨兵（errors.Is 可判定）并带本地结算的业务形态

@@ -170,22 +170,55 @@ KCP / UDP：`client.DialKCP("127.0.0.1:9003")` / `client.DialUDP("127.0.0.1:9004
 
 **票据与地址的唯一来源是本局成局推送**（不读本地配置、不猜端口）：
 
+> 游戏域消息（`battle` / `game` / `matcher`）**不在本仓**：它们由游戏协议包
+> （`github.com/huangyuCN/atlas-game-layout/protocol`）按 `.proto` 生成并独立发版。
+> 下面的 `battlev1` 即该包的 `api/battle/v1`；SDK **不 require、不 import** 它，
+> 只接收 `op` 名与请求消息（或原始字节），编码后发出去。
+
 ```go
+import (
+	battlev1 "github.com/huangyuCN/atlas-game-layout/protocol/api/battle/v1"
+	"github.com/huangyuCN/atlas-sdk-go/direct"
+)
+
 // 收到成局推送（Notify 帧，op = direct.PushOpMatchStarted）后解析直连计划：
 plan, err := direct.PlanFromPush(op, payload) // 等价于 direct.PlanFromNotify(payload)
 // plan.Ticket    ← 推送里的 battle_ticket（AEAD 密文；接入层与 battle 共持密钥验票）
 // plan.Endpoints ← 推送里的 endpoints[]：{transport, address} 各面接入层地址（可只下发部分面）
 
-sess, err := direct.Open(ctx, plan, direct.WithTransport(direct.TransportKCP))
+sess, err := direct.Open(ctx, plan,
+	direct.WithTransport(direct.TransportKCP),
+	// 会话自身要发的游戏 op（探针 / 重连重放）与帧号钩子由游戏侧用协议包提供：
+	// SDK 只持传输/会话 + 契约消息，不持有任何游戏消息类型。
+	direct.WithProbe(direct.OpPing, &battlev1.PingReq{BattleId: plan.BattleID}),
+	direct.WithReplay(
+		direct.Replay{Op: direct.OpJoinBattle, Req: func(uint64) any {
+			return &battlev1.JoinBattleReq{BattleId: plan.BattleID}
+		}},
+		direct.Replay{Op: direct.OpSyncFrames, Req: func(lastSeen uint64) any {
+			return &battlev1.SyncFramesReq{BattleId: plan.BattleID, LastSeenFrame: lastSeen}
+		}},
+	),
+	direct.WithFrameNumberFunc(func(payload []byte) (uint64, bool) {
+		var fb battlev1.FrameBroadcast
+		if protojson.Unmarshal(payload, &fb) != nil {
+			return 0, false
+		}
+		return fb.GetFrame().GetFrameId(), true
+	}),
+)
 if err != nil {
 	// 缺面 / 缺票 / 被接入层拒绝：见下方错误表；不重试、不猜端口
 }
 defer sess.Close()
 
-sess.OnFrame(func(fb *battlev1.FrameBroadcast) { /* 帧广播 */ })
-sess.OnBattleEnd(func(n *battlev1.BattleEndNotify) { /* 结算（回调恰一次） */ })
-_, err = sess.JoinBattle(ctx, &battlev1.JoinBattleReq{BattleId: plan.BattleID})
-err = sess.SendFrameInput(ctx, &battlev1.FrameInputReq{BattleId: plan.BattleID, Input: in})
+// 推送按 op 订阅：**(原始载荷, 帧头版本)** 原样交出，解码归游戏侧协议包。
+sess.OnPush(direct.OpFrameBroadcast, func(payload []byte, version uint8) { /* 帧广播 */ })
+sess.OnPush(direct.OpBattleEndNotify, func(payload []byte, version uint8) { /* 结算（回调恰一次） */ })
+
+// 业务 op 走通用 Invoke：op 与请求消息都来自协议包（SDK 只负责编码、写线、回执与错误归一）。
+err = sess.Invoke(ctx, direct.OpJoinBattle, &battlev1.JoinBattleReq{BattleId: plan.BattleID}, nil)
+err = sess.Invoke(ctx, direct.OpSendFrameInput, &battlev1.FrameInputReq{BattleId: plan.BattleID, Input: in}, nil)
 ```
 
 **三面地址选择**：`direct.WithTransport(direct.TransportWS|TransportKCP|TransportUDP)`
@@ -198,14 +231,18 @@ err = sess.SendFrameInput(ctx, &battlev1.FrameInputReq{BattleId: plan.BattleID, 
 `direct.ErrTicketExpired` / `direct.ErrTicketInvalid`（业务拒绝原文仍可用 `errors.As` 取到），
 由上层重新匹配取新票——**不重连**（同一张票重连只会再被拒）。
 
-**保活心跳**：缺省 2s 发一次 `battle.v1.BattleService/Ping`（Tell，服务端不回业务回执）。
+**保活心跳**：缺省 2s 发一次探针（`WithProbe` 给出 op 与请求消息，缺省 op 是
+`battle.v1.BattleService/Ping`；Tell，服务端不回业务回执）。
 数据报面（KCP/UDP）靠收包刷新帧面空闲读超时（battle 侧缺省 `offline_timeout/3` = 5s），
 静默会被判掉线、NAT 映射也会失效，故周期必须**严格小于**该阈值（`WithHeartbeat` 可调，
-`<=0` 关闭）。心跳在**连接就绪**时起表（早于 `JoinBattle`，与 TS/C# 同口径）——探针只证明
-链路活着，不参与对局语义；被拒的处置见下。
+`<=0` 关闭）。心跳在**连接就绪**时起表（早于入局，与 TS/C# 同口径）——探针只证明
+链路活着，不参与对局语义；被拒的处置见下。**未配 `WithProbe` 时一个字节都不发**
+（不会用空载荷裸探：那会被服务端的目标一致性校验判为拒绝）。
 
-**断线重连**：缺省自动重连（退避 ×2 封顶），重连成功后自动重放 `JoinBattle` +
-`SyncFrames(last_seen_frame)` 补断点；被接入层拒绝（`direct.ErrRejected`）与票据失效**不重试**。
+**断线重连**：缺省自动重连（退避 ×2 封顶），重连成功后按 `WithReplay` 的步骤重放进局与
+补帧（`last_seen_frame` 取 `LastSeenFrame()`，由 `WithFrameNumberFunc` 推进）；被接入层
+拒绝（`direct.ErrRejected`）与票据失效**不重试**。未配 `WithReplay` 则重连只重新 hello、
+不重放业务 op。
 
 **结束语义（终态）**：对局结束 / 对局不存在 / 入局被拒 / 请求目标不符时，会话进入**终态**
 （`Terminal()` 为真）：一切上发（业务帧 + 探针）被拒并返回终态族哨兵，不再重连。终态分两种，
@@ -350,8 +387,8 @@ if errors.As(err, &be) {
 
 ### 生成物来源（模板仓 descriptor set）
 
-本 SDK **不携带手写协议副本**：帧常量与域 DTO/会话 stub 全部由生成脚本从**模板仓**
-（`atlas-game-layout`）导出的 descriptor set 生成：
+本 SDK **不携带手写协议副本**：帧常量与**契约消息**（会话 / route / common / lockstep）的
+DTO 与会话 stub 全部由生成脚本从上游导出物生成；**游戏域消息不在本仓生成**（见下）：
 
 ```bash
 ATLAS_LAYOUT_DIR=../atlas-game-layout ATLAS_DIR=../atlas bash scripts/gen-dto.sh
@@ -360,8 +397,13 @@ ATLAS_LAYOUT_DIR=../atlas-game-layout ATLAS_DIR=../atlas bash scripts/gen-dto.sh
 | 产物 | 来源 | 用途 |
 |------|------|------|
 | `frame/gen/consts_gen.go`、`frame/gen/codec_gen.go` | 逐字节复制框架 `transport/frame/gen/goframe/{consts_gen,codec_gen}.go` | 帧协议常量与编解码（唯一来源；`frame` 包只做转发） |
-| `api/gateway/v1/**`、`api/battle/v1/**` 等 | 模板 descriptor set（两个 include 根：模板仓 + 框架仓）→ `--go_out`（M 映射到本仓包） | 域 DTO（`proto.Message`，ver=1 protojson / ver=2 protobuf 共用） |
-| `api/*/v1/opclient/*.pb.go` | `--atlas-client_out` + `go_client_package=github.com/huangyuCN/atlas-sdk-go/client` | 强类型客户端 stub 与**协议描述符**（5 会话 op + 3 提取器 + 推送 op） |
+| `api/gateway/v1/**`、`api/common/v1/**`、`api/atlas/v1/**`、`api/lockstep/**` | 模板/框架 descriptor set（两个 include 根：模板仓 + 框架仓）→ `--go_out`（M 映射到本仓包） | **契约消息** DTO（`proto.Message`，ver=1 protojson / ver=2 protobuf 共用） |
+| `api/gateway/v1/opclient/*.pb.go` | `--atlas-client_out` + `go_client_package=github.com/huangyuCN/atlas-sdk-go/client` | 会话强类型 stub 与**协议描述符**（5 会话 op + 3 提取器 + 推送 op） |
+
+> **游戏域消息（`battle` / `game` / `matcher`）已迁出**：由游戏协议包
+> `github.com/huangyuCN/atlas-game-layout/protocol` 独立生成与发版，本仓 `go.mod`
+> **不 require 它**（两条版本线互不牵连）。SDK 只提供传输/会话 + 契约消息，业务 op 一律
+> 走 `Session.Invoke(ctx, op, req, resp)`，推送一律经 `OnPush` 拿 `(原始载荷, 帧头版本)`。
 
 > **DTO 直接用生成类型**：`proto.Message` 作 `Invoke` 的 req/resp，默认序列化器自动走
 > 官方 protojson（camelCase + int64 字符串 + 零值省略）；非 proto 的 struct/map 仍可

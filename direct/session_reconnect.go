@@ -5,12 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"time"
-
-	battlev1 "github.com/huangyuCN/atlas-sdk-go/api/battle/v1"
-	battlev1opclient "github.com/huangyuCN/atlas-sdk-go/api/battle/v1/opclient"
 )
 
-// Reconnect 显式重连：重新 hello（含升级 query 票）、重放 JoinBattle 与 SyncFrames 补帧。
+// Reconnect 显式重连：重新 hello（含升级 query 票），并按 WithReplay 的步骤重放入局与补帧。
 // 终态（ended/failed）返回对应终态族哨兵的错误（重连只会被稳定拒绝）；被接入层拒绝与票据失效
 // 返回不可重试错误（会话随即终止，不再自动重试）。
 func (s *Session) Reconnect(ctx context.Context) error {
@@ -165,22 +162,25 @@ func (s *Session) dialOnce() (conn, error) {
 	return s.dialTracked(ctx)
 }
 
-// restore 在新连接上重放入局：JoinBattle + SyncFrames(last_seen_frame) 补帧（仅入局过的会话）。
+// restore 在新连接上按 `WithReplay` 的步骤重放（通常是入局 + 按 last_seen_frame 补帧）。
+// 载荷由游戏侧生成（SDK 不持游戏域消息），补帧基准取当前基准，故重放总是从断点续上。
 // 走内部 invoke（重连期间状态是 Reconnecting，公开 Invoke 会按未连接拒绝）。
 func (s *Session) restore() error {
-	if !s.joined.Load() {
+	if len(s.opt.replay) == 0 {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), s.opt.invokeTimeout)
 	defer cancel()
-	var join battlev1.JoinBattleReply
-	if err := s.invoke(ctx, battlev1opclient.BattleServiceProtocolOps.JoinBattle,
-		&battlev1.JoinBattleReq{BattleId: s.plan.BattleID}, &join); err != nil {
-		return err
+	for _, step := range s.opt.replay {
+		var req any
+		if step.Req != nil {
+			req = step.Req(s.LastSeenFrame())
+		}
+		if err := s.invoke(ctx, step.Op, req, nil); err != nil {
+			return err
+		}
 	}
-	var sync battlev1.SyncFramesReply
-	return s.invoke(ctx, battlev1opclient.BattleServiceProtocolOps.SyncFrames,
-		&battlev1.SyncFramesReq{BattleId: s.plan.BattleID, LastSeenFrame: s.LastSeenFrame()}, &sync)
+	return nil
 }
 
 // closeCurrent 关闭当前代连接（读循环随之退出，监管按策略处理）。

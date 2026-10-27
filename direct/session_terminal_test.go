@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	battlev1 "github.com/huangyuCN/atlas-sdk-go/api/battle/v1"
 	"github.com/huangyuCN/atlas-sdk-go/client"
 	"github.com/huangyuCN/atlas-sdk-go/frame"
 )
@@ -96,7 +95,7 @@ func TestBattleNotFoundTerminalAndReported(t *testing.T) {
 
 	joinOnce(t, sess, testBattleID)
 	fc.replyStatusNext(fakeStatus{code: 404, reason: "BATTLE_NOT_FOUND", class: frame.ClassBusiness})
-	err := sess.SendFrameInput(ctx, &battlev1.FrameInputReq{BattleId: testBattleID})
+	err := sendFrameInput(ctx, sess, testBattleID)
 	assertTerminalReject(t, err, ErrBattleNotFound, "BATTLE_NOT_FOUND", 404)
 	assertFailedState(t, sess, ErrBattleNotFound, "BATTLE_NOT_FOUND", 404)
 	assertReleasedQuickly(t, fc) // 收尾窗口配了 30s：连接仍被立刻释放，证明失败态不等窗口
@@ -106,7 +105,7 @@ func TestBattleNotFoundTerminalAndReported(t *testing.T) {
 	assertNoWireWrites(t, fc, len(ops))
 
 	// 终态下一切发送与重连同族拒绝（不写线、不重连）。
-	assertTerminalReject(t, sess.SendFrameInput(ctx, &battlev1.FrameInputReq{BattleId: testBattleID}),
+	assertTerminalReject(t, sendFrameInput(ctx, sess, testBattleID),
 		ErrBattleNotFound, "BATTLE_NOT_FOUND", 404)
 	assertTerminalReject(t, sess.Reconnect(ctx), ErrBattleNotFound, "BATTLE_NOT_FOUND", 404)
 	assertNoWireWrites(t, fc, len(ops))
@@ -122,14 +121,14 @@ func TestBattleFullTerminalAndReported(t *testing.T) {
 	defer cancel()
 
 	fc.replyStatusNext(fakeStatus{code: 409, reason: "BATTLE_FULL", class: frame.ClassBusiness})
-	_, err := sess.JoinBattle(ctx, &battlev1.JoinBattleReq{BattleId: testBattleID})
+	err := invokeJoin(ctx, sess, testBattleID)
 	assertTerminalReject(t, err, ErrBattleFull, "BATTLE_FULL", 409)
 	assertFailedState(t, sess, ErrBattleFull, "BATTLE_FULL", 409)
 
 	ops, _, _ := fc.snapshot()
 	time.Sleep(150 * time.Millisecond)
 	assertNoWireWrites(t, fc, len(ops))
-	assertTerminalReject(t, sess.SendFrameInput(ctx, &battlev1.FrameInputReq{BattleId: testBattleID}),
+	assertTerminalReject(t, sendFrameInput(ctx, sess, testBattleID),
 		ErrBattleFull, "BATTLE_FULL", 409)
 }
 
@@ -146,7 +145,7 @@ func TestFrameTargetMismatchTerminalAndReported(t *testing.T) {
 	defer cancel()
 
 	fc.replyStatusNext(fakeStatus{code: 403, reason: "FRAME_TARGET_MISMATCH"})
-	err := sess.SendFrameInput(ctx, &battlev1.FrameInputReq{BattleId: testBattleID})
+	err := sendFrameInput(ctx, sess, testBattleID)
 	assertTerminalReject(t, err, ErrFrameTargetMismatch, "FRAME_TARGET_MISMATCH", 403)
 	assertFailedState(t, sess, ErrFrameTargetMismatch, "FRAME_TARGET_MISMATCH", 403)
 	if got := sess.EndReason(); got != "FRAME_TARGET_MISMATCH" {
@@ -156,7 +155,7 @@ func TestFrameTargetMismatchTerminalAndReported(t *testing.T) {
 	ops, _, _ := fc.snapshot()
 	time.Sleep(150 * time.Millisecond) // 15 个心跳周期：收到即入终态、不再发送
 	assertNoWireWrites(t, fc, len(ops))
-	assertTerminalReject(t, sess.SendFrameInput(ctx, &battlev1.FrameInputReq{BattleId: testBattleID}),
+	assertTerminalReject(t, sendFrameInput(ctx, sess, testBattleID),
 		ErrFrameTargetMismatch, "FRAME_TARGET_MISMATCH", 403)
 }
 
@@ -182,7 +181,7 @@ func TestBattleEndedKeepsEndedState(t *testing.T) {
 
 	joinOnce(t, sess, testBattleID)
 	fc.replyStatusNext(fakeStatus{code: 409, reason: "BATTLE_ENDED", class: frame.ClassBusiness})
-	err := sess.SendFrameInput(ctx, &battlev1.FrameInputReq{BattleId: testBattleID})
+	err := sendFrameInput(ctx, sess, testBattleID)
 	assertTerminalReject(t, err, ErrBattleEnded, "BATTLE_ENDED", 409)
 	assertEndedState(t, sess, ErrBattleEnded, "BATTLE_ENDED", 409)
 	if fc.isClosed() {
@@ -218,7 +217,7 @@ func TestTerminalSettlesInflightWithStatus(t *testing.T) {
 	defer cancel()
 
 	done := make(chan error, 1)
-	go func() { done <- sess.SendFrameInput(ctx, &battlev1.FrameInputReq{BattleId: testBattleID}) }()
+	go func() { done <- sendFrameInput(ctx, sess, testBattleID) }()
 	waitFor(t, 2*time.Second, "在途请求已上线", func() bool { return fc.count(stubOpInput) == 1 })
 
 	pushEndNotifyPayload(t, fc, endNotifyPayload(t, "p-1")) // 终态由结束通知触发
@@ -243,13 +242,13 @@ func TestTerminalSettlesInflightOnReject(t *testing.T) {
 
 	// 第一条：静默在途（脚本为空 + silent=true，永远等不到回执）。
 	inflight := make(chan error, 1)
-	go func() { inflight <- errOfSync(sess.SyncFrames(ctx, &battlev1.SyncFramesReq{BattleId: testBattleID})) }()
+	go func() { inflight <- syncFrames(ctx, sess) }()
 	waitFor(t, 2*time.Second, "静默请求已上线", func() bool { return fc.count(stubOpSync) == 1 })
 
 	// 第二条：上线即拿到 BATTLE_NOT_FOUND 拒绝（脚本按写出顺序消费，故在其后登记）。
 	fc.replyStatusNext(fakeStatus{code: 404, reason: "BATTLE_NOT_FOUND", class: frame.ClassBusiness})
 	rejected := make(chan error, 1)
-	go func() { rejected <- sess.SendFrameInput(ctx, &battlev1.FrameInputReq{BattleId: testBattleID}) }()
+	go func() { rejected <- sendFrameInput(ctx, sess, testBattleID) }()
 	waitFor(t, 2*time.Second, "被拒请求已上线", func() bool { return fc.count(stubOpInput) == 1 })
 
 	if err := <-rejected; err == nil {

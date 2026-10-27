@@ -8,7 +8,7 @@ import (
 
 // 直连会话缺省参数。
 const (
-	// defaultInvokeTimeout 是单次请求超时（JoinBattle/SendFrameInput/SyncFrames）。
+	// defaultInvokeTimeout 是单次请求超时（业务 op 与保活探针共用）。
 	defaultInvokeTimeout = 10 * time.Second
 	// defaultHandshakeTimeout 是握手段超时（WS 升级 / hello 段等 flow-id）。
 	defaultHandshakeTimeout = 3 * time.Second
@@ -39,8 +39,11 @@ type options struct {
 	autoReconnect    bool              // 断线自动重连（被接入层拒绝/票问题一律不重试）
 	edgeHello        bool              // 是否走接入层 hello 握手段
 	heartbeat        time.Duration     // 保活探针周期（<= 0 = 关闭）
+	probeOp          string            // 探针 op（空 = 不发探针；不得裸跑，见 WithProbe）
+	probeReq         any               // 探针请求消息（由游戏侧用协议包构造）
+	replay           []Replay          // 重连后的重放步骤（空 = 不重放）
 	endLinger        time.Duration     // 终态收尾窗口（<= 0 = 进入终态即关连接）
-	frameNumber      FrameNumberFunc   // ver≠1 的帧号提取钩子（nil = 不推进补帧基准）
+	frameNumber      FrameNumberFunc   // 帧号提取钩子（nil = 不推进补帧基准）
 	serial           client.Serializer // 载荷序列化器（缺省 protojson = ver=1；ver=2 用 contrib/protobuf）
 }
 
@@ -105,8 +108,8 @@ func WithReconnectBackoff(base, max time.Duration) Option {
 	}
 }
 
-// WithAutoReconnect 开关断线自动重连（缺省开启）：重连即重新 hello 并重放
-// JoinBattle/SyncFrames 补帧；被接入层拒绝与票据失效属不可重试错误，一律终止且不重试。
+// WithAutoReconnect 开关断线自动重连（缺省开启）：重连即重新 hello，并按 `WithReplay`
+// 配置的步骤重放入局/补帧；被接入层拒绝与票据失效属不可重试错误，一律终止且不重试。
 func WithAutoReconnect(enabled bool) Option {
 	return func(o *options) { o.autoReconnect = enabled }
 }
@@ -118,10 +121,44 @@ func WithoutEdgeHello() Option {
 	return func(o *options) { o.edgeHello = false }
 }
 
-// WithHeartbeat 设置直连保活探针周期（battle.v1.BattleService/Ping，Tell 无业务回执）：
-// 无输入期间由会话周期发送，维持帧面活跃（数据报面靠收包刷新空闲读超时，顺带续 NAT 映射）。
-// 缺省 2s，必须严格小于 battle 侧 offline_timeout/3（缺省 15s/3 = 5s）；period <= 0 关闭探针
-// （自管心跳或对照实验用，关闭后静默期会被判掉线）。
+// WithProbe 设置保活探针（op + 请求消息）：无输入期间由会话按 `WithHeartbeat` 的周期发送，
+// 维持帧面活跃（数据报面靠收包刷新空闲读超时，顺带续 NAT 映射）。
+//
+// 请求消息由**游戏侧用协议包构造**（SDK 不持有游戏域消息类型，只按本会话序列化器编码）：
+// ver=1 传 protojson 可编码的 proto.Message 或带 camelCase json tag 的结构体，ver=2 必须传
+// proto.Message。未设置探针时**一个字节都不发**（心跳循环不启动）——不会用空载荷裸探，
+// 那会被服务端按目标一致性判为拒绝。
+func WithProbe(op string, req any) Option {
+	return func(o *options) {
+		if op != "" {
+			o.probeOp, o.probeReq = op, req
+		}
+	}
+}
+
+// Replay 是重连后要重放的一步（通常是「入局」与「按 last_seen_frame 补帧」）。
+type Replay struct {
+	// Op 是重放请求的 op 名（协议寻址键，取值见 OpJoinBattle / OpSyncFrames）。
+	Op string
+	// Req 按当前补帧基准生成请求消息（游戏侧用协议包构造；nil 表示空载荷）。
+	Req func(lastSeen uint64) any
+}
+
+// WithReplay 设置重连后的重放步骤：拨号成功即按顺序重放（载荷用当前 LastSeenFrame 生成）。
+// 未设置则重连不重放任何业务 op——「是否已入局」由调用方是否配置重放来表达（类型化入局方法
+// 已随游戏域消息迁出 SDK）。
+func WithReplay(steps ...Replay) Option {
+	return func(o *options) {
+		if len(steps) > 0 {
+			o.replay = steps
+		}
+	}
+}
+
+// WithHeartbeat 设置直连保活探针周期（探针内容见 WithProbe；服务端语义是 Tell，不回业务回执）：
+// 无输入期间由会话周期发送，维持帧面活跃。缺省 2s，必须严格小于 battle 侧 offline_timeout/3
+// （缺省 15s/3 = 5s）；period <= 0 关闭探针（自管心跳或对照实验用，关闭后静默期会被判掉线）。
+// 未配置 WithProbe 时周期只用于观测，不产生任何写出。
 func WithHeartbeat(period time.Duration) Option {
 	return func(o *options) { o.heartbeat = period }
 }
@@ -139,9 +176,9 @@ func WithEndLinger(d time.Duration) Option {
 	return func(o *options) { o.endLinger = max(d, 0) }
 }
 
-// FrameNumberFunc 是帧号提取钩子：从一帧 FrameBroadcast 的载荷里取帧号（重连补帧的
-// last_seen_frame 基准）。ver=2 的 protobuf 二进制载荷非自描述，SDK 不猜编码，须由调用方用
-// 游戏侧生成包注入；返回 ok=false 表示本帧取不到帧号（不推进基准，也不报错）。
+// FrameNumberFunc 是帧号提取钩子：从一帧帧广播的载荷里取帧号（重连补帧的 last_seen_frame
+// 基准）。SDK 不持有游戏域消息、也不猜载荷编码，故 ver=1（protojson）与 ver=2（protobuf 二进制）
+// **都**由调用方用游戏侧生成包注入；返回 ok=false 表示本帧取不到帧号（不推进基准，也不报错）。
 type FrameNumberFunc func(payload []byte) (uint64, bool)
 
 // WithSerializer 设置载荷序列化器：缺省 client.ProtoJSONSerializer（ver=1 protojson，调试开关），
@@ -156,9 +193,9 @@ func WithSerializer(s client.Serializer) Option {
 	}
 }
 
-// WithFrameNumberFunc 注入帧号提取钩子：ver=1 恒走内建 protojson 解析（注入后 ver=1 行为也
-// 不变），ver=2 未注入钩子时补帧基准**不推进、也不报错**——与 TS/C# 同一口径：二进制载荷
-// 非自描述，猜编码会带来静默错帧，宁可让上层显式注入，也不能因此断链。
+// WithFrameNumberFunc 注入帧号提取钩子：未注入时补帧基准**不推进、也不报错**——与 TS/C#
+// 同一口径：载荷既是 protojson 也可能是二进制，SDK 不持游戏消息、不猜编码，猜错会带来静默
+// 错帧，宁可让上层显式注入，也不能因此断链（LastSeenFrame 恒 0，补帧退化为全量）。
 func WithFrameNumberFunc(fn FrameNumberFunc) Option {
 	return func(o *options) {
 		if fn != nil {

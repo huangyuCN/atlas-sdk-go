@@ -60,7 +60,8 @@ const localSettledKey = "x-atlas-sdk-local-settled"
 // （errors.As 取 code/reason/metadata），故调用方一处判定即可分支处置。
 var (
 	// ErrBattleEnded 表示本局已结束（reason BATTLE_ENDED 的业务拒绝，或收到结束通知）：
-	// 会话进入终态并停止发送，继续重试没有意义；结算结果见 EndNotify/OnBattleEnd。
+	// 会话进入终态并停止发送，继续重试没有意义；结算载荷见 EndNotifyPayload 与
+	// OnPush(OpBattleEndNotify)。
 	ErrBattleEnded = errors.New("direct: 对局已结束")
 	// ErrBattleNotFound 表示对局不存在（reason BATTLE_NOT_FOUND，biz_code 3001）：
 	// 不可重试、终态化并上报。

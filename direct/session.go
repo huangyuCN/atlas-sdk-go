@@ -55,8 +55,8 @@ type generation struct {
 }
 
 // Session 是一条战斗直连会话：按传输面直连接入层（或 battle 帧端口），逐帧在会话槽携带票
-// 跑战斗 op（JoinBattle / SendFrameInput / SyncFrames），收帧广播/战斗结束推送；
-// 断线后重新 hello 并重放 JoinBattle + SyncFrames(last_seen_frame) 补帧。
+// 收发业务 op（op 与载荷由调用方给出，SDK 不持游戏域消息），收帧广播/战斗结束推送；
+// 断线后重新 hello，并按 WithReplay 的步骤重放入局与补帧。
 //
 // 并发安全：Invoke/Reconnect/Close 可并发调用；推送回调在独立 goroutine 执行（panic 被 recover）。
 type Session struct {
@@ -80,8 +80,7 @@ type Session struct {
 	notifyMu sync.Mutex
 	handlers map[string]map[string]pushHandler // op → 订阅键 → 订阅者（带载荷编码版本）
 
-	joined   atomic.Bool
-	lastSeen atomic.Uint64
+	lastSeen atomic.Uint64 // 补帧基准（由注入的帧号钩子推进）
 
 	stats sessionStats // 观测快照累加器（重连/握手/心跳，见 stats.go）
 

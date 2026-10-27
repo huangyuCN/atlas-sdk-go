@@ -37,7 +37,9 @@ jobs:
           ref: 08933f9ae854f66e196c38d2dead789511153e89
           path: atlas
           token: ${{ secrets.ATLAS_CI_TOKEN }}
-      # 会话/战斗 DTO 的协议源在模板仓 atlas-game-layout（R13）：gen-dto 门禁需要该检出。
+      # 会话 DTO（契约消息）的协议源在模板仓 atlas-game-layout：gen-dto 门禁需要该检出。
+      # 游戏域消息（battle/game/matcher）不在这里生成——它们由该仓的 protocol/ 包独立发布，
+      # 本仓 go.mod 不 require 它（见 direct/gamedomain_guard_test.go 的边界守卫）。
       # 未配置凭证时守卫步骤给出配置指引后失败（与上一条同款只读 PAT 约定）。
       - name: 校验模板仓访问凭证
         env:
@@ -66,7 +68,7 @@ jobs:
         with:
           version: '26.1'
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: 生成物无 diff 门禁（帧常量 + 会话/战斗 DTO/stub 重生成后必须零改动）
+      - name: 生成物无 diff 门禁（帧常量 + 会话 DTO/stub 重生成后必须零改动）
         run: |
           bash scripts/gen-dto.sh
           # 整仓口径（与 p4 计划 V.1 一致，比 git diff --exit-code 更严：未跟踪的新产物

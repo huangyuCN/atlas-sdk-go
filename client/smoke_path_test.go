@@ -1,7 +1,7 @@
 // 冒烟等价路径测试（A.5 本地替身）：本地无真机网关时，用假 gateway 覆盖
 // `go run ./examples/smoke -transport tcp -serializer json|protojson|protobuf` 的会话闭环——
-// 注册（生成 stub）→ 登录（会话状态机注入 client_version）→ 业务心跳 → 战斗绑定探针
-// （业务拒绝）→ 全部 op 命中生成描述符。三编码走同一份生成 DTO 与同一条接缝。
+// 注册（生成 stub）→ 登录（会话状态机注入 client_version）→ 业务心跳 → 业务拒绝探针
+// （走会话契约 op，不进游戏域）→ 全部 op 命中生成描述符。三编码走同一份契约 DTO 与同一条接缝。
 //
 // 需在服务器执行的命令（真机 e2e，本地不跑）：
 //
@@ -13,8 +13,6 @@ import (
 	"errors"
 	"testing"
 
-	battlev1 "github.com/huangyuCN/atlas-sdk-go/api/battle/v1"
-	battlev1opclient "github.com/huangyuCN/atlas-sdk-go/api/battle/v1/opclient"
 	gatewayv1 "github.com/huangyuCN/atlas-sdk-go/api/gateway/v1"
 	gatewayv1opclient "github.com/huangyuCN/atlas-sdk-go/api/gateway/v1/opclient"
 	"github.com/huangyuCN/atlas-sdk-go/client"
@@ -43,7 +41,8 @@ func runSmokePath(t *testing.T, tc smokeEncoding) {
 	t.Helper()
 	srv := startSessionServer(t)
 	seedSmokeReplies(t, srv, tc.proto)
-	srv.setErrorReply(battlev1opclient.BattleServiceProtocolOps.JoinBattle, 7, 0, "NO_SESSION")
+	// 业务拒绝探针走**会话契约 op**（游戏域消息已迁出 SDK，不再用战斗 op 作探针）。
+	srv.setErrorReply(gatewayv1opclient.SessionProtocolOps.Logout, 7, 0, "NO_SESSION")
 
 	var opts []client.Option
 	if tc.proto {
@@ -70,11 +69,11 @@ func runSmokePath(t *testing.T, tc smokeEncoding) {
 	if _, err := sess.Heartbeat(ctx); err != nil {
 		t.Fatalf("业务心跳失败: %v", err)
 	}
-	// 战斗绑定探针：伪造目标 → 业务拒绝（Reason 可判，说明 payload 编解码正确）。
-	_, err = battlev1opclient.NewBattleService(c).JoinBattle(ctx, &battlev1.JoinBattleReq{BattleId: "b1"})
+	// 业务拒绝探针：伪造目标 → 业务拒绝（Reason 可判，说明 payload 编解码正确）。
+	err = c.Invoke(ctx, gatewayv1opclient.SessionProtocolOps.Logout, &gatewayv1.LogoutRequest{}, nil)
 	var be *client.BusinessError
 	if !errors.As(err, &be) || be.Reason != "NO_SESSION" {
-		t.Fatalf("战斗探针应业务拒绝（NO_SESSION），得到 %v", err)
+		t.Fatalf("业务拒绝探针应返回 NO_SESSION，得到 %v", err)
 	}
 	assertSeenOpsGenerated(t, srv)
 }
@@ -120,10 +119,10 @@ func mustMarshal(t *testing.T, m proto.Message) []byte {
 func assertSeenOpsGenerated(t *testing.T, srv *sessionTestServer) {
 	t.Helper()
 	known := map[string]bool{
-		gatewayv1opclient.SessionProtocolOps.Register:        true,
-		gatewayv1opclient.SessionProtocolOps.Login:           true,
-		gatewayv1opclient.SessionProtocolOps.Heartbeat:       true,
-		battlev1opclient.BattleServiceProtocolOps.JoinBattle: true,
+		gatewayv1opclient.SessionProtocolOps.Register:  true,
+		gatewayv1opclient.SessionProtocolOps.Login:     true,
+		gatewayv1opclient.SessionProtocolOps.Heartbeat: true,
+		gatewayv1opclient.SessionProtocolOps.Logout:    true,
 	}
 	seen := srv.seenOps()
 	if len(seen) < 3 {

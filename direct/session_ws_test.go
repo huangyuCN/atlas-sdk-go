@@ -2,12 +2,10 @@ package direct
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
-
-	battlev1 "github.com/huangyuCN/atlas-sdk-go/api/battle/v1"
-	locksteppb "github.com/huangyuCN/atlas-sdk-go/api/lockstep"
 )
 
 // testTicket 是测试用票密文（内容无关，服务端按字节比对）。
@@ -26,16 +24,17 @@ func waitFor(t *testing.T, timeout time.Duration, desc string, cond func() bool)
 	t.Fatalf("等待超时：%s", desc)
 }
 
-// joinOnce 发一次 JoinBattle 并校验回执。
-func joinOnce(t *testing.T, sess *Session, battleID string) *battlev1.JoinBattleReply {
+// openTest 建立测试会话，并补上「探针 + 重放 + 帧号钩子」三件套
+// （生产上这三样都由游戏侧用协议包提供，见 testops_test.go）。
+func openTest(t *testing.T, plan Plan, opts ...Option) *Session {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	reply, err := sess.JoinBattle(ctx, &battlev1.JoinBattleReq{BattleId: battleID})
+	base := []Option{withTestProbe(plan.BattleID), withTestReplay(plan.BattleID), WithFrameNumberFunc(jsonFrameNumber)}
+	sess, err := Open(context.Background(), plan, append(base, opts...)...)
 	if err != nil {
-		t.Fatalf("JoinBattle 失败: %v", err)
+		t.Fatalf("Open 失败: %v", err)
 	}
-	return reply
+	t.Cleanup(func() { _ = sess.Close() })
+	return sess
 }
 
 // TestOpenWSQueryAndFrameSlot 验证 WS 直连的成局握手与逐帧带票：
@@ -44,28 +43,22 @@ func TestOpenWSQueryAndFrameSlot(t *testing.T) {
 	stub := newBattleStub(testTicket)
 	srv := startWSStub(t, testTicket, stub)
 
-	sess, err := Open(context.Background(), planFor(TransportWS, srv.addr, testTicket))
-	if err != nil {
-		t.Fatalf("Open 失败: %v", err)
-	}
-	defer func() { _ = sess.Close() }()
+	sess := openTest(t, planFor(TransportWS, srv.addr, testTicket))
 	if sess.Transport() != TransportWS {
 		t.Fatalf("实际传输面 = %s, 期望 ws", sess.Transport())
 	}
 
-	if reply := joinOnce(t, sess, "b-1"); reply.GetMeta().GetSessionId() != "b-1" {
-		t.Fatalf("JoinBattle 回执不符: %+v", reply.GetMeta())
+	var reply testJoinReply
+	if err := json.Unmarshal(joinOnce(t, sess, "b-1"), &reply); err != nil || reply.Meta.SessionID != "b-1" {
+		t.Fatalf("入局回执不符: %+v（err=%v）", reply, err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	err = sess.SendFrameInput(ctx, &battlev1.FrameInputReq{
-		BattleId: "b-1", Input: &locksteppb.LockstepInput{FrameId: 1, Payload: []byte{0x01}},
-	})
-	if err != nil {
-		t.Fatalf("SendFrameInput 失败: %v", err)
+	if err := sendFrameInput(ctx, sess, "b-1"); err != nil {
+		t.Fatalf("发帧失败: %v", err)
 	}
-	if _, err := sess.SyncFrames(ctx, &battlev1.SyncFramesReq{BattleId: "b-1", LastSeenFrame: 0}); err != nil {
-		t.Fatalf("SyncFrames 失败: %v", err)
+	if err := syncFrames(ctx, sess); err != nil {
+		t.Fatalf("补帧失败: %v", err)
 	}
 
 	assertWireOK(t, stub, 1, []string{stubOpJoin, stubOpInput, stubOpSync})
@@ -94,39 +87,32 @@ func TestOpenWSJoinTicketExpired(t *testing.T) {
 	srv := startWSStub(t, testTicket, stub)
 	stub.setJoinError(reasonTicketExpired)
 
-	sess, err := Open(context.Background(), planFor(TransportWS, srv.addr, testTicket))
-	if err != nil {
-		t.Fatalf("Open 失败: %v", err)
-	}
-	defer func() { _ = sess.Close() }()
+	sess := openTest(t, planFor(TransportWS, srv.addr, testTicket))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	_, err = sess.JoinBattle(ctx, &battlev1.JoinBattleReq{BattleId: "b-1"})
-	if !errors.Is(err, ErrTicketExpired) {
-		t.Fatalf("JoinBattle 错误 = %v, 期望 ErrTicketExpired", err)
+	if err := invokeJoin(ctx, sess, "b-1"); !errors.Is(err, ErrTicketExpired) {
+		t.Fatalf("入局错误 = %v, 期望 ErrTicketExpired", err)
 	}
 }
 
-// TestWSFrameBroadcastPush 验证帧广播推送经回调下发，并推进补帧基准（重连 SyncFrames 用它）。
+// TestWSFrameBroadcastPush 验证帧广播推送经回调下发，并推进补帧基准（重连补帧用它）。
 func TestWSFrameBroadcastPush(t *testing.T) {
 	stub := newBattleStub(testTicket)
 	srv := startWSStub(t, testTicket, stub)
 
-	sess, err := Open(context.Background(), planFor(TransportWS, srv.addr, testTicket))
-	if err != nil {
-		t.Fatalf("Open 失败: %v", err)
-	}
-	defer func() { _ = sess.Close() }()
+	sess := openTest(t, planFor(TransportWS, srv.addr, testTicket))
 
 	got := make(chan uint64, 4)
-	sess.OnFrame(func(fb *battlev1.FrameBroadcast) {
-		got <- fb.GetFrame().GetFrameId()
+	sess.OnPush(stubOpFrame, func(payload []byte, _ uint8) {
+		if id, ok := jsonFrameNumber(payload); ok {
+			got <- id
+		}
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if _, err := sess.SyncFrames(ctx, &battlev1.SyncFramesReq{BattleId: "b-1", LastSeenFrame: 0}); err != nil {
-		t.Fatalf("SyncFrames 失败: %v", err)
+	if err := syncFrames(ctx, sess); err != nil {
+		t.Fatalf("补帧失败: %v", err)
 	}
 	waitPushedFrame(t, got, 1)
 	if last := sess.LastSeenFrame(); last != 1 {
@@ -135,24 +121,24 @@ func TestWSFrameBroadcastPush(t *testing.T) {
 }
 
 // TestReconnectReplaysHelloJoinAndSync 验证显式重连：重新 hello（新连接重新带票）、
-// 重放 JoinBattle 与 SyncFrames（基准 = 已见帧号），逐帧仍带票。
+// 按 WithReplay 重放入局与补帧（基准 = 已见帧号），逐帧仍带票。
 func TestReconnectReplaysHelloJoinAndSync(t *testing.T) {
 	stub := newBattleStub(testTicket)
 	srv := startWSStub(t, testTicket, stub)
 
-	sess, err := Open(context.Background(), planFor(TransportWS, srv.addr, testTicket), WithAutoReconnect(false))
-	if err != nil {
-		t.Fatalf("Open 失败: %v", err)
-	}
-	defer func() { _ = sess.Close() }()
+	sess := openTest(t, planFor(TransportWS, srv.addr, testTicket), WithAutoReconnect(false))
 
 	seen := make(chan uint64, 4)
-	sess.OnFrame(func(fb *battlev1.FrameBroadcast) { seen <- fb.GetFrame().GetFrameId() })
+	sess.OnPush(stubOpFrame, func(payload []byte, _ uint8) {
+		if id, ok := jsonFrameNumber(payload); ok {
+			seen <- id
+		}
+	})
 	joinOnce(t, sess, "b-1")
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if _, err := sess.SyncFrames(ctx, &battlev1.SyncFramesReq{BattleId: "b-1", LastSeenFrame: 0}); err != nil {
-		t.Fatalf("SyncFrames 失败: %v", err)
+	if err := syncFrames(ctx, sess); err != nil {
+		t.Fatalf("补帧失败: %v", err)
 	}
 	waitPushedFrame(t, seen, 1)
 
@@ -169,34 +155,30 @@ func TestReconnectReplaysHelloJoinAndSync(t *testing.T) {
 	}
 	assertSlotsCarryTicket(t, slots, flags)
 	if countOp(ops, stubOpJoin) != 2 {
-		t.Fatalf("JoinBattle 次数 = %d, 期望 2（重连重放）: %v", countOp(ops, stubOpJoin), ops)
+		t.Fatalf("入局次数 = %d, 期望 2（重连重放）: %v", countOp(ops, stubOpJoin), ops)
 	}
 	if countOp(ops, stubOpSync) != 2 {
-		t.Fatalf("SyncFrames 次数 = %d, 期望 2（重连补帧）: %v", countOp(ops, stubOpSync), ops)
+		t.Fatalf("补帧次数 = %d, 期望 2（重连补帧）: %v", countOp(ops, stubOpSync), ops)
 	}
 	if len(syncs) != 2 || syncs[1] != 1 {
 		t.Fatalf("重连补帧基准 = %v, 期望第二次 last_seen_frame=1", syncs)
 	}
 }
 
-// TestAutoReconnectReplaysOnDrop 验证断线自动重连（默认开启）同样重放 JoinBattle/SyncFrames。
+// TestAutoReconnectReplaysOnDrop 验证断线自动重连（默认开启）同样按 WithReplay 重放入局与补帧。
 func TestAutoReconnectReplaysOnDrop(t *testing.T) {
 	stub := newBattleStub(testTicket)
 	srv := startWSStub(t, testTicket, stub)
-	stub.setCloseAfter(1, 2) // JoinBattle + SyncFrames 之后断开
+	stub.setCloseAfter(1, 2) // 入局 + 补帧之后断开
 
-	sess, err := Open(context.Background(), planFor(TransportWS, srv.addr, testTicket),
+	sess := openTest(t, planFor(TransportWS, srv.addr, testTicket),
 		WithReconnectBackoff(20*time.Millisecond, 100*time.Millisecond))
-	if err != nil {
-		t.Fatalf("Open 失败: %v", err)
-	}
-	defer func() { _ = sess.Close() }()
 
 	joinOnce(t, sess, "b-1")
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if _, err := sess.SyncFrames(ctx, &battlev1.SyncFramesReq{BattleId: "b-1", LastSeenFrame: 0}); err != nil {
-		t.Fatalf("SyncFrames 失败: %v", err)
+	if err := syncFrames(ctx, sess); err != nil {
+		t.Fatalf("补帧失败: %v", err)
 	}
 	waitFor(t, 3*time.Second, "自动重连完成", func() bool {
 		conns, _, _, ops, _, _, _ := stub.snapshot()
@@ -211,19 +193,15 @@ func TestRejectedDuringReconnectNotRetried(t *testing.T) {
 	stub := newBattleStub(testTicket)
 	srv := startWSStub(t, testTicket, stub)
 
-	sess, err := Open(context.Background(), planFor(TransportWS, srv.addr, testTicket),
+	sess := openTest(t, planFor(TransportWS, srv.addr, testTicket),
 		WithReconnectBackoff(20*time.Millisecond, 50*time.Millisecond))
-	if err != nil {
-		t.Fatalf("Open 失败: %v", err)
-	}
-	defer func() { _ = sess.Close() }()
 	joinOnce(t, sess, "b-1")
 
 	srv.reject.Store(true)
 	stub.setCloseAfter(1, 1)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	_, _ = sess.SyncFrames(ctx, &battlev1.SyncFramesReq{BattleId: "b-1", LastSeenFrame: 0})
+	_ = syncFrames(ctx, sess)
 
 	waitFor(t, 3*time.Second, "被拒后进入断开态", func() bool { return sess.State() == StateDisconnected })
 	if err := sess.Err(); !errors.Is(err, ErrRejected) {
@@ -252,11 +230,7 @@ func TestOpenDefaultPriorityPicksWS(t *testing.T) {
 		BattleID: "b-1", Ticket: testTicket,
 		Endpoints: map[Transport]string{TransportWS: srv.addr, TransportUDP: "127.0.0.1:1"},
 	}
-	sess, err := Open(context.Background(), plan)
-	if err != nil {
-		t.Fatalf("Open 失败: %v", err)
-	}
-	defer func() { _ = sess.Close() }()
+	sess := openTest(t, plan)
 	if sess.Transport() != TransportWS {
 		t.Fatalf("选中面 = %s, 期望 ws", sess.Transport())
 	}
@@ -282,25 +256,17 @@ func TestExpiredTicketFallback(t *testing.T) {
 	expiredStub.setJoinError(reasonTicketExpired)
 	expiredSrv := startWSStub(t, expiredTicket, expiredStub)
 
-	old, err := Open(context.Background(), planFor(TransportWS, expiredSrv.addr, expiredTicket))
-	if err != nil {
-		t.Fatalf("过期票建连（接入层不断连）：%v", err)
-	}
-	defer func() { _ = old.Close() }()
+	old := openTest(t, planFor(TransportWS, expiredSrv.addr, expiredTicket))
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if _, err := old.JoinBattle(ctx, &battlev1.JoinBattleReq{BattleId: "b-1"}); !errors.Is(err, ErrTicketExpired) {
+	if err := invokeJoin(ctx, old, "b-1"); !errors.Is(err, ErrTicketExpired) {
 		t.Fatalf("过期票入局错误 = %v, 期望 ErrTicketExpired", err)
 	}
 
 	// 回业务链路重新取票（新票）后重建会话：直接成功。
 	freshStub := newBattleStub(testTicket)
 	freshSrv := startWSStub(t, testTicket, freshStub)
-	fresh, err := Open(context.Background(), planFor(TransportWS, freshSrv.addr, testTicket))
-	if err != nil {
-		t.Fatalf("新票建连失败: %v", err)
-	}
-	defer func() { _ = fresh.Close() }()
+	fresh := openTest(t, planFor(TransportWS, freshSrv.addr, testTicket))
 	joinOnce(t, fresh, "b-1")
 	assertWireOK(t, freshStub, 1, []string{stubOpJoin})
 }

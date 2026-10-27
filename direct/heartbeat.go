@@ -23,14 +23,12 @@ import (
 	"errors"
 	"time"
 
-	battlev1 "github.com/huangyuCN/atlas-sdk-go/api/battle/v1"
-	battlev1opclient "github.com/huangyuCN/atlas-sdk-go/api/battle/v1/opclient"
 	"github.com/huangyuCN/atlas-sdk-go/client"
 )
 
-// startHeartbeat 为**本代连接**启动保活循环（周期 <= 0 表示关闭；会话已关闭则不启动）。
+// startHeartbeat 为**本代连接**启动保活循环（周期 <= 0 或未配置探针表示关闭；会话已关闭则不启动）。
 //
-// 起表时点是**连接就绪**（首连建连成功、每次重连成功）而非 JoinBattle 之后——有意为之，与 TS/C#
+// 起表时点是**连接就绪**（首连建连成功、每次重连成功）而非入局之后——有意为之，与 TS/C#
 // 同口径：探针只证明「这条连接还活着」（服务端帧面按收包刷新空闲读超时，顺带续 NAT 映射），
 // 不参与对局语义（不改名单/帧号/结算），也不需要先入局；若等入局后才起表，「建连到入局之间」的
 // 静默期（含自动重连重放入局的退避窗口）就没有任何保活证据，数据报面会在这段被误判掉线。
@@ -39,8 +37,8 @@ import (
 // 退出」的会话级循环，一次协议抖动就会让保活永久失效，客户端静默 >5s 便被服务端按
 // idle = offline_timeout/3 判掉线（把可恢复的协议错误升级成玩家判负）。
 func (s *Session) startHeartbeat(g *generation) {
-	if s.opt.heartbeat <= 0 {
-		return
+	if s.opt.heartbeat <= 0 || s.opt.probeOp == "" {
+		return // 周期关闭，或未配置探针（SDK 不持游戏域消息，不裸发现空载荷探针）
 	}
 	s.genMu.Lock()
 	if s.closed || s.gen != g {
@@ -112,11 +110,11 @@ func (s *Session) beat() bool {
 }
 
 // probe 发一次保活探针并等（空的）回执信封；等不到返回超时类错误。
+// op 与载荷来自 `WithProbe`（游戏侧用协议包构造）：SDK 只负责按时发与按拒绝分类处置。
 func (s *Session) probe() error {
 	ctx, cancel := context.WithTimeout(context.Background(), s.probeWindow())
 	defer cancel()
-	return s.invoke(ctx, battlev1opclient.BattleServiceProtocolOps.Ping,
-		&battlev1.PingReq{BattleId: s.plan.BattleID}, nil)
+	return s.invoke(ctx, s.opt.probeOp, s.opt.probeReq, nil)
 }
 
 // probeWindow 返回单次探针的等待窗口：一个心跳周期（不超过单次请求超时）。

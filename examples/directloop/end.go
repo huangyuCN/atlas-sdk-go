@@ -12,8 +12,6 @@ import (
 	"fmt"
 	"time"
 
-	battlev1 "github.com/huangyuCN/atlas-sdk-go/api/battle/v1"
-	locksteppb "github.com/huangyuCN/atlas-sdk-go/api/lockstep"
 	"github.com/huangyuCN/atlas-sdk-go/direct"
 )
 
@@ -83,16 +81,13 @@ func assertStopSending(ctx context.Context, sessions []*direct.Session) error {
 		if s.State() != direct.StateEnded {
 			return fmt.Errorf("玩家%d 状态 = %s, 期望 ended", i, s.State())
 		}
-		req := &battlev1.FrameInputReq{
-			BattleId: s.BattleID(),
-			Input:    &locksteppb.LockstepInput{FrameId: s.LastSeenFrame() + 1},
-		}
-		if err := s.SendFrameInput(ctx, req); !errors.Is(err, direct.ErrBattleEnded) {
+		payload := frameInputPayload(s.BattleID(), s.LastSeenFrame()+1, 0)
+		if err := s.Invoke(ctx, direct.OpSendFrameInput, payload, nil); !errors.Is(err, direct.ErrBattleEnded) {
 			return fmt.Errorf("玩家%d 终态下发帧未被拒: err=%v（期望 direct.ErrBattleEnded）", i, err)
 		}
 		fmt.Printf("[收尾] 玩家%d 终态发帧被拒（零写线）：%v\n", i, s.EndCause())
 	}
-	fmt.Printf("[收尾] 断言②通过：终态下 SendFrameInput 被 ErrBattleEnded 拒绝\n")
+	fmt.Printf("[收尾] 断言②通过：终态下发帧被 ErrBattleEnded 拒绝\n")
 	return nil
 }
 

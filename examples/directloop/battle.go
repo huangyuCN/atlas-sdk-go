@@ -2,13 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync/atomic"
 	"time"
 
-	battlev1 "github.com/huangyuCN/atlas-sdk-go/api/battle/v1"
-	locksteppb "github.com/huangyuCN/atlas-sdk-go/api/lockstep"
 	"github.com/huangyuCN/atlas-sdk-go/direct"
 )
 
@@ -75,7 +74,7 @@ func openBattleSessions(ctx context.Context, o roundOpts, players []*player, pla
 			return nil, fmt.Errorf("%s: %w", players[i].id, err)
 		}
 		plan.Endpoints[o.kind] = addr
-		sess, err := direct.Open(ctx, plan, openOptions(o, i)...)
+		sess, err := direct.Open(ctx, plan, openOptions(o, plan.BattleID, i)...)
 		if err != nil {
 			closeBattleSessions(out)
 			return nil, fmt.Errorf("%s 直连（%s 面 %s）失败: %w", players[i].id, o.kind, addr, err)
@@ -101,10 +100,23 @@ func resolveAddr(plan direct.Plan, o roundOpts) (string, error) {
 }
 
 // openOptions 组装第 i 条会话的建连选项：默认走接入层 hello 握手段（生产路径），
-// -without-edge-hello 才关闭。保活探针缺省交给 SDK（2s）；-no-heartbeat 只关静默方 A（i=0）的
-// 探针——对照组要让「同一局里 B 仍活着」成为参照，两边一起关就分不清保活靠的是心跳还是运气。
-func openOptions(o roundOpts, i int) []direct.Option {
-	opts := []direct.Option{direct.WithTransport(o.kind)}
+// -without-edge-hello 才关闭。保活探针缺省交给 SDK（2s，周期）；-no-heartbeat 只关静默方 A（i=0）
+// 的探针——对照组要让「同一局里 B 仍活着」成为参照，两边一起关就分不清保活靠的是心跳还是运气。
+//
+// 探针载荷、重连重放与帧号钩子由示例侧提供（游戏域消息已迁出 SDK，真实项目用协议包）：
+// 探针/入局/补帧三条 op 的 op 名取自 direct 的常量，载荷取自 battlewire.go。
+func openOptions(o roundOpts, battleID string, i int) []direct.Option {
+	opts := []direct.Option{
+		direct.WithTransport(o.kind),
+		direct.WithProbe(direct.OpPing, probePayload(battleID)),
+		direct.WithReplay(
+			direct.Replay{Op: direct.OpJoinBattle, Req: func(uint64) any { return joinPayload(battleID) }},
+			direct.Replay{Op: direct.OpSyncFrames, Req: func(lastSeen uint64) any {
+				return syncPayload(battleID, lastSeen)
+			}},
+		),
+		direct.WithFrameNumberFunc(frameNumberOf),
+	}
 	if !o.edgeHello {
 		opts = append(opts, direct.WithoutEdgeHello())
 	}
@@ -128,36 +140,31 @@ func inputStep(o roundOpts, i int) byte {
 }
 
 // joinAndInput 入局并发送若干帧输入（step 区分双方输入内容，服务端按帧聚合）。
+// 回执原样打印：SDK 不解析游戏消息（真实项目用协议包解 JoinBattleReply 取 session/帧号）。
 func joinAndInput(ctx context.Context, s *direct.Session, frames int, step byte) error {
-	join, err := s.JoinBattle(ctx, &battlev1.JoinBattleReq{BattleId: s.BattleID()})
-	if err != nil {
-		return fmt.Errorf("JoinBattle 失败: %w", err)
+	var reply json.RawMessage
+	if err := s.Invoke(ctx, direct.OpJoinBattle, joinPayload(s.BattleID()), &reply); err != nil {
+		return fmt.Errorf("入局失败: %w", err)
 	}
 	for i := 1; i <= frames; i++ {
-		req := &battlev1.FrameInputReq{
-			BattleId: s.BattleID(),
-			Input:    &locksteppb.LockstepInput{FrameId: uint64(i), Payload: []byte{step}},
-		}
-		if err := s.SendFrameInput(ctx, req); err != nil {
+		payload := frameInputPayload(s.BattleID(), uint64(i), step)
+		if err := s.Invoke(ctx, direct.OpSendFrameInput, payload, nil); err != nil {
 			return fmt.Errorf("第 %d 帧输入失败: %w", i, err)
 		}
 	}
-	fmt.Printf("[直连] JoinBattle ok（session=%s 当前帧=%d）+ %d 帧输入已发\n",
-		join.GetMeta().GetSessionId(), join.GetCurrentFrame(), frames)
+	fmt.Printf("[直连] 入局 ok（回执=%s）+ %d 帧输入已发\n", reply, frames)
 	return nil
 }
 
-// syncAll 双方各补一次帧（基准取各自已见帧号）。
+// syncAll 双方各补一次帧（基准取各自已见帧号）；回执原样打印（SDK 不解析游戏消息）。
 func syncAll(ctx context.Context, sessions []*direct.Session) error {
 	for _, s := range sessions {
-		reply, err := s.SyncFrames(ctx, &battlev1.SyncFramesReq{
-			BattleId: s.BattleID(), LastSeenFrame: s.LastSeenFrame(),
-		})
-		if err != nil {
-			return fmt.Errorf("SyncFrames 失败: %w", err)
+		var reply json.RawMessage
+		payload := syncPayload(s.BattleID(), s.LastSeenFrame())
+		if err := s.Invoke(ctx, direct.OpSyncFrames, payload, &reply); err != nil {
+			return fmt.Errorf("补帧失败: %w", err)
 		}
-		fmt.Printf("[直连] SyncFrames ok（当前帧=%d 补帧组=%d 基准=%d）\n",
-			reply.GetCurrentFrame(), len(reply.GetMissed()), s.LastSeenFrame())
+		fmt.Printf("[直连] 补帧 ok（基准=%d 回执=%s）\n", s.LastSeenFrame(), reply)
 	}
 	return nil
 }
@@ -190,11 +197,11 @@ type sessionWatch struct {
 }
 
 // noteOut 记录一条出局通知（是否针对本人）。
-func (w *sessionWatch) noteOut(n *battlev1.PlayerOutNotify) {
-	if n.GetPlayerId() == w.playerID {
+func (w *sessionWatch) noteOut(out playerOut) {
+	if out.PlayerID == w.playerID {
 		w.outSelf.Add(1)
 	}
-	w.lastOut.Store(fmt.Sprintf("玩家=%s 原因=%s", n.GetPlayerId(), n.GetReason()))
+	w.lastOut.Store(fmt.Sprintf("玩家=%s 原因=%s", out.PlayerID, out.Reason))
 }
 
 // describeOut 返回最近一条出局通知的文本（无则空串）。
@@ -225,17 +232,26 @@ func watchSessions(sessions []*direct.Session, players []*player) []*sessionWatc
 	out := make([]*sessionWatch, len(sessions))
 	for i, s := range sessions {
 		w := &sessionWatch{playerID: players[i].id}
-		s.OnFrame(func(fb *battlev1.FrameBroadcast) {
+		// 订阅三条推送并按示例侧的投影解析（真实项目用协议包解 FrameBroadcast / 通知消息）。
+		s.OnPush(direct.OpFrameBroadcast, func(payload []byte, _ uint8) {
 			w.frames.Add(1)
-			if id := fb.GetFrame().GetFrameId(); id > w.lastID.Load() {
+			if id, ok := frameNumberOf(payload); ok && id > w.lastID.Load() {
 				w.lastID.Store(id)
 			}
 		})
-		s.OnPlayerOut(w.noteOut)
-		s.OnBattleEnd(func(n *battlev1.BattleEndNotify) {
+		s.OnPush(direct.OpPlayerOutNotify, func(payload []byte, _ uint8) {
+			if out, ok := playerOutOf(payload); ok {
+				w.noteOut(out)
+			}
+		})
+		s.OnPush(direct.OpBattleEndNotify, func(payload []byte, _ uint8) {
+			end, ok := battleEndOf(payload)
+			if !ok {
+				return
+			}
 			w.ended.Add(1)
-			w.winner.Store(n.GetWinnerPlayerId())
-			fmt.Printf("[直连] 战斗结束通知：battle=%s 胜者=%s\n", n.GetBattleId(), n.GetWinnerPlayerId())
+			w.winner.Store(end.WinnerPlayerID)
+			fmt.Printf("[直连] 战斗结束通知：battle=%s 胜者=%s\n", end.BattleID, end.WinnerPlayerID)
 		})
 		out[i] = w
 	}
