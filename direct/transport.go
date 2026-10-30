@@ -86,17 +86,17 @@ func classifyWSHandshake(resp *http.Response, err error) error {
 // dialKCP 建立 KCP 直连：经接入层时先在**同一 UDP socket** 上发 hello 段并收 flow-id，
 // 之后每个数据报双向带 flow-id 前缀；KCP 会话跑在该 socket 上（消息模式，与 battle 帧面同档）。
 func dialKCP(ctx context.Context, addr string, ticket []byte, o options) (conn, error) {
-	udpConn, flowID, err := dialDatagram(ctx, addr, ticket, o)
+	pc, err := newKCPFlowConn(addr, ticket, o)
 	if err != nil {
 		return nil, err
 	}
-	sess, err := kcpgo.NewConn(addr, nil, 0, 0, flowPacketConn{PacketConn: datagramConn{conn: udpConn}, flowID: flowID})
+	sess, err := kcpgo.NewConn(addr, nil, 0, 0, pc)
 	if err != nil {
-		_ = udpConn.Close()
+		_ = pc.Close()
 		return nil, client.NewNetworkError(fmt.Errorf("direct: 建立 KCP 会话失败: %w", err))
 	}
 	kcpcfg.Apply(sess)
-	return &kcpConn{sess: sess}, nil
+	return &kcpConn{sess: sess, pc: pc}, nil
 }
 
 // dialUDP 建立裸 UDP 直连：经接入层时首包 hello 换 flow-id，之后一报一帧且双向带前缀。
@@ -190,9 +190,11 @@ func (c *wsConn) WriteFrame(h frame.Header, body []byte, maxBodySize int) error 
 // Close 关闭 WS 连接。
 func (c *wsConn) Close() error { return c.conn.Close() }
 
-// kcpConn 是 KCP 会话上的帧读写（消息模式，一次 Read 收回一个完整帧）。
+// kcpConn 是 KCP 会话上的帧读写（消息模式，一次 Read 收回一个完整帧）；pc 是会话之下的
+// 换网胶水，关闭时必须一并关闭（kcp-go 不接管传入的 PacketConn 所有权）。
 type kcpConn struct {
 	sess    *kcpgo.UDPSession
+	pc      *flowPacketConn
 	writeMu sync.Mutex
 }
 
@@ -209,8 +211,14 @@ func (c *kcpConn) WriteFrame(h frame.Header, body []byte, maxBodySize int) error
 	return frame.Write(c.sess, h, body, maxBodySize)
 }
 
-// Close 关闭 KCP 会话。
-func (c *kcpConn) Close() error { return c.sess.Close() }
+// Close 先关 KCP 会话、再关换网胶水（顺带修 socket 泄漏：kcp-go 不关闭传入的 PacketConn）。
+func (c *kcpConn) Close() error {
+	err := c.sess.Close()
+	if cerr := c.pc.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
 
 // udpConnWrap 是 UDP 数据报上的帧读写：一报一帧，经接入层时写侧加 flow-id 前缀、读侧剥前缀。
 type udpConnWrap struct {
@@ -308,39 +316,3 @@ func (c datagramConn) SetReadDeadline(t time.Time) error { return c.conn.SetRead
 
 // SetWriteDeadline 设置写截止时间。
 func (c datagramConn) SetWriteDeadline(t time.Time) error { return c.conn.SetWriteDeadline(t) }
-
-// flowPacketConn 是 KCP 会话看到的 PacketConn：写侧加 flow-id 前缀、读侧剥前缀后交给 KCP
-// （flowID=0 表示不经接入层，直通）。前缀失配的包直接丢弃，不视为会话故障；
-// 本地地址与 deadline 等能力由内嵌的底层 PacketConn 提供。
-type flowPacketConn struct {
-	net.PacketConn
-	flowID uint64
-}
-
-// ReadFrom 读一个数据报并剥掉本流前缀（失配/过短的包丢弃后继续读）。
-func (c flowPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	buf := make([]byte, max(len(p), 2048))
-	for {
-		n, addr, err := c.PacketConn.ReadFrom(buf)
-		if err != nil {
-			return 0, addr, err
-		}
-		if c.flowID == 0 {
-			return copy(p, buf[:n]), addr, nil
-		}
-		if payload, serr := StripFlowID(buf[:n], c.flowID); serr == nil {
-			return copy(p, payload), addr, nil
-		}
-	}
-}
-
-// WriteTo 给回程数据报加 flow-id 前缀后写出。
-func (c flowPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
-	if c.flowID == 0 {
-		return c.PacketConn.WriteTo(p, addr)
-	}
-	if _, err := c.PacketConn.WriteTo(WrapFlowID(c.flowID, p), addr); err != nil {
-		return 0, err
-	}
-	return len(p), nil
-}

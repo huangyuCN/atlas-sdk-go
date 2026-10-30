@@ -93,6 +93,9 @@ type Session struct {
 
 // newSession 组装会话本体（不含拨号）：出站载荷编码版本由序列化器推导，白名单外的声明在此报错。
 func newSession(plan Plan, kind Transport, addr string, o options) (*Session, error) {
+	if err := validateSwitchOptions(o); err != nil {
+		return nil, err
+	}
 	ver, err := payloadVersion(o.serial)
 	if err != nil {
 		return nil, err
@@ -108,6 +111,7 @@ func newSession(plan Plan, kind Transport, addr string, o options) (*Session, er
 		closeCh:  make(chan struct{}),
 	}
 	s.state.Store(int32(StateDisconnected))
+	s.opt.flow = &s.stats.flow // 换网计数跨代共享（重连后不归零）
 	return s, nil
 }
 

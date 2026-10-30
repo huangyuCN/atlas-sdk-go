@@ -1,6 +1,9 @@
 package direct
 
 import (
+	"context"
+	"fmt"
+	"net"
 	"time"
 
 	"github.com/huangyuCN/atlas-sdk-go/client"
@@ -45,6 +48,20 @@ type options struct {
 	endLinger        time.Duration     // 终态收尾窗口（<= 0 = 进入终态即关连接）
 	frameNumber      FrameNumberFunc   // 帧号提取钩子（nil = 不推进补帧基准）
 	serial           client.Serializer // 载荷序列化器（缺省 protojson = ver=1；ver=2 用 contrib/protobuf）
+
+	// KCP 换网胶水的阈值与测试注入点（非 KCP 面不生效）。
+	switchWindow       time.Duration // 吞写错误的时间窗
+	idleSwitch         time.Duration // T1：写后无收包多久尝试切网
+	idleDead           time.Duration // T2：无收包多久判定坏死
+	swallowMax         uint64        // 吞错条数上限
+	switchHelloTimeout time.Duration // 迁移重发 hello 的超时
+	switchRetryBase    time.Duration // hello 背压退避与切换防抖起步
+	switchPollInterval time.Duration // 网络变化轮询周期
+	switchDialer       func(ctx context.Context) (*net.UDPConn, error)
+	switchDial         func(ctx context.Context) (datagramSocket, error)
+	switchWatcher      NetworkWatcher
+	switchClock        func() time.Time
+	flow               *flowCounters // 换网观测累加器（由 Session 注入，跨连接共享）
 }
 
 // defaultOptions 返回缺省配置。
@@ -60,6 +77,15 @@ func defaultOptions() options {
 		heartbeat:        defaultHeartbeat,
 		endLinger:        defaultEndLinger,
 		serial:           client.ProtoJSONSerializer{},
+
+		switchWindow:       defaultSwitchWindow,
+		idleSwitch:         defaultIdleSwitch,
+		idleDead:           defaultIdleDead,
+		swallowMax:         defaultSwallowMax,
+		switchHelloTimeout: defaultSwitchHelloTimeout,
+		switchRetryBase:    defaultSwitchRetryBase,
+		switchPollInterval: defaultSwitchPollInterval,
+		switchClock:        time.Now,
 	}
 }
 
@@ -202,4 +228,80 @@ func WithFrameNumberFunc(fn FrameNumberFunc) Option {
 			o.frameNumber = fn
 		}
 	}
+}
+
+// WithSwitchWindow 设置换网切换的吞写错误时间窗（缺省 500ms，≈RTO 量级；必须 > 0）。
+// 窗口只覆盖切换前后：窗口内的写失败被吞掉并计数（否则 kcp-go 一次写错误即永久坏死），
+// 窗口外的写错误照旧上抛。
+func WithSwitchWindow(d time.Duration) Option {
+	return func(o *options) { o.switchWindow = d }
+}
+
+// WithIdleSwitch 设置 T1（缺省 3s）：有写出但超过该时长无任何收包即尝试切网。
+// 必须小于 T2（WithIdleDeadline），且大于 KCP 的 RTO 量级，避免把正常抖动当换网。
+func WithIdleSwitch(d time.Duration) Option {
+	return func(o *options) { o.idleSwitch = d }
+}
+
+// WithIdleDeadline 设置坏死判定 T2（缺省 15s）：超过该时长无任何收包即返回读错误，
+// 交给既有重连（WithReplay）收敛。T2 必须大于 T1（缺省 3s）与 2×心跳周期。
+func WithIdleDeadline(d time.Duration) Option {
+	return func(o *options) { o.idleDead = d }
+}
+
+// WithSwitchHelloTimeout 设置迁移时重发 hello 的单次超时（缺省 1s；必须在 hello 背压
+// 退避后仍能覆盖一次往返）。
+func WithSwitchHelloTimeout(d time.Duration) Option {
+	return func(o *options) { o.switchHelloTimeout = d }
+}
+
+// WithSwallowBudget 设置窗口内吞掉的写错误条数上限（缺省 256）：超限即返回读错误，
+// 不再继续「假装健康」。上限必须 > 0。
+func WithSwallowBudget(n uint64) Option {
+	return func(o *options) { o.swallowMax = n }
+}
+
+// WithSwitchDialer 注入换网拨号器（测试/自定义本地绑定用；返回的 socket 必须已连接接入层）。
+// 首连与迁移共用同一拨号器；nil 表示用缺省 DialContext 拨 cfg 的接入层地址。
+func WithSwitchDialer(fn func(ctx context.Context) (*net.UDPConn, error)) Option {
+	return func(o *options) {
+		if fn != nil {
+			o.switchDialer = fn
+		}
+	}
+}
+
+// WithSwitchWatcher 注入网络变化事件源（各平台可替换缺省的地址集合轮询；nil = 用轮询）。
+func WithSwitchWatcher(w NetworkWatcher) Option {
+	return func(o *options) {
+		if w != nil {
+			o.switchWatcher = w
+		}
+	}
+}
+
+// WithSwitchClock 注入换网判定用的时钟（测试用；nil = time.Now）。
+func WithSwitchClock(now func() time.Time) Option {
+	return func(o *options) {
+		if now != nil {
+			o.switchClock = now
+		}
+	}
+}
+
+// validateSwitchOptions 校验换网阈值（非法值在装配期报错，不静默回退）。
+func validateSwitchOptions(o options) error {
+	if o.switchWindow <= 0 {
+		return fmt.Errorf("direct: 换网窗口必须大于 0（当前 %s）", o.switchWindow)
+	}
+	if o.idleSwitch <= 0 || o.idleDead <= o.idleSwitch {
+		return fmt.Errorf("direct: 无收包阈值非法（T1=%s T2=%s，要求 0<T1<T2）", o.idleSwitch, o.idleDead)
+	}
+	if o.swallowMax == 0 {
+		return fmt.Errorf("direct: 吞错上限必须大于 0")
+	}
+	if o.switchHelloTimeout <= 0 || o.switchRetryBase <= 0 || o.switchPollInterval <= 0 {
+		return fmt.Errorf("direct: 换网超时/退避/轮询周期必须大于 0")
+	}
+	return nil
 }

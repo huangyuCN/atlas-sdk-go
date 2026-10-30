@@ -11,6 +11,7 @@ package direct
 import (
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Stats 是直连会话的只读观测快照。
@@ -41,6 +42,46 @@ type Stats struct {
 	HeartbeatRejects uint64
 	// LastHeartbeatErr 是最近一次探针失败或被拒原因（nil = 尚未失败）。
 	LastHeartbeatErr error
+	// Flow 是 KCP 换网胶水的观测快照（切网/吞错/兜底；非 KCP 面恒为零值）。
+	Flow FlowStats
+}
+
+// FlowStats 是 KCP 换网胶水的观测快照（会话级累计，跨重连不重置）。
+//
+// 建议上层映射的指标名：sdk_flow_switches_total / sdk_flow_switch_failures_total /
+// sdk_flow_swallowed_writes_total / sdk_flow_rebuilds_total{reason} /
+// sdk_flow_switch_duration_ms（LastSwitchCost/MaxSwitchCost 转毫秒直方图）。
+type FlowStats struct {
+	// Switches 是成功完成的切网次数（并发信号合并后只计一次）。
+	Switches uint64
+	// SwitchFailures 是切网失败次数（拨号/hello 失败或背压重试耗尽）。
+	SwitchFailures uint64
+	// SwallowedWrites 是切换窗口内吞掉的写错误条数。
+	SwallowedWrites uint64
+	// DeadRebuilds 是兜底判定坏死的次数（按 LastDeadReason 归因）。
+	DeadRebuilds uint64
+	// LastSwitchCost 是最近一次成功切网的耗时。
+	LastSwitchCost time.Duration
+	// MaxSwitchCost 是成功切网的最大耗时。
+	MaxSwitchCost time.Duration
+	// LastSwitchErr 是最近一次切网失败原因（nil = 尚未失败）。
+	LastSwitchErr error
+	// LastDeadReason 是最近一次兜底重建原因（空串 = 尚未发生）。
+	LastDeadReason DeadReason
+}
+
+// flowCounters 是 FlowStats 的会话级累加器：一条会话内跨多代连接共享（切网/重连后不归零）。
+type flowCounters struct {
+	switches       atomic.Uint64
+	switchFailures atomic.Uint64
+	swallowed      atomic.Uint64
+	deadRebuilds   atomic.Uint64
+	lastCostNs     atomic.Int64
+	maxCostNs      atomic.Int64
+
+	mu             sync.Mutex
+	lastSwitchErr  error
+	lastDeadReason DeadReason
 }
 
 // sessionStats 是 Stats 的累加器（会话内唯一实例）：计数原子累加，最近错误加锁读写。
@@ -53,6 +94,8 @@ type sessionStats struct {
 	hbSent            atomic.Uint64
 	hbFailures        atomic.Uint64
 	hbRejects         atomic.Uint64
+
+	flow flowCounters // 换网观测累加器（跨代共享）
 
 	mu               sync.Mutex
 	lastReconnectErr error
@@ -75,6 +118,7 @@ func (s *Session) Stats() Stats {
 		HeartbeatFailures: s.stats.hbFailures.Load(),
 		HeartbeatRejects:  s.stats.hbRejects.Load(),
 		LastHeartbeatErr:  s.stats.lastError(&s.stats.lastHBErr),
+		Flow:              s.stats.flow.snapshot(),
 	}
 }
 
@@ -145,4 +189,53 @@ func (st *sessionStats) firstHeartbeatErr() error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	return st.firstHBErr
+}
+
+// noteSwitch 记一次成功切网与耗时。
+func (c *flowCounters) noteSwitch(cost time.Duration) {
+	c.switches.Add(1)
+	ns := int64(cost)
+	c.lastCostNs.Store(ns)
+	for {
+		max := c.maxCostNs.Load()
+		if ns <= max || c.maxCostNs.CompareAndSwap(max, ns) {
+			break
+		}
+	}
+}
+
+// noteSwitchFailure 记一次切网失败（原因进 LastSwitchErr，供排障；不判死，交 T2 收敛）。
+func (c *flowCounters) noteSwitchFailure(err error) {
+	c.switchFailures.Add(1)
+	c.mu.Lock()
+	c.lastSwitchErr = err
+	c.mu.Unlock()
+}
+
+// noteSwallowed 记一条窗口内吞掉的写错误。
+func (c *flowCounters) noteSwallowed() { c.swallowed.Add(1) }
+
+// noteDead 记一次兜底判定（按原因归因）。
+func (c *flowCounters) noteDead(reason DeadReason) {
+	c.deadRebuilds.Add(1)
+	c.mu.Lock()
+	c.lastDeadReason = reason
+	c.mu.Unlock()
+}
+
+// snapshot 返回只读快照。
+func (c *flowCounters) snapshot() FlowStats {
+	c.mu.Lock()
+	lastErr, lastDead := c.lastSwitchErr, c.lastDeadReason
+	c.mu.Unlock()
+	return FlowStats{
+		Switches:        c.switches.Load(),
+		SwitchFailures:  c.switchFailures.Load(),
+		SwallowedWrites: c.swallowed.Load(),
+		DeadRebuilds:    c.deadRebuilds.Load(),
+		LastSwitchCost:  time.Duration(c.lastCostNs.Load()),
+		MaxSwitchCost:   time.Duration(c.maxCostNs.Load()),
+		LastSwitchErr:   lastErr,
+		LastDeadReason:  lastDead,
+	}
 }
