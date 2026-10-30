@@ -1,6 +1,7 @@
 package direct
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -18,6 +19,14 @@ const (
 	fieldAddress   = "address"
 	fieldType      = "type"
 	fieldPayload   = "payload"
+	// fieldTickets 是「逐人票条目」列表（IssueEntryTicketReply.tickets / 事件级 battle_tickets，
+	// 键名归一后同一空间）：每条自带该玩家被选中实例的面列表。
+	fieldTickets = "tickets"
+	// fieldBattleTickets 是事件级（MatchStartedEvent）的票条目列表键名：与回执级内容同形。
+	fieldBattleTickets = "battle_tickets"
+	// fieldEntryTicket 是票条目**内部**的票密文字段名（BattleTicketEntry.ticket，不是
+	// 顶层通知的 battle_ticket）。
+	fieldEntryTicket = "ticket"
 )
 
 // PushOpMatchStarted 是成局推送的 op，**消息完整名**（不是服务/方法名；服务/方法名写给
@@ -58,7 +67,7 @@ func PlanFromNotify(payload []byte) (Plan, error) {
 	if err != nil {
 		return Plan{}, err
 	}
-	endpoints, err := notifyEndpoints(fields)
+	endpoints, err := resolveEndpoints(fields, ticket)
 	if err != nil {
 		return Plan{}, err
 	}
@@ -158,6 +167,60 @@ func decodeTicketBase64(encoded string) ([]byte, error) {
 	return base64.RawStdEncoding.DecodeString(encoded)
 }
 
+// resolveEndpoints 返回本玩家实际要拨的面列表：**优先**票条目里的逐人 endpoints
+// （多实例接入层按 player_id 哈希选实例，同一玩家恒定同址），缺失/为空/对不上本人票
+// 即回落到回执（事件）级 endpoints——旧服务端只下发该列表，兼容路径行为不变。
+func resolveEndpoints(fields map[string]json.RawMessage, ticket []byte) (map[Transport]string, error) {
+	if eps := ticketEntryEndpoints(fields, ticket); len(eps) > 0 {
+		return eps, nil
+	}
+	return notifyEndpoints(fields)
+}
+
+// ticketEntryEndpoints 从逐人票条目列表里取「本人那一份」的面列表：条目按票密文逐字节匹配
+// （身份由票本身确定，**不取第一条**、不猜）；无列表/无匹配/该条目未下发面都返回空，
+// 由调用方回落到回执级列表。
+func ticketEntryEndpoints(fields map[string]json.RawMessage, ticket []byte) map[Transport]string {
+	for _, key := range []string{fieldTickets, fieldBattleTickets} {
+		if eps := ticketEntriesOf(fields, key, ticket); len(eps) > 0 {
+			return eps
+		}
+	}
+	return nil
+}
+
+// ticketEntriesOf 解析指定键下的票条目数组并取本人那一份：键缺失/非数组即返回空。
+func ticketEntriesOf(fields map[string]json.RawMessage, key string, ticket []byte) map[Transport]string {
+	raw, ok := fields[normalizeKey(key)]
+	if !ok {
+		return nil
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return nil
+	}
+	for _, item := range items {
+		if eps := ticketEntryOf(item, ticket); len(eps) > 0 {
+			return eps
+		}
+	}
+	return nil
+}
+
+// ticketEntryOf 解析单个票条目：票密文与本人票相等且带可用面列表时返回该列表，否则返回空。
+func ticketEntryOf(item json.RawMessage, ticket []byte) map[Transport]string {
+	var entry map[string]json.RawMessage
+	if err := json.Unmarshal(item, &entry); err != nil {
+		return nil
+	}
+	normalized := normalizeMap(entry)
+	own, err := decodeTicketBase64(rawString(normalized, fieldEntryTicket))
+	if err != nil || !bytes.Equal(own, ticket) {
+		return nil // 不是本人那张票（或票不可解析）：跳过，绝不借用别人的实例地址
+	}
+	return endpointItems(normalized[normalizeKey(fieldEndpoints)])
+}
+
 // notifyEndpoints 解析「面 → 地址」列表：面名未知或地址为空的条目被跳过（不算可用面）；
 // 一条可用面都没有即返回 ErrNotifyNoEndpoint。
 func notifyEndpoints(fields map[string]json.RawMessage) (map[Transport]string, error) {
@@ -169,18 +232,33 @@ func notifyEndpoints(fields map[string]json.RawMessage) (map[Transport]string, e
 	if err := json.Unmarshal(raw, &items); err != nil {
 		return nil, fmt.Errorf("%w: %s 不是数组", ErrNotifyNoEndpoint, fieldEndpoints)
 	}
+	if out := endpointList(items); len(out) > 0 {
+		return out, nil
+	}
+	return nil, fmt.Errorf("%w: 列表里没有已知面或地址为空", ErrNotifyNoEndpoint)
+}
+
+// endpointItems 解析 endpoints 字段为「面 → 地址」表：字段缺失/为 null/不是数组都返回空表。
+func endpointItems(raw json.RawMessage) map[Transport]string {
+	var items []json.RawMessage
+	if len(raw) == 0 || json.Unmarshal(raw, &items) != nil {
+		return nil
+	}
+	return endpointList(items)
+}
+
+// endpointList 把条目数组解析为「面 → 地址」表：未知面名或地址为空的条目跳过
+// （缺面由调用方兜底报错，绝不猜端口）。
+func endpointList(items []json.RawMessage) map[Transport]string {
 	out := make(map[Transport]string, len(items))
 	for _, item := range items {
 		transport, addr, ok := endpointItem(item)
 		if !ok {
-			continue // 未知面/空地址：跳过（缺面由下方兜底报错，绝不猜端口）
+			continue // 未知面/空地址：跳过（缺面由调用方兜底报错，绝不猜端口）
 		}
 		out[transport] = addr
 	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("%w: 列表里没有已知面或地址为空", ErrNotifyNoEndpoint)
-	}
-	return out, nil
+	return out
 }
 
 // endpointItem 解析单个面条目：返回「面 + 地址」，未知面或空地址返回 ok=false。
