@@ -5,7 +5,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // notifyFields 是成局推送（MatchStartedNotify）的字段名（proto 名口径）；
@@ -27,6 +29,9 @@ const (
 	// fieldEntryTicket 是票条目**内部**的票密文字段名（BattleTicketEntry.ticket，不是
 	// 顶层通知的 battle_ticket）。
 	fieldEntryTicket = "ticket"
+	// fieldMaxNetworkGap 是服务端下发的「玩家最多断网多久还能回来」（毫秒整数字段；
+	// protojson 的 int64 默认按字符串下发）。
+	fieldMaxNetworkGap = "max_network_gap_ms"
 )
 
 // PushOpMatchStarted 是成局推送的 op，**消息完整名**（不是服务/方法名；服务/方法名写给
@@ -76,6 +81,8 @@ func PlanFromNotify(payload []byte) (Plan, error) {
 		BattleID:  rawString(fields, fieldBattleID),
 		Ticket:    ticket,
 		Endpoints: endpoints,
+		// 服务端「玩家最多断网多久还能回来」（毫秒；0 = 未下发/旧服务端，保持既有缺省）。
+		MaxNetworkGap: time.Duration(rawInt64(fields, fieldMaxNetworkGap)) * time.Millisecond,
 	}, nil
 }
 
@@ -133,6 +140,28 @@ func rawString(fields map[string]json.RawMessage, name string) string {
 		return ""
 	}
 	return s
+}
+
+// rawInt64 取 64 位整数字段：protojson 默认按**字符串**下发（保精度），也接受 JSON 数字；
+// 缺失/类型不符/解析失败/负值一律返回 0（调用方按「未下发」处理，时长没有负语义）。
+func rawInt64(fields map[string]json.RawMessage, name string) int64 {
+	raw, ok := fields[normalizeKey(name)]
+	if !ok {
+		return 0
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil || n < 0 {
+			return 0
+		}
+		return n
+	}
+	var n int64
+	if err := json.Unmarshal(raw, &n); err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 // notifyTicket 取票密文：protojson 的 bytes 是标准 base64（带填充）；无填充的容错也接受。

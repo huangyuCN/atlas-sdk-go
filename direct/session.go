@@ -128,6 +128,8 @@ func Open(ctx context.Context, plan Plan, opts ...Option) (*Session, error) {
 	for _, opt := range opts {
 		opt(&o)
 	}
+	// 通知里带了服务端的 max_network_gap 就据此推导缺省 T2（显式 WithIdleDeadline 优先）。
+	o = applyPlanDefaults(plan, o)
 	kind, addr, err := pickEndpoint(plan, o.transport)
 	if err != nil {
 		return nil, err

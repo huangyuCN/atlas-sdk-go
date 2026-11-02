@@ -53,6 +53,7 @@ type options struct {
 	switchWindow       time.Duration // 吞写错误的时间窗
 	idleSwitch         time.Duration // T1：写后无收包多久尝试切网
 	idleDead           time.Duration // T2：无收包多久判定坏死
+	idleDeadExplicit   bool          // T2 是否由 WithIdleDeadline 显式设置（显式优先于通知值）
 	swallowMax         uint64        // 吞错条数上限
 	switchHelloTimeout time.Duration // 迁移重发 hello 的超时
 	switchRetryBase    time.Duration // hello 背压退避与切换防抖起步
@@ -245,8 +246,34 @@ func WithIdleSwitch(d time.Duration) Option {
 
 // WithIdleDeadline 设置坏死判定 T2（缺省 15s）：超过该时长无任何收包即返回读错误，
 // 交给既有重连（WithReplay）收敛。T2 必须大于 T1（缺省 3s）与 2×心跳周期。
+//
+// 显式设置时**优先于**服务端通知下发的 max_network_gap（逃生阀）；不设置时若通知带该值，
+// 按 gap × 1.5 推导（见 applyPlanDefaults），未带则用缺省 15s。
 func WithIdleDeadline(d time.Duration) Option {
-	return func(o *options) { o.idleDead = d }
+	return func(o *options) {
+		o.idleDead = d
+		o.idleDeadExplicit = true
+	}
+}
+
+// clientIdleDeadline 由服务端下发的 max_network_gap 推导客户端 T2：
+// 取 gap × 1.5（与服务端 offline_timeout 同口径，晚于服务端拆会话），且必须严格大于 T1
+// （gap 极小、1.5× 仍不大于 T1 时抬到 T1+1s），保证 0 < T1 < T2。
+func clientIdleDeadline(gap, idleSwitch time.Duration) time.Duration {
+	d := gap * 3 / 2
+	if d <= idleSwitch {
+		return idleSwitch + time.Second
+	}
+	return d
+}
+
+// applyPlanDefaults 把成局通知里下发的服务端参数落到缺省选项上：目前只有 T2。
+// 显式 WithIdleDeadline 优先（逃生阀）；通知未下发（0）则保持既有缺省，行为零变化。
+func applyPlanDefaults(plan Plan, o options) options {
+	if plan.MaxNetworkGap > 0 && !o.idleDeadExplicit {
+		o.idleDead = clientIdleDeadline(plan.MaxNetworkGap, o.idleSwitch)
+	}
+	return o
 }
 
 // WithSwitchHelloTimeout 设置迁移时重发 hello 的单次超时（缺省 1s；必须在 hello 背压

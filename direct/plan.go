@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // Transport 是接入层传输面，取值与 battle.v1.EdgeTransport 枚举一一对应
@@ -102,6 +103,10 @@ type Plan struct {
 	Ticket []byte
 	// Endpoints 是「传输面 → 接入层地址（host:port）」列表（本局推送下发，唯一来源）。
 	Endpoints map[Transport]string
+	// MaxNetworkGap 是服务端下发的「玩家最多断网多久还能回来」（0 = 未下发/旧服务端）。
+	// 它同时是服务端的会话静默窗口：客户端 T2 必须大于它（见 applyPlanDefaults），
+	// 否则客户端先重建、无感切网失效。
+	MaxNetworkGap time.Duration
 }
 
 // Endpoint 返回指定传输面的接入层地址；本局未下发该面即报错（不猜端口、不静默换面）。
