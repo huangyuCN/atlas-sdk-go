@@ -13,6 +13,8 @@ const (
 	Version uint8 = 1
 	// Version2 载荷编码 ver=2（protobuf 二进制）
 	Version2 uint8 = 2
+	// Version3 载荷编码 ver=3（下行增量广播）
+	Version3 uint8 = 3
 	// MaxBodySize 单帧 body 绝对上限（2MiB）
 	MaxBodySize int = 2097152
 	// MaxOperationLen operation 名长度上限（4096 字节）
@@ -32,3 +34,6 @@ const (
 	// FlagRequestID body 携带请求幂等键
 	FlagRequestID uint8 = 2
 )
+
+// PayloadVersions 是解码器接受的帧头载荷版本全集（升序；由 transport/frame 派生，勿手改）。
+var PayloadVersions = [...]uint8{1, 2, 3}

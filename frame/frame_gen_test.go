@@ -25,6 +25,12 @@ func TestConstantsFromGenerated(t *testing.T) {
 	if Version2 != goframe.Version2 {
 		t.Errorf("Version2 = %d, 生成物 %d", Version2, goframe.Version2)
 	}
+	if Version3 != goframe.Version3 {
+		t.Errorf("Version3 = %d, 生成物 %d", Version3, goframe.Version3)
+	}
+	if got := PayloadVersions(); len(got) != len(goframe.PayloadVersions) {
+		t.Errorf("PayloadVersions = %v, 生成物 %v", got, goframe.PayloadVersions)
+	}
 	if MaxBodySize != goframe.MaxBodySize {
 		t.Errorf("MaxBodySize = %d, 生成物 %d", MaxBodySize, goframe.MaxBodySize)
 	}

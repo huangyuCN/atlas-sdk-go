@@ -40,9 +40,22 @@ const (
 	// 协商，2026-09-04 v0.5 设计决策）。可选增强：服务端支持 ver=2 前勿在真实
 	// 连接启用（protojson ver=1 永续支持）。
 	Version2 uint8 = goframe.Version2
+	// Version3 是载荷编码 ver=3（下行增量广播：wire 仍是 protobuf 二进制，语义为基于
+	// base_seq 的稀疏增量，只用于服务端 → 客户端下行）。帧头白名单必须接受它，否则
+	// 合法增量帧会被当协议错误断开连接（2026-11-04 实测：unexpected EOF 16,233 次）。
+	Version3 uint8 = goframe.Version3
 	// MaxBodySize 是单帧 body 的绝对上限（2MiB，与服务端 frame.MaxBodySize 对齐）。
 	MaxBodySize = goframe.MaxBodySize
 )
+
+// PayloadVersions 返回解码器接受的帧头载荷版本全集（升序；唯一来源是框架仓
+// transport/frame.PayloadVersions，经生成物转发）。客户端「能解即能声明」：
+// 协商里声明 accept_payload_versions 时必须取自同一集合，不得另立字面量。
+func PayloadVersions() []uint8 {
+	versions := make([]uint8, len(goframe.PayloadVersions))
+	copy(versions, goframe.PayloadVersions[:])
+	return versions
+}
 
 // MsgType 是帧类型。
 type MsgType uint8

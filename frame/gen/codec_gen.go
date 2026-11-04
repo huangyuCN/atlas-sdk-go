@@ -38,6 +38,18 @@ func NormalizeMaxBodySize(maxBodySize int) int {
 	return maxBodySize
 }
 
+// IsPayloadVersion 判定帧头 version 位是否在解码器接受的白名单内。
+// 白名单是生成物 PayloadVersions（源自 transport/frame.PayloadVersions），
+// 此处不再写死 ver=1/2 之类的字面量——否则「能声明」与「能解」会各自漂移。
+func IsPayloadVersion(ver uint8) bool {
+	for _, v := range PayloadVersions {
+		if v == ver {
+			return true
+		}
+	}
+	return false
+}
+
 // CheckHeader 校验帧头合法性：magic / seq≠0 / type 白名单 / version 白名单 / flags 保留位 / 长度上限。
 func CheckHeader(h Header, maxBodySize int) error {
 	if h.Magic != Magic {
@@ -49,7 +61,7 @@ func CheckHeader(h Header, maxBodySize int) error {
 	if h.Type != MsgTypeRequest && h.Type != MsgTypeResponse && h.Type != MsgTypeNotify {
 		return fmt.Errorf("frame: invalid type: %x", h.Type)
 	}
-	if h.Version != Version && h.Version != Version2 {
+	if !IsPayloadVersion(h.Version) {
 		return fmt.Errorf("frame: invalid version: %x", h.Version)
 	}
 	if h.Flags&reservedFlags != 0 {

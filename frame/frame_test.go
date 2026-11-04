@@ -1,4 +1,4 @@
-// frame 版本白名单测试（载荷编码协商，规范 §3.1）：ver=1/ver=2 合法，未知版本拒绝。
+// frame 版本白名单测试（载荷编码协商，规范 §3.1）：ver=1/ver=2/ver=3 合法，未定义版本拒绝。
 package frame
 
 import (
@@ -13,8 +13,9 @@ func TestCheckVersionWhitelist(t *testing.T) {
 	}{
 		{Version, true},  // ver=1 protojson
 		{Version2, true}, // ver=2 protobuf 二进制
-		{0, false},       // 未知
-		{3, false},       // 前向保留：未知版本即协议非法
+		{Version3, true}, // ver=3 下行增量广播（白名单已扩）
+		{0, false},       // 未标注的历史形态，头校验层仍拒
+		{4, false},       // 未定义的未来版本：不得放太宽
 		{99, false},
 	}
 	for _, tc := range cases {
